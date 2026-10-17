@@ -436,6 +436,99 @@ const GEMM_SIMDMAT_FRAGS: [:0]const u8 =
     \\  }
     \\}
 ;
+/// The tail body's run: the matrix body for one run with a compile-time block count MB (holistech
+/// fork). The kernel calls the smallest MB that covers the run, so a short run no longer pays for
+/// four blocks; each instance keeps fixed-size fragment arrays (no spill), and every row's sum
+/// order is the full body's.
+const GEMM_SIMDMAT_TAIL_FRAGS: [:0]const u8 = GEMM_SIMDMAT_FRAGS ++
+    \\template<uint N, uint MB, uint IDIM_, uint ODIM_, typename TX, typename TY>
+    \\static inline void smat_run(const device TX *x, const device uint *tiles, device TY *y, uint run0, uint nlive, uint col0, ushort fm, ushort fn, uint g) {
+    \\  constexpr uint TILE = 16u;
+    \\  constexpr uint PACKED_W = N / 2u;
+    \\  constexpr uint IT = IDIM_ / TILE;
+    \\  constexpr uint OT = ODIM_ / TILE;
+    \\  size_t xo[MB][2];
+    \\  SMAT_UNROLL for (uint mb = 0u; mb < MB; mb++) {
+    \\    xo[mb][0] = (size_t)(run0 + min(mb * 8u + uint(fn), nlive - 1u)) * (size_t)(IDIM_);
+    \\    xo[mb][1] = (size_t)(run0 + min(mb * 8u + uint(fn) + 1u, nlive - 1u)) * (size_t)(IDIM_);
+    \\  }
+    \\  simdgroup_matrix<float, 8, 8> acc[4][MB];
+    \\  SMAT_UNROLL for (uint nb = 0u; nb < 4u; nb++) {
+    \\    SMAT_UNROLL for (uint mb = 0u; mb < MB; mb++) acc[nb][mb] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    \\  }
+    \\  for (uint tk = 0u; tk < IT; tk++) {
+    \\    const uint kc = tk * TILE + uint(fm);
+    \\    simdgroup_matrix<half, 8, 8> b[2][MB];
+    \\    SMAT_UNROLL for (uint mb = 0u; mb < MB; mb++) {
+    \\      SMAT_UNROLL for (uint kb = 0u; kb < 2u; kb++) {
+    \\        b[kb][mb].thread_elements()[0] = x[xo[mb][0] + kc + kb * 8u];
+    \\        b[kb][mb].thread_elements()[1] = x[xo[mb][1] + kc + kb * 8u];
+    \\      }
+    \\    }
+    \\    const device uint *words = tiles + (size_t)tk * (size_t)OT * (size_t)PACKED_W;
+    \\    simdgroup_matrix<half, 8, 8> a[4][2];
+    \\    SMAT_UNROLL for (uint t = 0u; t < 2u; t++) {
+    \\      half2 p[4];
+    \\      smat_group<N>(words + t * PACKED_W, g, p);
+    \\      SMAT_UNROLL for (uint j = 0u; j < 4u; j++) {
+    \\        a[2u * t + (j >> 1u)][j & 1u].thread_elements()[0] = p[j].x;
+    \\        a[2u * t + (j >> 1u)][j & 1u].thread_elements()[1] = p[j].y;
+    \\      }
+    \\    }
+    \\    SMAT_UNROLL for (uint mb = 0u; mb < MB; mb++) {
+    \\      SMAT_UNROLL for (uint kb = 0u; kb < 2u; kb++) {
+    \\        SMAT_UNROLL for (uint nb = 0u; nb < 4u; nb++) simdgroup_multiply_accumulate(acc[nb][mb], a[nb][kb], b[kb][mb], acc[nb][mb]);
+    \\      }
+    \\    }
+    \\  }
+    \\  SMAT_UNROLL for (uint nb = 0u; nb < 4u; nb++) {
+    \\    const size_t oc = (size_t)(col0 + nb * 8u + uint(fm));
+    \\    SMAT_UNROLL for (uint mb = 0u; mb < MB; mb++) {
+    \\      const uint m = mb * 8u + uint(fn);
+    \\      if (m < nlive) y[(size_t)(run0 + m) * (size_t)(ODIM_) + oc] = half(acc[nb][mb].thread_elements()[0]);
+    \\      if (m + 1u < nlive) y[(size_t)(run0 + m + 1u) * (size_t)(ODIM_) + oc] = half(acc[nb][mb].thread_elements()[1]);
+    \\    }
+    \\  }
+    \\}
+;
+/// The tail body (holistech fork): the full body's preamble and run loop, each run computed by
+/// the smallest `smat_run<MB>` that covers it.
+const GEMM_SIMDMAT_TAIL_SOURCE: [:0]const u8 =
+    \\uint win = uint(threadgroup_position_in_grid.y);
+    \\uint sg = uint(simdgroup_index_in_threadgroup);
+    \\ushort lane = ushort(thread_index_in_simdgroup);
+    \\constexpr uint TILE = 16u;
+    \\constexpr uint N = uint(NHW);
+    \\constexpr uint PACKED_W = N / 2u;
+    \\constexpr uint IT = uint(IDIM) / TILE;
+    \\constexpr uint OT = uint(ODIM) / TILE;
+    \\const uint start = wstarts[win];
+    \\const uint n = wnlive[win];
+    \\if (n == 0u || n > uint(WIN)) return;
+    \\const uint col0 = uint(threadgroup_position_in_grid.x) * 128u + sg * 32u;
+    \\const ushort qid = lane >> 2;
+    \\const ushort fm = (qid & 4) + ((lane >> 1) & 3);
+    \\const ushort fn = (qid & 2) * 2 + (lane & 1) * 2;
+    \\const uint g = uint(fm) * 4u + uint(fn >> 1);
+    \\constexpr uint MB = (uint(WIN) + 7u) / 8u;
+    \\constexpr uint MB2 = MB < 2u ? MB : 2u;
+    \\constexpr uint MB3 = MB < 3u ? MB : 3u;
+    \\uint row = start;
+    \\const uint end = start + n;
+    \\while (row < end) {
+    \\const uint run0 = row;
+    \\const uint eid = uint(eids[row]);
+    \\uint run_end = row + 1u;
+    \\while (run_end < end && uint(eids[run_end]) == eid) run_end++;
+    \\const uint nlive = run_end - row;
+    \\const device uint *tiles = (const device uint *)(trellis + (size_t)eid * (size_t)IT * (size_t)OT * (size_t)N) + (col0 / TILE) * PACKED_W;
+    \\if (nlive <= 8u) smat_run<N, 1u, uint(IDIM), uint(ODIM)>(x, tiles, y, run0, nlive, col0, fm, fn, g);
+    \\else if (nlive <= 16u) smat_run<N, MB2, uint(IDIM), uint(ODIM)>(x, tiles, y, run0, nlive, col0, fm, fn, g);
+    \\else if (nlive <= 24u) smat_run<N, MB3, uint(IDIM), uint(ODIM)>(x, tiles, y, run0, nlive, col0, fm, fn, g);
+    \\else smat_run<N, MB, uint(IDIM), uint(ODIM)>(x, tiles, y, run0, nlive, col0, fm, fn, g);
+    \\row = run_end;
+    \\}
+;
 /// A data-dependent block count spills the accumulators, so use compile-time WIN.
 /// Short runs repeat their last row; padded rows are never stored.
 const GEMM_SIMDMAT_SOURCE: [:0]const u8 =
@@ -1396,7 +1489,24 @@ fn getGemmSortedKernel() !mlx.mlx_fast_metal_kernel {
 fn getGemmSimdmatKernel() !mlx.mlx_fast_metal_kernel {
     const ins = [_][*:0]const u8{ "x", "trellis", "eids", "wstarts", "wnlive" };
     const outs = [_][*:0]const u8{"y"};
+    if (smatTailOn()) return codebookKernelWith(&gemm_simdmat_tail_kernel, "sushi_exl3_k4_gemm_simdmat_tail", &ins, &outs, GEMM_SIMDMAT_TAIL_SOURCE, GEMM_SIMDMAT_TAIL_FRAGS);
     return codebookKernelWith(&gemm_simdmat_kernel, "sushi_exl3_k4_gemm_simdmat", &ins, &outs, GEMM_SIMDMAT_SOURCE, GEMM_SIMDMAT_FRAGS);
+}
+
+var gemm_simdmat_tail_kernel: KernelSlots = no_kernels;
+/// Test seam for the tail body; null reads `SUSHI_EXL3_SMAT_TAIL` (default on, `0` off).
+var gemm_smat_tail_force: ?bool = null;
+var gemm_smat_tail_env: ?bool = null;
+fn smatTailOn() bool {
+    if (gemm_smat_tail_force) |v| return v;
+    if (gemm_smat_tail_env) |v| return v;
+    var on = true;
+    if (std.c.getenv("SUSHI_EXL3_SMAT_TAIL")) |p| {
+        const v = std.mem.span(p);
+        if (v.len > 0 and v[0] == '0') on = false;
+    }
+    gemm_smat_tail_env = on;
+    return on;
 }
 
 fn sortedGemmCfg(cache: *CfgCache(GemmSortedKey, 8), key: GemmSortedKey) !mlx.mlx_fast_metal_kernel_config {
@@ -11006,3 +11116,85 @@ test "exl3 GLM one-row decode chain equals the lane chain to the byte and engage
         }
     }
 }
+
+test "exl3 simdgroup-matrix tail body: bytes equal the full body, A B B A timing (SUSHI_EXP_SMAT_TAIL_TEST)" {
+    if (std.c.getenv("SUSHI_EXP_SMAT_TAIL_TEST") == null) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    var env: FallbackEnv = .{};
+    env.force();
+    defer env.restore();
+    setDecodeParams(.{ .codebook = .mcg, .window = .w15 });
+    defer setDecodeParams(.mul1);
+    gemm_simdmat_force = true;
+    defer gemm_simdmat_force = null;
+    defer gemm_smat_tail_force = null;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const E: c_int = 512;
+    var prng = std.Random.DefaultPrng.init(0x5a17);
+    const rnd = prng.random();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var mismatches: usize = 0;
+    for ([_]c_int{ 42, 48 }) |nhw| for ([_][2]c_int{ .{ 2560, 640 }, .{ 640, 2560 } }) |shape| {
+        const it = @divExact(shape[0], 16);
+        const ot = @divExact(shape[1], 16);
+        const tr_h = try alloc.alloc(u16, @intCast(E * it * ot * nhw));
+        for (tr_h) |*v| v.* = @truncate(rnd.int(u32));
+        const tr = mlx.mlx_array_new_data(tr_h.ptr, &[_]c_int{ E, it, ot, nhw }, 4, .uint16);
+        defer _ = mlx.mlx_array_free(tr);
+        for ([_]c_int{ 170, 2050, 20250 }) |nslots| {
+            const ids = try alloc.alloc(u32, @intCast(nslots));
+            // Skewed routing like real text: half the slots on a quarter of the experts.
+            for (ids) |*v| v.* = if (rnd.boolean()) rnd.uintLessThan(u32, @intCast(@divExact(E, 4))) else rnd.uintLessThan(u32, @intCast(E));
+            std.mem.sort(u32, ids, {}, std.sort.asc(u32));
+            const eids = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{nslots}, 1, .uint32);
+            defer _ = mlx.mlx_array_free(eids);
+            const xh = try alloc.alloc(u16, @intCast(nslots * shape[0]));
+            for (xh) |*v| v.* = exl3.f32ToF16Bits((rnd.float(f32) - 0.5) * 0.2);
+            const x = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ nslots, shape[0] }, 2, .float16);
+            defer _ = mlx.mlx_array_free(x);
+            const tab = try gemmWindowTable(s, eids, nslots, 32, true);
+            defer _ = mlx.mlx_array_free(tab.starts);
+            defer _ = mlx.mlx_array_free(tab.nlives);
+            var outs: [2]mlx.mlx_array = undefined;
+            for ([_]bool{ false, true }, 0..) |arm, i| {
+                gemm_smat_tail_force = arm;
+                outs[i] = try innerGemmSortedTable(s, x, tr, eids, 32, true, tab);
+                try mlx.check(mlx.mlx_array_eval(outs[i]));
+            }
+            defer for (outs) |o| {
+                _ = mlx.mlx_array_free(o);
+            };
+            // Bytes, not values: view both as uint16 and compare.
+            var eq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(eq);
+            var va = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(va);
+            var vb = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(vb);
+            try mlx.check(mlx.mlx_view(&va, outs[0], .uint16, s));
+            try mlx.check(mlx.mlx_view(&vb, outs[1], .uint16, s));
+            try mlx.check(mlx.mlx_array_equal(&eq, va, vb, false, s));
+            try mlx.check(mlx.mlx_array_eval(eq));
+            var same: bool = false;
+            try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+            if (!same) mismatches += 1;
+            var tot: [2]u64 = .{ 0, 0 };
+            for (0..3) |_| for ([_]bool{ false, true, true, false }) |arm| {
+                gemm_smat_tail_force = arm;
+                var sw = io_util.Stopwatch.init(io);
+                const got = try innerGemmSortedTable(s, x, tr, eids, 32, true, tab);
+                try mlx.check(mlx.mlx_array_eval(got));
+                tot[@intFromBool(arm)] += sw.read();
+                _ = mlx.mlx_array_free(got);
+            };
+            std.debug.print("[smat-tail] n{d} {d}->{d} slots={d}: full {d} us, tail {d} us per call, bytes equal {}\n", .{
+                nhw, shape[0], shape[1], nslots, tot[0] / 6000, tot[1] / 6000, same,
+            });
+        }
+    };
+    try std.testing.expectEqual(@as(usize, 0), mismatches);
+}
+
