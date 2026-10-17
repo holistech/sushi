@@ -152,6 +152,21 @@ fn warmEnabled() bool {
     return v;
 }
 
+/// holistech fork: a prefill-width gather of a table without a separate bf16 store walks the
+/// mapping on all pool threads in one round (`PrefetchPool.runWalk`, the serial walk's `row`, so
+/// the same bytes) instead of three preads per row in rounds of `MAX_ROWS`. Set once by main
+/// (`applyM1PrefillDefaults`); measured on the M1 Ultra only
+/// (Flash-Next Sushi-2.6bpw, 4-bit table of 29.8 GB, M1 Ultra 64 GB, 2026-10-17, same binary): the
+/// pool spends ~480 ms of a 4096-token chunk on 1024 rounds of 64 rows while the GPU waits. Prefill
+/// meter at 4096 rows 5205 / 5194 -> 4690 / 4754 ms; API 32k document, fresh server per arm,
+/// A B C C B A: 780 / 781 -> 853 / 847 tok/s (+9.0 %), the serial walk 827 / 823 and slow on the
+/// first cold prompt; unread 31.7k-token documents, one per arm, 781 / 780 / 778 -> 854 / 844 /
+/// 845 tok/s (ple-kalt.py). Same text, decode and peak footprint unchanged. A short first prompt
+/// while the table warmer still reads costs ~60 ms more than through the pool (38 tokens 112-125
+/// against 145-155 tok/s); preads in one round (797 tok/s at 32k) and a mincore probe per row
+/// (757) lose more than that at prefill width.
+pub var ple_wide_walk: bool = false;
+
 fn ngramCacheLimit() usize {
     if (@import("builtin").is_test) {
         if (test_ngram_cache_limit) |limit| return limit;
@@ -624,6 +639,11 @@ pub const NgramTable = struct {
         // Announce the arm that actually runs, not the lever that permits it.
         const pooled = wide_ok and self.pool != null and self.fd >= 0 and need <= PrefetchPool.ROW_BUF;
         const whole_chunk = wide and oversized_bf16 and self.bits == 16;
+        if (wide and self.pool != null and ple_wide_walk) {
+            notePrefillGatherArm(true, row_ids.len, row_ids.len, "holistech fork: parallel mmap walk");
+            self.pool.?.runWalk(self, row_ids, out);
+            return;
+        }
         if (wide) notePrefillGatherArm(pooled, row_ids.len, if (whole_chunk) row_ids.len else PrefetchPool.MAX_ROWS, prefillGatherWhy(wide_ok, pooled, prefer_pool));
         if (pooled and whole_chunk) {
             if (try self.pool.?.runBf16(self, row_ids, out)) return;
@@ -726,6 +746,7 @@ const PrefetchPool = struct {
     rows: []const i64 = &.{},
     wide_out: ?WideOutput = null,
     wide_refs: []const RowRead = &.{},
+    walk_out: ?[]f32 = null,
     wide_preads: std.atomic.Value(u64) = .init(0),
     bufs: [MAX_ROWS][ROW_BUF]u8 = undefined,
     pending: std.atomic.Value(u32) = .init(0),
@@ -767,6 +788,16 @@ const PrefetchPool = struct {
     /// Rows land in `bufs`; the caller keeps `rows` alive until this returns.
     fn run(self: *PrefetchPool, table: *const NgramTable, rows: []const i64) bool {
         return self.dispatch(table, rows, null, &.{});
+    }
+
+    /// holistech fork: every row through `table.row` from the mapping, row i on thread i % N, one
+    /// round; cold pages fault in on all threads at once. Only for a table without a separate bf16
+    /// store (`row` reads `map`).
+    fn runWalk(self: *PrefetchPool, table: *const NgramTable, rows: []const i64, out: []f32) void {
+        std.debug.assert(table.bf16 == null and out.len >= rows.len * table.dim);
+        self.walk_out = out;
+        defer self.walk_out = null;
+        _ = self.dispatch(table, rows, null, &.{});
     }
 
     fn runBf16(self: *PrefetchPool, table: *const NgramTable, rows: []const i64, out: []f32) !bool {
@@ -818,7 +849,14 @@ const PrefetchPool = struct {
             const rows = self.rows;
             const wide_out = self.wide_out;
             const refs = self.wide_refs;
+            const walk_out = self.walk_out;
             self.mu.unlock(io);
+            if (walk_out) |out| {
+                var i = idx;
+                while (i < rows.len) : (i += N) table.row(@intCast(rows[i]), out[i * table.dim ..][0..table.dim]);
+                _ = self.pending.fetchSub(1, .acq_rel);
+                continue;
+            }
             if (wide_out) |output| {
                 var buf: [ROW_BUF]u8 = undefined;
                 var reads: u64 = 0;
@@ -1437,6 +1475,72 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
     defer test_ngram_cache_limit = null;
     try t.gatherChecked(ids, got, 0);
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(ref), std.mem.sliceAsBytes(got));
+}
+
+test "ngram prefill gather: the parallel mmap walk equals the serial walk in one pool round (holistech fork)" {
+    // Same 4-bit table as the 4096-row pool test above.
+    const ROWS: usize = 4096;
+    const HDR: usize = 512;
+    const W: usize = ROWS * 16;
+    const SB: usize = ROWS * 2;
+    const buf = try testing.allocator.alloc(u8, 8 + HDR + W + 2 * SB);
+    defer testing.allocator.free(buf);
+    const header = "{\"__metadata__\":{\"bits\":\"4\",\"group_size\":\"32\"}," ++
+        "\"weight\":{\"dtype\":\"U32\",\"shape\":[4096,4],\"data_offsets\":[0,65536]}," ++
+        "\"scales\":{\"dtype\":\"BF16\",\"shape\":[4096,1],\"data_offsets\":[65536,73728]}," ++
+        "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4096,1],\"data_offsets\":[73728,81920]}}";
+    std.mem.writeInt(u64, buf[0..8], HDR, .little);
+    @memset(buf[8 .. 8 + HDR], ' ');
+    @memcpy(buf[8..][0..header.len], header);
+    for (buf[8 + HDR ..], 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try td.dir.writeFile(io, .{ .sub_path = "ngram_table.bin", .data = buf });
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try td.dir.realPath(io, &pbuf);
+    var full: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&full, "{s}/ngram_table.bin", .{pbuf[0..root_len]});
+
+    warm_override = false;
+    defer warm_override = null;
+    var t = try NgramTable.open(path);
+    defer t.close();
+    const pool = t.pool orelse return error.SkipZigTest;
+
+    const ids = try testing.allocator.alloc(i64, ROWS);
+    defer testing.allocator.free(ids);
+    for (ids, 0..) |*r, i| r.* = @intCast((i *% 1237) % ROWS);
+    const ref = try testing.allocator.alloc(f32, ROWS * t.dim);
+    defer testing.allocator.free(ref);
+    const got = try testing.allocator.alloc(f32, ROWS * t.dim);
+    defer testing.allocator.free(got);
+
+    // Reference: the serial mmap walk (prefetch forced off, no pool round).
+    ple_prefill_prefetch_override = false;
+    defer ple_prefill_prefetch_override = null;
+    const saved = ple_wide_walk;
+    defer ple_wide_walk = saved;
+    ple_wide_walk = false;
+    const before = pool.runs.load(.monotonic);
+    try t.gatherChecked(ids, ref, 1_000_000);
+    try testing.expectEqual(before, pool.runs.load(.monotonic));
+
+    ple_wide_walk = true;
+    @memset(got, -1.0);
+    try t.gatherChecked(ids, got, 1_000_000);
+    try testing.expectEqual(before + 1, pool.runs.load(.monotonic));
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(ref), std.mem.sliceAsBytes(got));
+
+    // A decode-width gather (<= MAX_ROWS) keeps its arm.
+    const dec = ids[0..16];
+    const d_got = try testing.allocator.alloc(f32, dec.len * t.dim);
+    defer testing.allocator.free(d_got);
+    const dec_before = pool.runs.load(.monotonic);
+    try t.gatherChecked(dec, d_got, 1_000_000);
+    try testing.expectEqual(dec_before + 1, pool.runs.load(.monotonic));
+    try testing.expectEqualSlices(f32, ref[0 .. dec.len * t.dim], d_got);
 }
 
 test "ngram table: a bf16 .bin gathers rows from the mmap and through the pool" {
