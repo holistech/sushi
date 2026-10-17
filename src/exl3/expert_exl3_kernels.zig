@@ -47,8 +47,13 @@ fn funnelReads(n: u32) bool {
 /// and the prepare; the other readers carry one.
 const GemvLayout = struct { funnel: bool, tiles: c_int };
 
+/// Exploration seam (SUSHI_EXP_GEMV_TILES=1): one output tile per threadgroup on the
+/// funnel, doubling the decode grid; the per-tile accumulation order is unchanged.
+pub var gemv_tiles_override: ?c_int = null;
+
 fn gemvLayout(n: u32, out_tiles: c_int) GemvLayout {
     const funnel = !funnel_off_for_test and funnelReads(n);
+    if (funnel and gemv_tiles_override != null and gemv_tiles_override.? == 1) return .{ .funnel = true, .tiles = 1 };
     return .{ .funnel = funnel, .tiles = if (funnel and @rem(out_tiles, 2) == 0) 2 else 1 };
 }
 
@@ -2963,6 +2968,29 @@ pub fn moeSwigluFused(
     return moeSwigluFusedWithShared(s, x, gate_t, gate_suh, gate_svh, up_t, up_suh, up_svh, down_t, down_suh, down_svh, slots, scores, out_dtype, null, null);
 }
 
+/// Erkundung (holistech-Fork): `SUSHI_EXP_MOE_SKIP` als Bitmaske P=1, D=2, R=4, einmal gelesen.
+var moe_exp_skip: ?u8 = null;
+fn moeExpSkip() u8 {
+    if (moe_exp_skip) |v| return v;
+    var v: u8 = 0;
+    if (std.c.getenv("SUSHI_EXP_MOE_SKIP")) |r| {
+        for (std.mem.sliceTo(r, 0)) |c| switch (c) {
+            'P' => v |= 1,
+            'D' => v |= 2,
+            'R' => v |= 4,
+            else => {},
+        };
+    }
+    moe_exp_skip = v;
+    return v;
+}
+fn moeExpZerosLike(s: mlx.mlx_stream, a: mlx.mlx_array) !mlx.mlx_array {
+    var z = mlx.mlx_array_new();
+    const sh = mlx.getShape(a);
+    try mlx.check(mlx.mlx_zeros(&z, sh.ptr, sh.len, mlx.mlx_array_dtype(a), s));
+    return z;
+}
+
 pub fn moeSwigluFusedWithShared(
     s: mlx.mlx_stream,
     x: mlx.mlx_array,
@@ -3000,6 +3028,15 @@ pub fn moeSwigluFusedWithShared(
     } else try pairGemv(s, x, gate_suh, up_suh, gate_t, up_t, slots, hidden, inter, nslots, topk, group);
     defer _ = mlx.mlx_array_free(inners[0]);
     defer _ = mlx.mlx_array_free(inners[1]);
+    const moe_skip = moeExpSkip();
+    const ig_use = if (moe_skip & 1 != 0) try moeExpZerosLike(s, inners[0]) else inners[0];
+    defer if (moe_skip & 1 != 0) {
+        _ = mlx.mlx_array_free(ig_use);
+    };
+    const iu_use = if (moe_skip & 1 != 0) try moeExpZerosLike(s, inners[1]) else inners[1];
+    defer if (moe_skip & 1 != 0) {
+        _ = mlx.mlx_array_free(iu_use);
+    };
     try ubenchEval(inners[0], "pair_gemv");
     if (exl3UbenchOn()) try mlx.check(mlx.mlx_array_eval(inners[1]));
     const maxabs = swigluMaxabsOn() and swiglu_maxabs_dumped < 96;
@@ -3008,14 +3045,18 @@ pub fn moeSwigluFusedWithShared(
         try dumpAbsMax(s, inners[1], "iu");
     }
     const down_inner = if (prepared) blk: {
-        const y = try downGemvPreparedMid(s, inners[0], inners[1], down_t, gate_svh, up_svh, down_suh, slots, inter, hidden, nslots, group);
+        const y = try downGemvPreparedMid(s, ig_use, iu_use, down_t, gate_svh, up_svh, down_suh, slots, inter, hidden, nslots, group);
         if (!prepared_mid_engaged) {
             prepared_mid_engaged = true;
             log.info("[exl3-decode] prepared mid engaged dtype=bfloat16 middle=f16 after down-input Hadamard\n", .{});
         }
         break :blk y;
-    } else try downGemvFusedMid(s, inners[0], inners[1], down_t, gate_svh, up_svh, down_suh, slots, inter, hidden, nslots);
+    } else try downGemvFusedMid(s, ig_use, iu_use, down_t, gate_svh, up_svh, down_suh, slots, inter, hidden, nslots);
     defer _ = mlx.mlx_array_free(down_inner);
+    const down_use = if (moe_skip & 2 != 0) try moeExpZerosLike(s, down_inner) else down_inner;
+    defer if (moe_skip & 2 != 0) {
+        _ = mlx.mlx_array_free(down_use);
+    };
     try ubenchEval(down_inner, "down_gemv");
     // The SwiGLU product and the down inner plane are the f16 stores that can
     // saturate: a non-finite here is the mid overflow, not a decode fault.
@@ -3023,7 +3064,12 @@ pub fn moeSwigluFusedWithShared(
         try dumpAbsMax(s, down_inner, "down_inner");
         swiglu_maxabs_dumped += 1;
     }
-    const out = try downFinishReduceWithShared(s, down_inner, down_svh, slots, scores, hidden, rows, topk, out_dtype, shared, shared_gate, false);
+    const out = blk: {
+        const o = try downFinishReduceWithShared(s, down_use, down_svh, slots, scores, hidden, rows, topk, out_dtype, shared, shared_gate, false);
+        if (moe_skip & 4 == 0) break :blk o;
+        defer _ = mlx.mlx_array_free(o);
+        break :blk try moeExpZerosLike(s, o);
+    };
     errdefer _ = mlx.mlx_array_free(out);
     try ubenchEval(out, "reduce");
     if (applyUbenchOn()) {

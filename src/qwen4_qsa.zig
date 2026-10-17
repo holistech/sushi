@@ -1497,7 +1497,38 @@ pub fn qsaBlockVisibility(self: *Transformer, offset: c_int, seq_len: c_int, nb:
 /// One row-chunk of the block selection: the top-`kb` visible blocks per row, ascending,
 /// INT_MAX past the row's count. Under `all_vis` the visibility sheet and both `where`s are
 /// identities and are skipped; the fused arm reads the same claim through `qsaVisibleBoundsHost`.
+/// Erkundung (holistech-Fork): `SUSHI_EXP_QSA_SKIP` als Bitmaske L=1, S=2, einmal gelesen.
+var qsa_exp_skip: ?u8 = null;
+fn qsaExpSkip() u8 {
+    if (qsa_exp_skip) |v| return v;
+    var v: u8 = 0;
+    if (std.c.getenv("SUSHI_EXP_QSA_SKIP")) |r| {
+        for (std.mem.sliceTo(r, 0)) |c| switch (c) {
+            'L' => v |= 1,
+            'S' => v |= 2,
+            else => {},
+        };
+    }
+    qsa_exp_skip = v;
+    return v;
+}
+
 pub fn qsaChunkSelect(self: *Transformer, scores: mlx.mlx_array, canonical: mlx.mlx_array, row0: c_int, rows: c_int, nb: c_int, ratio: c_int, kb: c_int, block_topk: c_int, all_vis: bool) !mlx.mlx_array {
+    if (canonical.ctx == null and qsaExpSkip() & 1 != 0) {
+        // Erkundung: feste Bloecke 0..kb-1 statt Auswahl (Ausgabe unbrauchbar).
+        var ar = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ar);
+        try mlx.check(mlx.mlx_arange(&ar, 0, @floatFromInt(kb), 1.0, .int32, self.s));
+        var r3 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(r3);
+        try mlx.check(mlx.mlx_reshape(&r3, ar, &[_]c_int{ 1, 1, kb }, 3, self.s));
+        var bc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(bc);
+        try mlx.check(mlx.mlx_broadcast_to(&bc, r3, &[_]c_int{ 1, rows, kb }, 3, self.s));
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_contiguous(&out, bc, false, self.s));
+        return out;
+    }
     if (canonical.ctx == null and qsaSelectKernelEnabled() and mlx.streamIsGpu(self.s)) {
         // The whole composed tail in one dispatch; bounds are host arithmetic.
         const bounds_host = try self.allocator.alloc(i32, @intCast(rows));
@@ -1560,8 +1591,17 @@ pub fn qsaSelectBlocks(self: *Transformer, q_rope: mlx.mlx_array, k32t: mlx.mlx_
         defer _ = mlx.mlx_array_free(q_chunk);
         try mlx.check(mlx.mlx_slice(&q_chunk, q_rope, &[_]c_int{ 0, 0, r0, 0 }, 4, &[_]c_int{ 1, n_idx, r1, idx_hd }, 4, &strides4, 4, self.s));
         qsa_index_score_graphs += 1;
-        const scores = try qsaScoreSheet(self.s, q_chunk, pooled, k32t, fused);
-        defer _ = mlx.mlx_array_free(scores);
+        const scores_real = try qsaScoreSheet(self.s, q_chunk, pooled, k32t, fused);
+        defer _ = mlx.mlx_array_free(scores_real);
+        const scores = if (qsaExpSkip() & 2 != 0) blk: {
+            var z = mlx.mlx_array_new();
+            const sh = mlx.getShape(scores_real);
+            try mlx.check(mlx.mlx_zeros(&z, sh.ptr, sh.len, mlx.mlx_array_dtype(scores_real), self.s));
+            break :blk z;
+        } else scores_real;
+        defer if (qsaExpSkip() & 2 != 0) {
+            _ = mlx.mlx_array_free(scores);
+        };
         const sorted = try self.qsaChunkSelect(scores, canonical, offset + r0, rows, nb, ratio, kb, block_topk, qsaAllBlocksVisible(offset + r0, nb, ratio));
         errdefer _ = mlx.mlx_array_free(sorted);
         try parts.append(self.allocator, sorted);
