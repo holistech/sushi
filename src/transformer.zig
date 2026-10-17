@@ -2683,6 +2683,16 @@ pub fn qsaGatherEnabled() bool {
 /// 64-row tile, the gather reads 2051 rows per token unshared (ladder: 8k
 /// -3%, 16k +4%, 32k +19%, 64k +42%).
 pub const QSA_GATHER_MIN_KV_DEFAULT: c_int = 8192;
+
+/// holistech fork: up to this many keys the qwen4_exp QSA prefill runs the mask arm
+/// (fusedSdpa256Masked) instead of the block gather; set once by main (`applyM1PrefillDefaults`),
+/// 0 keeps the gather at every width, and `server.qsaMaskBytes` bills the mask up to it. A kv8
+/// cache otherwise gathers at every width, but on the M1 Ultra the mask arm wins up to 4096 keys
+/// (qsa-pf-ubench.py, 2026-10-17, kv8, 12 dependent layers, gather / mask ms: kv 4096 S 1024
+/// 397 / 325, S 4096 1171 / 757; kv 8192 S 4096 1566 / 1951). Prefill meter at 4096 rows
+/// 5632 -> 5183 ms; API prompt of 3943 tokens +8 % without and with MTP, 32k document +1.1 %, peak
+/// footprint +0.2 GB. Not bit-equal: KLD 0.0023 against the gather at 2500-token prompts.
+pub var qsa_prefill_mask_max_kv: c_int = 0;
 pub var qsa_gather_min_kv_override: ?c_int = null;
 
 pub fn qsaGatherMinKv() c_int {

@@ -2453,7 +2453,9 @@ pub fn gatedFullAttnProjected(
         }
         // The prefill kernel has no q_len floor of its own; a verify-width
         // selection must never fall into it (it walks the WHOLE cache).
-        if (gathered == null and seq_len >= FUSED256_MIN_Q_LEN and ctx.qsa_blocks.ctx != null and !qwen4Standin().attn_sdpa) {
+        if (gathered == null and seq_len >= FUSED256_MIN_Q_LEN and ctx.qsa_blocks.ctx != null and !qwen4Standin().attn_sdpa and
+            mlx.getShape(full_k)[2] > trf.qsa_prefill_mask_max_kv)
+        {
             const prof = diagEnvOnCached(&qwen4_profile_qsa_env, "QWEN4_PROFILE_QSA");
             var clk: ProfClock = undefined;
             if (prof) {

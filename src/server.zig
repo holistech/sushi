@@ -3283,9 +3283,14 @@ pub fn qsaMaskBytes(config: *const model_mod.ModelConfig, fwd: u64, kv: u64) u64
     if (config.indexer_budget == 0) return 0;
     // Prefill widths gather by block index (row-chunked score sheet, no
     // [S, kv] mask); decode/verify widths still build the dense mask.
-    if (fwd >= transformer_mod.FUSED256_MIN_Q_LEN and transformer_mod.qsaGatherEnabled())
-        return transformer_mod.qsaPrefillTransientBytes(config.indexer_n_heads, fwd, kv, config.indexer_compress_ratio, config.indexer_head_dim);
-    return QSA_MASK_BYTES_PER_KEY * fwd * kv * 5 / 4;
+    const mask = QSA_MASK_BYTES_PER_KEY * fwd * kv * 5 / 4;
+    if (fwd >= transformer_mod.FUSED256_MIN_Q_LEN and transformer_mod.qsaGatherEnabled()) {
+        const gather = transformer_mod.qsaPrefillTransientBytes(config.indexer_n_heads, fwd, kv, config.indexer_compress_ratio, config.indexer_head_dim);
+        // holistech fork: up to `qsa_prefill_mask_max_kv` keys the prefill runs the mask arm.
+        if (kv <= @as(u64, @intCast(@max(transformer_mod.qsa_prefill_mask_max_kv, 0)))) return @max(gather, mask);
+        return gather;
+    }
+    return mask;
 }
 
 /// Widths `resolvePrefillChunk` will step down through. Descending, floored at
@@ -22037,6 +22042,26 @@ test "resolvePrefillChunk: a squeezed box steps the chunk down; a roomy one keep
         try t.expect(c >= generate_mod.PREFILL_CHUNK_FLOOR);
         prev = c;
     }
+}
+
+test "qsaMaskBytes: up to qsa_prefill_mask_max_kv keys a prefill width bills the mask arm (holistech fork)" {
+    const t = std.testing;
+    var cfg = model_mod.ModelConfig{};
+    cfg.indexer_budget = 2048;
+    cfg.indexer_n_heads = 4;
+    cfg.indexer_compress_ratio = 4;
+    cfg.indexer_head_dim = 128;
+    const saved = transformer_mod.qsa_prefill_mask_max_kv;
+    defer transformer_mod.qsa_prefill_mask_max_kv = saved;
+    transformer_mod.qsa_prefill_mask_max_kv = 0;
+    const gather_4k = qsaMaskBytes(&cfg, 4096, 4096);
+    const gather_8k = qsaMaskBytes(&cfg, 4096, 8192);
+    transformer_mod.qsa_prefill_mask_max_kv = 4096;
+    // The bill covers the mask; past the limit it is the gather's alone. (On M1 the unfused score
+    // sheet already exceeds the mask at these sizes, so the max only binds on a fused sheet.)
+    try t.expect(qsaMaskBytes(&cfg, 4096, 4096) >= QSA_MASK_BYTES_PER_KEY * 4096 * 4096 * 5 / 4);
+    try t.expect(qsaMaskBytes(&cfg, 4096, 4096) >= gather_4k);
+    try t.expectEqual(gather_8k, qsaMaskBytes(&cfg, 4096, 8192));
 }
 
 test "qsaMaskBytes: a qwen4_exp twin bills the QSA mask and steps a rung the qwen3_5 twin keeps" {
