@@ -2246,19 +2246,45 @@ const ATTN_PD_KERNEL_SOURCE =
     \\}
 ;
 
+/// holistech fork: the SIMD kernel with K staged row-major (one uint4 store per lane, the S = Q K^T
+/// reads with swapped indices), set once by main (`applyM1PrefillDefaults`). Every MMA gets the
+/// same operands, so the output is bit-identical (test below). In the stock staging a lane
+/// scatters its key row over 8 rows of the transposed tile. Measured on the M1 Ultra only
+/// (qsaWideUbench mask arm, kv8, 12 dependent layers, 2026-10-17, attnpd-abl.py): S = kv = 4096
+/// 733 / 738 -> 561 ms, S = kv = 2048 213 -> 163 ms; with a 16-key tile on top 689 ms, the
+/// 16-key tile alone 676, without the QSA mask lookup 683 (output wrong).
+pub var attn_pd_krow: bool = false;
+
+const ATTN_PD_KERNEL_SOURCE_KROW = blk: {
+    @setEvalBranchQuota(4_000_000);
+    const pairs = [_][2][]const u8{
+        .{ "constexpr int SMEM = (LDK * BDK > BK * LDV) ? (LDK * BDK) : (BK * LDV);", "constexpr int LDKR = BDK + 8;\nconstexpr int SMEM = (BK * LDKR > BK * LDV) ? (BK * LDKR) : (BK * LDV);" },
+        .{ "    thread T* e = (thread T*)&w;\n    const int cb = c8 * 8;\n    Ks[(cb + 0) * LDK + r] = e[0];\n    Ks[(cb + 1) * LDK + r] = e[1];\n    Ks[(cb + 2) * LDK + r] = e[2];\n    Ks[(cb + 3) * LDK + r] = e[3];\n    Ks[(cb + 4) * LDK + r] = e[4];\n    Ks[(cb + 5) * LDK + r] = e[5];\n    Ks[(cb + 6) * LDK + r] = e[6];\n    Ks[(cb + 7) * LDK + r] = e[7];", "    *((threadgroup uint4*)(Ks + r * LDKR) + c8) = w;" },
+        .{ "    const int kbase = Ks_off + dd * 8 * LDK;\n    const float2 kf0 = float2(float(Ks[kbase]), float(Ks[kbase + 1]));\n    const float2 kf1 = float2(float(Ks[kbase + 8]), float(Ks[kbase + 9]));\n    const float2 kf2 = float2(float(Ks[kbase + 16]), float(Ks[kbase + 17]));\n    const float2 kf3 = float2(float(Ks[kbase + 24]), float(Ks[kbase + 25]));", "    const int kbase = sn * LDKR + dd * 8 + sm;\n    const float2 kf0 = float2(float(Ks[kbase]), float(Ks[kbase + LDKR]));\n    const float2 kf1 = float2(float(Ks[kbase + 8 * LDKR]), float(Ks[kbase + 9 * LDKR]));\n    const float2 kf2 = float2(float(Ks[kbase + 16 * LDKR]), float(Ks[kbase + 17 * LDKR]));\n    const float2 kf3 = float2(float(Ks[kbase + 24 * LDKR]), float(Ks[kbase + 25 * LDKR]));" },
+    };
+    var src: []const u8 = ATTN_PD_KERNEL_SOURCE;
+    for (pairs) |pr| {
+        const at = std.mem.indexOf(u8, src, pr[0]) orelse @compileError("attn_pd krow: pattern not in the kernel");
+        if (std.mem.indexOf(u8, src[at + 1 ..], pr[0]) != null) @compileError("attn_pd krow: pattern not unique");
+        src = src[0..at] ++ pr[1] ++ src[at + pr[0].len ..];
+    }
+    break :blk (src ++ "\x00")[0..src.len :0];
+};
+
 /// Which kernel a `sushi_attn_pd` dispatch runs: the SIMD-matrix kernel above, or
 /// `sushi_attn_pd_nax` (src/kernels/attn_pd_nax.metal) on the M5 matrix units.
 pub const AttnPdArm = enum { simd, nax };
 
-/// [simd, nax]
-var attn_pd_kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
+/// [simd, nax, simd krow]
+var attn_pd_kernels: [3]?mlx.mlx_fast_metal_kernel = .{ null, null, null };
 
 fn getAttnPdKernel(arm: AttnPdArm) !mlx.mlx_fast_metal_kernel {
-    const slot = &attn_pd_kernels[@intFromEnum(arm)];
+    const krow = arm == .simd and attn_pd_krow;
+    const slot = &attn_pd_kernels[if (krow) 2 else @intFromEnum(arm)];
     if (slot.*) |kk| return kk;
     const kernel = try newAttnPdKernel(
-        if (arm == .nax) "sushi_attn_pd_nax" else "sushi_attn_pd",
-        if (arm == .nax) @embedFile("kernels/attn_pd_nax.metal") else ATTN_PD_KERNEL_SOURCE,
+        if (arm == .nax) "sushi_attn_pd_nax" else if (krow) "sushi_attn_pd_krow" else "sushi_attn_pd",
+        if (arm == .nax) @embedFile("kernels/attn_pd_nax.metal") else if (krow) ATTN_PD_KERNEL_SOURCE_KROW else ATTN_PD_KERNEL_SOURCE,
         if (arm == .nax) @embedFile("kernels/attn_pd_nax_header.metal") else ATTN_PD_KERNEL_HEADER,
     );
     slot.* = kernel;
@@ -39322,6 +39348,51 @@ test "sushi_attn_pd every arm: qk 192 / v 128 causal vs fp64 truth (ragged, carr
         try attnPdGlobalCase(seed + 3, 4, 1, 300, 2300, 20.0, 4 * 300 * 256, false);
         // A packed kv8 cache, dequantized one slice per dispatch.
         try attnPdGlobalCase(seed + 4, 16, 1, 70, 1993, 8.0, 16 * 70 * 256, true);
+    }
+}
+
+test "sushi_attn_pd row-major K (holistech fork): bit-identical to the stock SIMD kernel" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    fused256_override = true;
+    defer fused256_override = null;
+    attn_pd_nax_override = false;
+    defer attn_pd_nax_override = null;
+    const saved = attn_pd_krow;
+    defer attn_pd_krow = saved;
+    var prng = std.Random.DefaultPrng.init(0x0B09);
+    const rnd = prng.random();
+    // [hq, qL, hk, kL, dk, dv]: Flash-Next geometry, ragged tails, and the asymmetric 192/128.
+    for ([_][6]c_int{ .{ 24, 300, 2, 1000, 256, 256 }, .{ 16, 70, 2, 1993, 192, 128 } }) |c| {
+        const q = try attn256RandBf16Scaled(rnd, &[_]c_int{ 1, c[0], c[1], c[4] }, 8.0, s);
+        defer _ = mlx.mlx_array_free(q);
+        const k = try attn256RandBf16(rnd, &[_]c_int{ 1, c[2], c[3], c[4] }, s);
+        defer _ = mlx.mlx_array_free(k);
+        const v = try attn256RandBf16(rnd, &[_]c_int{ 1, c[2], c[3], c[5] }, s);
+        defer _ = mlx.mlx_array_free(v);
+        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(c[4])));
+        attn_pd_krow = false;
+        const ref = (try fusedSdpaPrefill(s, q, k, v, scale, 0)) orelse return error.FusedDeclined;
+        defer _ = mlx.mlx_array_free(ref);
+        attn_pd_krow = true;
+        const got = (try fusedSdpaPrefill(s, q, k, v, scale, 0)) orelse return error.FusedDeclined;
+        defer _ = mlx.mlx_array_free(got);
+        try std.testing.expectEqual(AttnPdArm.simd, attn_pd_last_arm);
+        try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(got, ref, s));
+        if (c[4] != 256) continue;
+        // The QSA mask arm: a random visibility on top of causal.
+        const mb = try std.testing.allocator.alloc(bool, @intCast(c[1] * c[3]));
+        defer std.testing.allocator.free(mb);
+        for (mb) |*m| m.* = rnd.boolean();
+        const u = mlx.mlx_array_new_data(mb.ptr, &[_]c_int{ 1, 1, c[1], c[3] }, 4, .bool_);
+        defer _ = mlx.mlx_array_free(u);
+        attn_pd_krow = false;
+        const mref = (try fusedSdpa256Masked(s, q, k, v, scale, u)) orelse return error.FusedDeclined;
+        defer _ = mlx.mlx_array_free(mref);
+        attn_pd_krow = true;
+        const mgot = (try fusedSdpa256Masked(s, q, k, v, scale, u)) orelse return error.FusedDeclined;
+        defer _ = mlx.mlx_array_free(mgot);
+        try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(mgot, mref, s));
     }
 }
 

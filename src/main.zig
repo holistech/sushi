@@ -370,10 +370,11 @@ fn applyM1CommandBufferDefaults() void {
 }
 
 /// On the M1 Ultra: the dequant+GEMM prefill route from 1024 rows instead of 2048 and in f16, the
-/// QSA prefill mask arm up to 4096 keys, the row-major 8-key QSA gather kernel, and the parallel
-/// mmap walk for the PLE prefill gather (measurements at `transformer.prefill_dq_gemm_min_m`,
-/// `prefill_dq_gemm_f16`, `qsa_prefill_mask_max_kv`, `qsa_gather_rows` and
-/// `qwen4_exp.ple_wide_walk`). Other chips are unmeasured and keep the defaults.
+/// QSA prefill mask arm up to 4096 keys, the row-major 8-key QSA gather kernel, the parallel mmap
+/// walk for the PLE prefill gather, and row-major K in the prefill attention kernel (measurements
+/// at `transformer.prefill_dq_gemm_min_m`, `prefill_dq_gemm_f16`, `qsa_prefill_mask_max_kv`,
+/// `qsa_gather_rows`, `qwen4_exp.ple_wide_walk` and `attn_pd_krow`). Other chips are unmeasured
+/// and keep the defaults.
 fn applyM1PrefillDefaults() void {
     if (!std.mem.eql(u8, chip_mod.chipBrand(), "Apple M1 Ultra")) return;
     @import("transformer.zig").prefill_dq_gemm_min_m = 1024;
@@ -381,6 +382,7 @@ fn applyM1PrefillDefaults() void {
     @import("transformer.zig").qsa_prefill_mask_max_kv = 4096;
     @import("transformer.zig").qsa_gather_rows = true;
     @import("qwen4_exp.zig").ple_wide_walk = true;
+    @import("transformer.zig").attn_pd_krow = true;
 }
 
 pub fn main(init: std.process.Init) !void {
