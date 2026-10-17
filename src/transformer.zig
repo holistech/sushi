@@ -2710,6 +2710,22 @@ pub fn qsaPrefillGatherMinKvFrom(seq_len: c_int, nax_serves: bool, override: ?c_
 /// Key tile of the gather kernel.
 const QSA_GATHER_BK: c_int = 32;
 
+/// holistech fork: the gather kernel with K staged row-major and an 8-key tile, set once by main
+/// (`applyM1PrefillDefaults`). In the stock kernel a simdgroup's lanes stage one key row each
+/// iteration and scatter it transposed, 8 * LDK halves apart per lane; the row-major staging hands
+/// every MMA the same operands (KLD 0 against the stock kernel, 4900-token prompts). The 8-key
+/// tile is what pays on the M1 Ultra: qsaWideUbench shapes, 12 dependent layers, kv8, S 4096,
+/// 2026-10-17, ms at kv 8192 / 32768: stock 1565 / 1588, row-major 1485 / 1508, 8-key tile
+/// 978 / 994, both 821 / 837 (16-key tile with both 1084 / 1098). Not bit-equal (the online
+/// softmax rescales per tile): KLD 0.0079 against the stock kernel at 4900-token prompts, where
+/// the f16 dequant route (`prefill_dq_gemm_f16`) measures 0.0081. Outside NAX only.
+pub var qsa_gather_rows: bool = false;
+const QSA_GATHER_ROWS_BK: c_int = 8;
+
+fn qsaGatherBk(nax: bool) c_int {
+    return if (!nax and qsa_gather_rows) QSA_GATHER_ROWS_BK else QSA_GATHER_BK;
+}
+
 pub var qsa_decode_gather_override: ?bool = null;
 
 /// Decode-width QSA gather (S==1): reuse the sorted block selection and read
@@ -2920,10 +2936,36 @@ const ATTN_QSA256_KERNEL_SOURCE =
     \\}
 ;
 
-var attn_qsa256_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
+/// `qsa_gather_rows` form of ATTN_QSA256_KERNEL_SOURCE, derived at compile time so the two cannot
+/// drift: K staged row-major like V (one uint4 store), read with swapped indices, buffer BK * LDV.
+const ATTN_QSA256_KERNEL_SOURCE_ROWS = blk: {
+    @setEvalBranchQuota(2_000_000);
+    const pairs = [_][2][]const u8{
+        .{ "threadgroup T KVs[LDK * BD];", "threadgroup T KVs[BK * LDV];" },
+        .{
+            "    thread T* e = (thread T*)&w;\n    const int cb = c8 * 8;\n    for (int j = 0; j < 8; ++j) Ks[(cb + j) * LDK + r] = e[j];",
+            "    *((threadgroup uint4*)(Ks + r * LDV) + c8) = w;",
+        },
+        .{
+            "    const int kbase = Ks_off + dd * 8 * LDK;\n    for (int kt = 0; kt < KT; ++kt) {\n      const float2 kf = float2(float(Ks[kbase + kt * 8]), float(Ks[kbase + kt * 8 + 1]));",
+            "    const int kbase = sn * LDV + dd * 8 + sm;\n    for (int kt = 0; kt < KT; ++kt) {\n      const float2 kf = float2(float(Ks[kbase + kt * 8 * LDV]), float(Ks[kbase + kt * 8 * LDV + LDV]));",
+        },
+    };
+    var src: []const u8 = ATTN_QSA256_KERNEL_SOURCE;
+    for (pairs) |pr| {
+        const at = std.mem.indexOf(u8, src, pr[0]) orelse @compileError("qsa rows: pattern not in the gather kernel");
+        if (std.mem.indexOf(u8, src[at + 1 ..], pr[0]) != null) @compileError("qsa rows: pattern not unique");
+        src = src[0..at] ++ pr[1] ++ src[at + pr[0].len ..];
+    }
+    break :blk (src ++ "\x00")[0..src.len :0];
+};
+
+/// [stock, rows]
+var attn_qsa256_kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
 
 fn getAttnQsa256Kernel() !mlx.mlx_fast_metal_kernel {
-    if (attn_qsa256_kernel_cached) |kk| return kk;
+    const slot = &attn_qsa256_kernels[@intFromBool(qsa_gather_rows)];
+    if (slot.*) |kk| return kk;
     const input_names = [_][*:0]const u8{ "q", "k", "v", "scl", "blocks" };
     const output_names = [_][*:0]const u8{"out"};
     const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
@@ -2931,16 +2973,16 @@ fn getAttnQsa256Kernel() !mlx.mlx_fast_metal_kernel {
     const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
     defer _ = mlx.mlx_vector_string_free(out_vec);
     const kernel = mlx.mlx_fast_metal_kernel_new(
-        "sushi_attn_qsa256",
+        if (qsa_gather_rows) "sushi_attn_qsa256_rows" else "sushi_attn_qsa256",
         in_vec,
         out_vec,
-        ATTN_QSA256_KERNEL_SOURCE,
+        if (qsa_gather_rows) ATTN_QSA256_KERNEL_SOURCE_ROWS else ATTN_QSA256_KERNEL_SOURCE,
         ATTN_QSA256_KERNEL_HEADER,
         false, // K/V are cache views (see sushi_attn_p256)
         false,
     );
     if (kernel.ctx == null) return error.MetalKernelCompileFailed;
-    attn_qsa256_kernel_cached = kernel;
+    slot.* = kernel;
     return kernel;
 }
 
@@ -3172,7 +3214,7 @@ fn qsaGatherProbeDispatch(
     const ks = mlx.getShape(k);
     const gqa: c_int = @divTrunc(qs[1], ks[1]);
     const nsg: c_int = @divTrunc(gqa + 7, 8);
-    const bk: c_int = QSA_GATHER_BK;
+    const bk: c_int = qsaGatherBk(nax);
     const one = [_]c_int{1};
     const scl_data = [_]f32{scale};
     const scl = mlx.mlx_array_new_data(&scl_data, &one, 1, .float32);
@@ -3334,12 +3376,12 @@ const QSA_PACKED_HEADER =
     \\
 ;
 
-/// [stock, nax]
-var qsa_gather_packed_kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
+/// [stock, nax, stock rows]
+var qsa_gather_packed_kernels: [3]?mlx.mlx_fast_metal_kernel = .{ null, null, null };
 
 fn getQsaGatherPackedKernel(nax: bool) !mlx.mlx_fast_metal_kernel {
     if (nax and !verifyQmmNaxAvailable()) return error.NaxUnavailable;
-    const slot = &qsa_gather_packed_kernels[@intFromBool(nax)];
+    const slot = &qsa_gather_packed_kernels[if (nax) 1 else if (qsa_gather_rows) 2 else 0];
     if (slot.*) |kernel| return kernel;
     const names = [_][*:0]const u8{ "q", "k", "v", "scl", "blocks", "ksc", "kbi", "vsc", "vbi" };
     const outputs = [_][*:0]const u8{"out"};
@@ -3347,8 +3389,8 @@ fn getQsaGatherPackedKernel(nax: bool) !mlx.mlx_fast_metal_kernel {
     defer _ = mlx.mlx_vector_string_free(in_vec);
     const out_vec = mlx.mlx_vector_string_new_data(&outputs, outputs.len);
     defer _ = mlx.mlx_vector_string_free(out_vec);
-    const name: [*:0]const u8 = if (nax) "sushi_qsa_nax_packed" else "sushi_attn_qsa256_packed";
-    const source: [*:0]const u8 = if (nax) @embedFile("kernels/qsa_nax.metal") else ATTN_QSA256_KERNEL_SOURCE;
+    const name: [*:0]const u8 = if (nax) "sushi_qsa_nax_packed" else if (qsa_gather_rows) "sushi_attn_qsa256_packed_rows" else "sushi_attn_qsa256_packed";
+    const source: [*:0]const u8 = if (nax) @embedFile("kernels/qsa_nax.metal") else if (qsa_gather_rows) ATTN_QSA256_KERNEL_SOURCE_ROWS else ATTN_QSA256_KERNEL_SOURCE;
     const header: [*:0]const u8 = if (nax) QSA_PACKED_HEADER ++ @embedFile("kernels/qsa_nax_header.metal") else QSA_PACKED_HEADER ++ ATTN_QSA256_KERNEL_HEADER;
     const kernel = mlx.mlx_fast_metal_kernel_new(name, in_vec, out_vec, source, header, false, false);
     if (kernel.ctx == null) return error.MetalKernelCompileFailed;
@@ -3463,7 +3505,7 @@ fn gatherQsa256Impl(
     const scl = mlx.mlx_array_new_data(&scl_data, &one, 1, .float32);
     defer _ = mlx.mlx_array_free(scl);
     const nsg: c_int = @divTrunc(gqa + 7, 8);
-    const bk: c_int = QSA_GATHER_BK;
+    const bk: c_int = qsaGatherBk(use_nax);
     const key = QsaGatherCfgKey{
         .q_shape = ShapeKey.from(qs),
         .h_kv = ks[1],
@@ -41973,6 +42015,40 @@ fn attn256ReferenceRows(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, sc
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 2, s));
     return out;
+}
+
+test "qsa gather rows layout, 8-key tile (holistech fork): within bf16 noise of the stock kernel" {
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const ta = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x0B08);
+    const rnd = prng.random();
+    const kv: c_int = 6144;
+    const sq: c_int = 256;
+    const kb: c_int = 512;
+    const k = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, kv, 256 }, s);
+    defer _ = mlx.mlx_array_free(k);
+    const v = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, kv, 256 }, s);
+    defer _ = mlx.mlx_array_free(v);
+    const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, sq, 256 }, s);
+    defer _ = mlx.mlx_array_free(q);
+    const bh = try qsaVerifyBlocksHost(ta, rnd, sq, kv, kb, 4);
+    defer ta.free(bh);
+    const blocks = mlx.mlx_array_new_data(bh.ptr, &[_]c_int{ 1, sq, kb }, 3, .int32);
+    defer _ = mlx.mlx_array_free(blocks);
+    const saved = qsa_gather_rows;
+    defer qsa_gather_rows = saved;
+    qsa_gather_rows = false;
+    const ref = (try gatherQsa256(s, q, k, v, 1.0 / 16.0, blocks, 4)) orelse return error.GatherDeclined;
+    defer _ = mlx.mlx_array_free(ref);
+    qsa_gather_rows = true;
+    const got = (try gatherQsa256(s, q, k, v, 1.0 / 16.0, blocks, 4)) orelse return error.GatherDeclined;
+    defer _ = mlx.mlx_array_free(got);
+    const d = try attn256MaxDiff(got, ref, s);
+    try std.testing.expect(d < 0.005);
+    // The 8-key tile rescales the online softmax more often, so a nonzero difference shows the
+    // rows kernel actually ran.
+    try std.testing.expect(d > 0);
 }
 
 test "qsa packed gather: prefill widths read the packed cache as precisely as the gather over its dense rebuild" {

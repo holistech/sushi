@@ -369,15 +369,16 @@ fn applyM1CommandBufferDefaults() void {
     if (!mb_preset and std.mem.eql(u8, brand, "Apple M1 Ultra")) @import("cb_phase.zig").enable(250, 1000);
 }
 
-/// On the M1 Ultra: the dequant+GEMM prefill route from 1024 rows instead of 2048 and in f16, and
-/// the QSA prefill mask arm up to 4096 keys (measurements at `transformer.prefill_dq_gemm_min_m`,
-/// `prefill_dq_gemm_f16` and `qsa_prefill_mask_max_kv`). Other chips are unmeasured and keep the
-/// defaults.
+/// On the M1 Ultra: the dequant+GEMM prefill route from 1024 rows instead of 2048 and in f16, the
+/// QSA prefill mask arm up to 4096 keys, and the row-major 8-key QSA gather kernel (measurements at
+/// `transformer.prefill_dq_gemm_min_m`, `prefill_dq_gemm_f16`, `qsa_prefill_mask_max_kv` and
+/// `qsa_gather_rows`). Other chips are unmeasured and keep the defaults.
 fn applyM1PrefillDefaults() void {
     if (!std.mem.eql(u8, chip_mod.chipBrand(), "Apple M1 Ultra")) return;
     @import("transformer.zig").prefill_dq_gemm_min_m = 1024;
     @import("transformer.zig").prefill_dq_gemm_f16 = true;
     @import("transformer.zig").qsa_prefill_mask_max_kv = 4096;
+    @import("transformer.zig").qsa_gather_rows = true;
 }
 
 pub fn main(init: std.process.Init) !void {
