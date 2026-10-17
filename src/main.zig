@@ -28,6 +28,7 @@ const sleep_inhibit_mod = @import("sleep_inhibit.zig");
 const version_mod = @import("version.zig");
 const parent_watch = @import("parent_watch.zig");
 const update_mod = @import("update.zig");
+const chip_mod = @import("chip.zig");
 
 pub const VERSION: []const u8 = build_options.version;
 
@@ -348,9 +349,28 @@ fn printUsage(io: std.Io) void {
     stdout_w.interface.flush() catch {};
 }
 
+/// Command-buffer limits for the M1 Max and M1 Ultra, unless the environment sets them. MLX
+/// commits a buffer after 50 ops or 50 MB on both dies (`device.cpp`, arch suffixes `s`/`d`),
+/// about 75 commits per Flash-Next decode forward. Measured 2026-10-17, Flash-Next
+/// Sushi-2.6bpw kv8, fresh server per arm, two rounds, output hashes unchanged: on the M1 Ultra
+/// 1000/1000 took the API decode from 42.0 to 45.8 tok/s without MTP and 54.3 -> 58.4 with
+/// MTP (1500 and 2000 within the run-to-run spread; raising only the op limit was slower
+/// than 50/50); on the M1 Max +8 % decode without and with MTP depth 2. This default itself, decode
+/// meter A B B A against MLX_MAX_OPS_PER_BUFFER=MLX_MAX_MB_PER_BUFFER=50 in the same binary (M1 Ultra,
+/// 4k keys): 28.89 -> 27.48 ms per one-row forward, 59.3 -> 56.6 ms at four rows. Other chips are unmeasured.
+fn applyM1CommandBufferDefaults() void {
+    const brand = chip_mod.chipBrand();
+    if (!std.mem.eql(u8, brand, "Apple M1 Max") and !std.mem.eql(u8, brand, "Apple M1 Ultra")) return;
+    _ = setenv("MLX_MAX_OPS_PER_BUFFER", "1000", 0);
+    _ = setenv("MLX_MAX_MB_PER_BUFFER", "1000", 0);
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
+
+    // Before any MLX call: the Metal device reads its command-buffer limits once, on creation.
+    applyM1CommandBufferDefaults();
 
     // Bound MLX's reclaimable buffer pool before anything can allocate. ONCE,
     // above every subcommand branch — a per-serve-path call is how
