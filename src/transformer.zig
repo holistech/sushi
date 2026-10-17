@@ -7,6 +7,7 @@ const expert_bf16 = @import("expert_bf16_kernels.zig");
 const imatrix_capture = @import("imatrix.zig");
 const sushi_exl3 = @import("sushi_exl3");
 const expert_exl3_kernels = sushi_exl3.kernels;
+const chip_mod = @import("chip.zig");
 const expert_exl3 = sushi_exl3.format;
 const expert_quant_mod = @import("expert_quant.zig");
 const fp8_block = @import("fp8_block.zig");
@@ -4304,6 +4305,13 @@ pub var qsa_attn_nsplit_override: ?c_int = null;
 /// thread exists: first touch of a `?bool`/`?c_int` from two threads is a race.
 pub fn warmQsaEnvCaches() void {
     _ = qsaScoreSheetBudget();
+    if (std.c.getenv("SUSHI_EXP_QSA_NSPLIT")) |r| qsa_attn_nsplit_override = std.fmt.parseInt(c_int, std.mem.sliceTo(r, 0), 10) catch null;
+    if (std.c.getenv("SUSHI_EXP_QSA_SG")) |r| qsa_attn_simdgroups_override = std.fmt.parseInt(c_int, std.mem.sliceTo(r, 0), 10) catch null;
+    if (std.c.getenv("SUSHI_EXP_QSA_BK")) |r| qsa_attn_bk_override = std.fmt.parseInt(c_int, std.mem.sliceTo(r, 0), 10) catch null;
+    if (std.c.getenv("SUSHI_QSA_ULTRA")) |r| qsa_ultra_override = r[0] == '1';
+    _ = qsaUltraDie();
+    if (std.c.getenv("SUSHI_EXP_GEMV_TILES")) |r| expert_exl3_kernels.gemv_tiles_override = std.fmt.parseInt(c_int, std.mem.sliceTo(r, 0), 10) catch null;
+    if (std.c.getenv("SUSHI_EXP_PAIR_SPLITS")) |r| expert_exl3_kernels.setPairSplitsForTest(std.fmt.parseInt(u32, std.mem.sliceTo(r, 0), 10) catch null);
 }
 
 pub fn qsaAttnNSplit() c_int {
@@ -4319,9 +4327,45 @@ pub fn qsaAttnNSplit() c_int {
 /// Test and microbench seam: forces the simdgroups per threadgroup (floored at the computing ones).
 pub var qsa_attn_simdgroups_override: ?c_int = null;
 
+/// Ultra dies (two GPUs over UltraFusion, 48-80 cores) are their own row: the GPU arch string
+/// cannot tell them from a Max, the brand string can (`chip.chipBrand`).
+var qsa_ultra_cached: ?bool = null;
+pub var qsa_ultra_override: ?bool = null;
+
+fn qsaUltraDie() bool {
+    if (qsa_ultra_override) |v| return v;
+    if (qsa_ultra_cached) |v| return v;
+    const v = std.mem.indexOf(u8, chip_mod.chipBrand(), "Ultra") != null;
+    qsa_ultra_cached = v;
+    return v;
+}
+
+/// Threadgroups an Ultra's decode grid should reach. Measured M1 Ultra (64 cores), Flash-Next
+/// Sushi-2.6bpw kv8, decode meter at 1 row, A B B A, 2026-10-17: the default 32 threadgroups
+/// (2 KV heads x 16 splits) leave half the cores idle; 32 splits with 8 simdgroups took the
+/// forward 29.68 -> 28.74 ms at 4k keys (kernel alone 195 -> 136 us per layer); 64 splits read
+/// the same, 8 splits lose. More splits change the merge's summation order (last bf16 bit).
+pub const QSA_ATTN_ULTRA_MIN_TGS: c_int = 64;
+
+/// Split count for a call: the flat default, or on an Ultra die enough splits that the grid
+/// reaches `QSA_ATTN_ULTRA_MIN_TGS` (verify widths already do at the default).
+pub fn qsaAttnNSplitFor(seq_len: c_int, h_kv: c_int) c_int {
+    if (qsa_attn_nsplit_override != null) return qsaAttnNSplit();
+    var n = QSA_ATTN_NSPLIT_DEFAULT;
+    if (qsaUltraDie()) {
+        while (seq_len * h_kv * n < QSA_ATTN_ULTRA_MIN_TGS and n < QSA_ATTN_MAX_NSPLIT) n *= 2;
+    }
+    return n;
+}
+
 /// Simdgroups per QSA split-K threadgroup: a small grid stages each tile with loader simdgroups.
+/// On an Ultra the grid is twice as wide (see `qsaAttnNSplitFor`) and 8 simdgroups read best
+/// (kernel 136 us vs 141 at 16 and 160 at 2, same meter run).
 pub fn qsaAttnSimdgroups(seq_len: c_int, h_kv: c_int, nsg: c_int, nsplit: c_int) c_int {
-    const fallback: c_int = if (seq_len * h_kv * nsplit <= 32) 16 else nsg;
+    const ultra = qsaUltraDie();
+    const small: c_int = if (ultra) QSA_ATTN_ULTRA_MIN_TGS else 32;
+    const loaders: c_int = if (ultra) 8 else 16;
+    const fallback: c_int = if (seq_len * h_kv * nsplit <= small) loaders else nsg;
     return @max(nsg, @min(qsa_attn_simdgroups_override orelse fallback, 32));
 }
 
@@ -4387,6 +4431,14 @@ pub fn qsaAttnBk() c_int {
     const v = qsa_attn_bk_override orelse QSA_ATTN_BK;
     if (v <= 0 or @rem(v, 8) != 0 or v > 32) return QSA_ATTN_BK;
     return v;
+}
+
+/// Tile depth for a call: on an Ultra the widened one-row grid reads best at 32 (decode meter
+/// 2026-10-17, 32 splits / 8 simdgroups: 28.74 -> 28.67 ms at 4k keys, 29.35 -> 29.24 at 32k).
+pub fn qsaAttnBkFor(seq_len: c_int, h_kv: c_int) c_int {
+    if (qsa_attn_bk_override != null) return qsaAttnBk();
+    if (qsaUltraDie() and seq_len * h_kv * QSA_ATTN_NSPLIT_DEFAULT < QSA_ATTN_ULTRA_MIN_TGS) return 32;
+    return QSA_ATTN_BK;
 }
 
 var qsa_attn_q_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
@@ -4640,8 +4692,8 @@ pub fn qsaSparseAttn(
         .quant = quant,
         .sparse = true,
         .nsg = @divTrunc(gqa + 7, 8),
-        .nsgt = qsaAttnSimdgroups(seq_len, h_kv, @divTrunc(gqa + 7, 8), qsaAttnNSplit()),        .nsplit = qsaAttnNSplit(),
-        .bk = qsaAttnBk(),
+        .nsgt = qsaAttnSimdgroups(seq_len, h_kv, @divTrunc(gqa + 7, 8), qsaAttnNSplitFor(seq_len, h_kv)),        .nsplit = qsaAttnNSplitFor(seq_len, h_kv),
+        .bk = qsaAttnBkFor(seq_len, h_kv),
         .ratio = ratio,
         .dtype = .bfloat16,
     };
@@ -56431,3 +56483,175 @@ test "GLM vision native serving splices media before HC expansion and preserves 
         try testing.expectEqual(request.offset, ctx.cache.step);
     }
 }
+
+// Exploration (holistech fork, M1 Ultra): split count, simdgroups and tile depth of the
+// decode-width QSA split-K kernel, timed as 12 dependent layers like the test above, and the
+// largest output difference against the default geometry (0 = bit-identical).
+test "qsa sparse attn sweep: split, simdgroups, tile depth (SUSHI_EXP_QSA_SWEEP=1)" {
+    if (!diagEnvOn("SUSHI_EXP_QSA_SWEEP")) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = std.testing.allocator;
+    const ratio: c_int = 4;
+    const layers: usize = 12;
+    const chain: usize = 8;
+    const reps: usize = 7;
+    var prng = std.Random.DefaultPrng.init(0x0B5E_7A11);
+    const rnd = prng.random();
+    defer {
+        qsa_attn_simdgroups_override = null;
+        qsa_attn_nsplit_override = null;
+        qsa_attn_bk_override = null;
+    }
+    // (nsplit, simdgroups, bk); the first arm is the served default at decode width.
+    const arms = [_][3]c_int{
+        .{ 16, 16, 16 }, .{ 16, 2, 16 }, .{ 32, 16, 16 }, .{ 32, 8, 16 }, .{ 32, 2, 16 },
+        .{ 64, 16, 16 }, .{ 64, 8, 16 }, .{ 64, 4, 16 }, .{ 64, 2, 16 }, .{ 16, 16, 32 },
+        .{ 32, 16, 32 }, .{ 64, 8, 32 }, .{ 8, 16, 16 },
+    };
+    for ([_]c_int{ 4096, 32768 }) |kv| {
+        var caches: [layers]KVCache = undefined;
+        var views: [layers]DenseKVView = undefined;
+        var built: usize = 0;
+        defer for (0..built) |i| {
+            views[i].deinit();
+            caches[i].deinit();
+        };
+        for (0..layers) |i| {
+            const k = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, kv, 256 }, s);
+            defer _ = mlx.mlx_array_free(k);
+            const v = try testRandWeightBf16(rnd, &[_]c_int{ 1, 2, kv, 256 }, s);
+            defer _ = mlx.mlx_array_free(v);
+            caches[i] = try KVCache.initWithConfig(ta, 1, kv_quant.KVQuantConfig.affine(8));
+            views[i] = try qsaAttnCacheFixture(ta, s, k, v, kv, kv - 1, kv_quant.KVQuantConfig.affine(8), &caches[i]);
+            built += 1;
+        }
+        const blocks_host = try qsaVerifyBlocksHost(ta, rnd, 1, kv, 512, ratio);
+        defer ta.free(blocks_host);
+        const blocks = mlx.mlx_array_new_data(blocks_host.ptr, &[_]c_int{ 1, 1, 512 }, 3, .int32);
+        defer _ = mlx.mlx_array_free(blocks);
+        const q0 = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, 1, 256 }, s);
+        defer _ = mlx.mlx_array_free(q0);
+        // Reference output of one call at the default geometry.
+        var ref = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ref);
+        var us: [arms.len][reps]f64 = undefined;
+        var diff: [arms.len]f32 = @splat(-1);
+        for (0..reps + 1) |rep| for (arms, 0..) |arm, ai| {
+            qsa_attn_nsplit_override = arm[0];
+            qsa_attn_simdgroups_override = arm[1];
+            qsa_attn_bk_override = arm[2];
+            if (rep == 0) {
+                const one = (try qsaSparseAttn(s, q0, &views[0], blocks, ratio, 1.0 / 16.0)) orelse return error.SparseAttnDeclined;
+                defer _ = mlx.mlx_array_free(one);
+                var f = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(f);
+                try mlx.check(mlx.mlx_astype(&f, one, .float32, s));
+                try mlx.check(mlx.mlx_array_eval(f));
+                if (ai == 0) {
+                    try mlx.check(mlx.mlx_array_set(&ref, f));
+                    diff[0] = 0;
+                } else diff[ai] = qsaProbeMaxAbsDiff(s, f, ref) orelse -2;
+            }
+            var q = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&q, q0));
+            for (0..chain) |_| for (&views) |*view| {
+                const out = (try qsaSparseAttn(s, q, view, blocks, ratio, 1.0 / 16.0)) orelse return error.SparseAttnDeclined;
+                _ = mlx.mlx_array_free(q);
+                q = out;
+            };
+            var clk = ProfClock.init();
+            try mlx.check(mlx.mlx_array_eval(q));
+            const ns = clk.lap();
+            _ = mlx.mlx_array_free(q);
+            if (rep > 0) us[ai][rep - 1] = @as(f64, @floatFromInt(ns)) / 1e3 / @as(f64, @floatFromInt(layers * chain));
+        };
+        for (arms, 0..) |arm, ai| {
+            std.mem.sort(f64, &us[ai], {}, std.sort.asc(f64));
+            std.debug.print("[qsa-sweep] kv={d} nsplit={d} sg={d} bk={d}: {d:.1} us/call (median of {d}, min {d:.1}) maxdiff={e}\n", .{ kv, arm[0], arm[1], arm[2], us[ai][reps / 2], reps, us[ai][0], diff[ai] });
+        }
+    }
+}
+
+test "fused hyper-connection read dump for a cross-build bit comparison (SUSHI_HC_DUMP)" {
+    const path = std.c.getenv("SUSHI_HC_DUMP") orelse return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x4D5F_0A12);
+    const rnd = prng.random();
+    const bf16Random = struct {
+        fn f(a: std.mem.Allocator, r: std.Random, st: mlx.mlx_stream, shape: []const c_int, scale: f32, offset: f32) !mlx.mlx_array {
+            var n: usize = 1;
+            for (shape) |d| n *= @intCast(d);
+            const buf = try a.alloc(f32, n);
+            defer a.free(buf);
+            for (buf) |*v| v.* = (r.float(f32) - 0.5) * scale + offset;
+            const a32 = mlx.mlx_array_new_data(buf.ptr, shape.ptr, @intCast(shape.len), .float32);
+            defer _ = mlx.mlx_array_free(a32);
+            var out = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&out, a32, .bfloat16, st));
+            return out;
+        }
+    }.f;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(allocator);
+    const Geo = struct { h: c_int, r: c_int, bits: u32 };
+    for ([_]Geo{ .{ .h = 2560, .r = 320, .bits = 8 }, .{ .h = 512, .r = 64, .bits = 4 } }) |geo| {
+        const HC: c_int = 4;
+        const K = HC * geo.h;
+        var q: [2][3]mlx.mlx_array = undefined;
+        for ([_][2]c_int{ .{ geo.r, K }, .{ K, geo.r } }, 0..) |dims, wi| {
+            const w = try bf16Random(allocator, rnd, s, &.{ dims[0], dims[1] }, 0.2, 0.0);
+            defer _ = mlx.mlx_array_free(w);
+            var triple = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(triple);
+            try mlx.check(mlx.mlx_quantize(&triple, w, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(@intCast(geo.bits)), "affine", .{}, s));
+            for (&q[wi], 0..) |*a, i| {
+                a.* = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_vector_array_get(a, triple, i));
+            }
+        }
+        defer for (q) |t| for (t) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        const nw = try bf16Random(allocator, rnd, s, &.{ HC, geo.h }, 1.0, 1.0);
+        defer _ = mlx.mlx_array_free(nw);
+        const iw = try bf16Random(allocator, rnd, s, &.{ K, HC }, 0.1, 0.0);
+        defer _ = mlx.mlx_array_free(iw);
+        for ([_]c_int{ 1, 2, 3, 7, 8, 9, 16 }) |rows| {
+            const x = try bf16Random(allocator, rnd, s, &.{ 1, rows, K }, 4.0, 0.0);
+            defer _ = mlx.mlx_array_free(x);
+            const wo = try bf16Random(allocator, rnd, s, &.{ 1, rows, geo.h }, 2.0, 0.0);
+            defer _ = mlx.mlx_array_free(wo);
+            const wiv = try bf16Random(allocator, rnd, s, &.{ 1, rows, HC, 1 }, 1.0, 1.0);
+            defer _ = mlx.mlx_array_free(wiv);
+            for ([_][2]bool{ .{ true, true }, .{ true, false }, .{ false, true }, .{ false, false } }) |arm| {
+                const pend: ?HcPending = if (arm[1]) .{ .out = wo, .inj = wiv } else null;
+                const o = (try hcReadFused(s, x, 1, rows, nw, q[0][0], q[0][1], q[0][2], q[1][0], q[1][1], q[1][2], if (arm[0]) iw else .{ .ctx = null }, 1e-6, HC, geo.h, geo.bits, 64, pend)) orelse return error.HcFusedDeclined;
+                defer {
+                    _ = mlx.mlx_array_free(o.mixed);
+                    if (o.inj.ctx != null) _ = mlx.mlx_array_free(o.inj);
+                    if (o.stream.ctx != null) _ = mlx.mlx_array_free(o.stream);
+                }
+                for ([_]mlx.mlx_array{ o.mixed, o.inj, o.stream }) |a| {
+                    if (a.ctx == null) continue;
+                    var c32 = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(c32);
+                    try mlx.check(mlx.mlx_astype(&c32, a, .float32, s));
+                    var cc = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(cc);
+                    try mlx.check(mlx.mlx_contiguous(&cc, c32, false, s));
+                    try mlx.check(mlx.mlx_array_eval(cc));
+                    const d = mlx.mlx_array_data_float32(cc).?;
+                    try bytes.appendSlice(allocator, std.mem.sliceAsBytes(d[0..mlx.mlx_array_size(cc)]));
+                }
+            }
+        }
+    }
+    const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    if (fd < 0) return error.HcDumpOpenFailed;
+    defer _ = std.c.close(fd);
+    if (std.c.write(fd, bytes.items.ptr, bytes.items.len) != @as(isize, @intCast(bytes.items.len))) return error.HcDumpWriteFailed;
+    std.debug.print("[hc-dump] {d} bytes -> {s}\n", .{ bytes.items.len, path });
+}
+
