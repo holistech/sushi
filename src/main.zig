@@ -369,10 +369,13 @@ fn applyM1CommandBufferDefaults() void {
     if (!mb_preset and std.mem.eql(u8, brand, "Apple M1 Ultra")) @import("cb_phase.zig").enable(250, 1000);
 }
 
-/// The dequant+GEMM prefill route from 1024 rows instead of 2048 on the M1 Ultra (measurement at
-/// `transformer.prefill_dq_gemm_min_m`). Other chips are unmeasured and keep the default.
+/// The dequant+GEMM prefill route from 1024 rows instead of 2048, and in f16, on the M1 Ultra
+/// (measurements at `transformer.prefill_dq_gemm_min_m` and `prefill_dq_gemm_f16`). Other chips
+/// are unmeasured and keep the defaults.
 fn applyM1PrefillDefaults() void {
-    if (std.mem.eql(u8, chip_mod.chipBrand(), "Apple M1 Ultra")) @import("transformer.zig").prefill_dq_gemm_min_m = 1024;
+    if (!std.mem.eql(u8, chip_mod.chipBrand(), "Apple M1 Ultra")) return;
+    @import("transformer.zig").prefill_dq_gemm_min_m = 1024;
+    @import("transformer.zig").prefill_dq_gemm_f16 = true;
 }
 
 pub fn main(init: std.process.Init) !void {

@@ -26195,6 +26195,15 @@ pub fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: ml
 
 /// The dequant+GEMM prefill route (see the block comment above
 /// prefillDqGemmEnabled). Returns null when the call must stay on stock qmm.
+/// holistech fork: run the route in f16 when the activations are bf16, set once by main
+/// (`applyM1PrefillDefaults`). Measured with MLX 0.32.3 on the M1 Ultra, M = 2025,
+/// dequant + matmul 14.4-15.2 TFLOPS in bf16 against 17.5-18.4 in f16 (qmm-prefill.py,
+/// 2026-10-17). x is cast to f16, the weight dequantized to f16, the product cast back to bf16.
+/// Flash-Next Sushi-2.6bpw kv8, 2026-10-17, A B B A: prefill meter -5.8 % per 2025-row chunk; API 32k document 646 -> 687 tok/s without MTP, 643 -> 686 with; KLD 0.0057 against the bf16 route at 2500-token prompts, below the 0.0074 of switching the route off; peak footprint at 32k 50.5 GiB against 50.6-50.8.
+/// A value beyond f16's 65504 would overflow; the projections this route serves take normalized
+/// inputs, and the KLD above shows none on real text.
+pub var prefill_dq_gemm_f16: bool = false;
+
 fn prefillDqGemm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
     if (!prefillDqGemmEnabled()) return null;
     switch (bits) {
@@ -26208,15 +26217,28 @@ fn prefillDqGemm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.
     const xd = mlx.mlx_array_dtype(x);
     if (xd != .bfloat16 and xd != .float16) return null;
 
+    const as_f16 = xd == .bfloat16 and prefill_dq_gemm_f16;
+    const cd: mlx.mlx_dtype = if (as_f16) .float16 else xd;
+    var xh = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(xh);
+    if (as_f16) try mlx.check(mlx.mlx_astype(&xh, x, .float16, s));
+
     var dq = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(dq);
-    try mlx.check(mlx.mlx_dequantize(&dq, w, sc, bi, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{ .ctx = null }, mlx.mlx_optional_dtype{ .value = xd, .has_value = true }, s));
+    try mlx.check(mlx.mlx_dequantize(&dq, w, sc, bi, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{ .ctx = null }, mlx.mlx_optional_dtype{ .value = cd, .has_value = true }, s));
     var dq_t = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(dq_t);
     try mlx.check(mlx.mlx_transpose(&dq_t, dq, s));
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_matmul(&out, x, dq_t, s));
+    if (as_f16) {
+        var oh = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(oh);
+        try mlx.check(mlx.mlx_matmul(&oh, xh, dq_t, s));
+        try mlx.check(mlx.mlx_astype(&out, oh, .bfloat16, s));
+    } else {
+        try mlx.check(mlx.mlx_matmul(&out, x, dq_t, s));
+    }
     prefill_dq_gemm_engaged += 1;
     return out;
 }
@@ -33257,6 +33279,21 @@ test "qmatmulBits: prefill-width affine calls take the dequant+GEMM route (engag
     // bf16-weight-rounding is the only extra error source — same magnitude
     // class as the stock kernel's own bf16 output rounding.
     try testing.expect(routed_err <= 1.5 * stock_err + 5e-3);
+
+    // holistech fork: the f16 form (M1 Ultra) keeps a bf16 result within the same bound.
+    prefill_dq_gemm_f16 = true;
+    defer prefill_dq_gemm_f16 = false;
+    const before16 = prefill_dq_gemm_engaged;
+    const routed16 = try qmatmulBits(x, wq, wsc, wbi, 4, 64, .affine, s);
+    defer _ = mlx.mlx_array_free(routed16);
+    try testing.expectEqual(before16 + 1, prefill_dq_gemm_engaged);
+    try testing.expect(mlx.mlx_array_dtype(routed16) == .bfloat16);
+    const routed16_f = try evalToF32(al, routed16, on, s);
+    defer al.free(routed16_f);
+    var routed16_err: f32 = 0;
+    for (0..on) |i| routed16_err = @max(routed16_err, @abs(routed16_f[i] - gtd[i]));
+    try testing.expect(routed16_err <= 1.5 * stock_err + 5e-3);
+    prefill_dq_gemm_f16 = false;
 
     // Decode/verify widths never route (M below the floor).
     var x8 = mlx.mlx_array_new();
