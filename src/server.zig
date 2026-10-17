@@ -6085,7 +6085,7 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
     // the route off: +0.51 GB on the qwen3_5 27B at chunk
     // 2048, +0.17-0.21 on the lfm2 2.6B, ~0 at chunk 8192 where the envelope
     // already dominates.
-    const dq_weights: u64 = if (fwd >= transformer_mod.PREFILL_DQ_GEMM_MIN_M) dequant_weights else 0;
+    const dq_weights: u64 = if (fwd >= transformer_mod.prefill_dq_gemm_min_m) dequant_weights else 0;
     const gross: u64 = kv_bytes + req.reserved_kv_bytes + req.state_bytes + req.checkpoint_bytes +
         req.grow_coexist_bytes + req.qsa_ring_bytes + req.mtp_head_kv_bytes + scores + dequant + envelope + dq_weights + PREFILL_RUNTIME_FLOOR_BYTES;
     // The one place a warm turn's resident rows leave the bill, inside the 5/4.
@@ -6146,7 +6146,7 @@ fn prefillStreamBytesPerToken(config: *const model_mod.ModelConfig) u64 {
 /// (a bf16 copy of the weight plus its transpose, ~3 alive across the layer
 /// loop). Chunk-INDEPENDENT — it is weights, not activations — and billed only
 /// where the route can fire: affine-quantized weights, and (inside
-/// `prefillMemoryNeeded`) forwards at least `PREFILL_DQ_GEMM_MIN_M` wide.
+/// `prefillMemoryNeeded`) forwards at least `transformer.prefill_dq_gemm_min_m` wide.
 /// Reads the same kill switch the route does, so an A/B with the route off
 /// does not get billed for it.
 fn prefillDequantWeightBytes(config: *const model_mod.ModelConfig) u64 {
@@ -22189,6 +22189,22 @@ test "prefillMemoryNeeded: every prefill peak the box measured, re-derived for t
     try t.expect(prefillMemoryNeeded(10206, 32, 8, 16384, 64, 64, 2048, 10752, 16, 8192, 10206, 0, 3 * 10752 * 2048 * 2, .{}) >= 2_527_000_000);
     // muse_glimmer 30B dense: hidden 6656, ffn 19968, 52 layers, hd 128.
     try t.expect(prefillMemoryNeeded(9827, 32, 2, 53248, 128, 128, 6656, 19968, 16, 2048, 9827, 0, 3 * 19968 * 6656 * 2, .{}) >= 2_178_000_000);
+}
+
+test "prefillMemoryNeeded: the dequant-weight bill follows the route's threshold (holistech fork)" {
+    const t = std.testing;
+    const saved = transformer_mod.prefill_dq_gemm_min_m;
+    defer transformer_mod.prefill_dq_gemm_min_m = saved;
+    const dq: u64 = 3 * 17408 * 5120 * 2;
+    const at = struct {
+        fn f(dqb: u64) u64 {
+            return prefillMemoryNeeded(9320, 24, 4, 65536, 256, 256, 5120, 17408, 16, 1024, 9320, 0, dqb, .{});
+        }
+    }.f;
+    transformer_mod.prefill_dq_gemm_min_m = transformer_mod.PREFILL_DQ_GEMM_MIN_M;
+    try t.expectEqual(at(0), at(dq));
+    transformer_mod.prefill_dq_gemm_min_m = 1024;
+    try t.expectEqual(at(dq) - at(0), dq * 5 / 4);
 }
 
 test "prefillMemoryNeeded: the new terms fire only where the measurement put them" {

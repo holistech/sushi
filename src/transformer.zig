@@ -25526,6 +25526,15 @@ pub fn prefillDqGemmEnabled() bool {
     return prefill_dq_gemm_override orelse true;
 }
 
+/// holistech fork: the row threshold the route actually uses, set once by main before any prefill
+/// (`applyM1PrefillDefaults`); the server's admission bills the dequantized weights by the same
+/// value. On the M1 Ultra the route already pays at 1024 rows (Flash-Next Sushi-2.6bpw kv8,
+/// 2026-10-17, same binary A B B A): prefill meter +4.7 % at 1024 rows and +7.6 % at 1536, API
+/// prompt of 1493 tokens 673 -> 728 tok/s. Not bit-equal: KLD against the default's own fixture
+/// 0.0044 (4 prompts x 1475 tokens, 256 generated), against 0.0074 for switching the route off
+/// at 2500-token prompts, i.e. the rounding the default already accepts above 2048 rows.
+pub var prefill_dq_gemm_min_m: usize = PREFILL_DQ_GEMM_MIN_M;
+
 /// Test seam: engagement is counted, never inferred from output equality.
 pub var prefill_dq_gemm_engaged: u64 = 0;
 
@@ -26195,7 +26204,7 @@ fn prefillDqGemm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.
     const last = lastDim(x) orelse return null;
     if (last == 0) return null;
     const rows = mlx.mlx_array_size(x) / @as(usize, @intCast(last));
-    if (rows < PREFILL_DQ_GEMM_MIN_M) return null;
+    if (rows < prefill_dq_gemm_min_m) return null;
     const xd = mlx.mlx_array_dtype(x);
     if (xd != .bfloat16 and xd != .float16) return null;
 

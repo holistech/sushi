@@ -369,12 +369,19 @@ fn applyM1CommandBufferDefaults() void {
     if (!mb_preset and std.mem.eql(u8, brand, "Apple M1 Ultra")) @import("cb_phase.zig").enable(250, 1000);
 }
 
+/// The dequant+GEMM prefill route from 1024 rows instead of 2048 on the M1 Ultra (measurement at
+/// `transformer.prefill_dq_gemm_min_m`). Other chips are unmeasured and keep the default.
+fn applyM1PrefillDefaults() void {
+    if (std.mem.eql(u8, chip_mod.chipBrand(), "Apple M1 Ultra")) @import("transformer.zig").prefill_dq_gemm_min_m = 1024;
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
 
     // Before any MLX call: the Metal device reads its command-buffer limits once, on creation.
     applyM1CommandBufferDefaults();
+    applyM1PrefillDefaults();
 
     // Bound MLX's reclaimable buffer pool before anything can allocate. ONCE,
     // above every subcommand branch — a per-serve-path call is how
