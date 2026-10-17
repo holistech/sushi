@@ -6824,6 +6824,8 @@ fn publishHandoverToken(slot: *Slot, gen: *const Generator) void {
 }
 
 fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
+    const cb_prev = @import("cb_phase.zig").enter(.prefill);
+    defer @import("cb_phase.zig").restore(cb_prev);
     // Mark the phase for the whole of prefill, and clear both signals on EVERY
     // exit path (success, cancel, error). `requests_prefilling` flips at entry
     // so the panel isn't blind until the first chunk lands; the chunk loop in
@@ -7324,6 +7326,8 @@ fn sumInflightGeneratedTokens(active: anytype) u64 {
 
 fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     if (active.len == 0) return;
+    const cb_prev = @import("cb_phase.zig").enter(.decode);
+    defer @import("cb_phase.zig").restore(cb_prev);
 
     // Publish the in-flight generated-token aggregate for the gauge sampler.
     // Runs after the whole tick (all decode work + any finishSlot calls) on

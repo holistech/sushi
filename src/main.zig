@@ -361,8 +361,12 @@ fn printUsage(io: std.Io) void {
 fn applyM1CommandBufferDefaults() void {
     const brand = chip_mod.chipBrand();
     if (!std.mem.eql(u8, brand, "Apple M1 Max") and !std.mem.eql(u8, brand, "Apple M1 Ultra")) return;
+    const mb_preset = std.c.getenv("MLX_MAX_MB_PER_BUFFER") != null;
     _ = setenv("MLX_MAX_OPS_PER_BUFFER", "1000", 0);
     _ = setenv("MLX_MAX_MB_PER_BUFFER", "1000", 0);
+    // The 1000 MB limit costs the Ultra's long prefill 3 % (see cb_phase.zig); measured there only,
+    // and a limit the user set stays fixed.
+    if (!mb_preset and std.mem.eql(u8, brand, "Apple M1 Ultra")) @import("cb_phase.zig").enable(250, 1000);
 }
 
 pub fn main(init: std.process.Init) !void {

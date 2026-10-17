@@ -50,7 +50,9 @@ done
 MLX_SHA="$(git -C "$MLX_SRC" rev-parse --short=12 HEAD)"
 MLXC_SHA="$(git -C "$MLXC_SRC" rev-parse --short=12 HEAD)"
 MLXC_PATCH="$REPO_ROOT/patches/mlxc-gather-qmm-global-scale.patch"
-PATCH_SHA="$(shasum "$MLXC_PATCH" | cut -c1-12)"
+# holistech fork: a runtime setter for MLX's per-buffer MB limit (src/cb_phase.zig).
+MLX_PATCH="$REPO_ROOT/patches/mlx-cb-phase-setter.patch"
+PATCH_SHA="$(cat "$MLXC_PATCH" "$MLX_PATCH" | shasum | cut -c1-12)"
 WANT="mlx=$MLX_SHA mlxc=$MLXC_SHA patch=$PATCH_SHA target=$DEPLOYMENT_TARGET"
 
 # Idempotent: skip when the staged build already matches the pinned SHAs.
@@ -79,6 +81,8 @@ echo "[build-mlx] SDK $SDK_VERSION, deployment target $DEPLOYMENT_TARGET, $WANT"
 NCPU="$(sysctl -n hw.ncpu)"
 
 # ── mlx (C++ core + metallib) ────────────────────────────────────────────────
+git -C "$MLX_SRC" checkout -- $(git -C "$MLX_SRC" apply --numstat -p1 "$MLX_PATCH" | cut -f3)
+git -C "$MLX_SRC" apply -p1 "$MLX_PATCH"
 cmake -S "$MLX_SRC" -B "$BUILD_ROOT/mlx" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \

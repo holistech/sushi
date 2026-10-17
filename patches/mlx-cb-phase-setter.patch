@@ -1,0 +1,58 @@
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+index d3f435a14..a8688a641 100644
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -907,6 +907,16 @@ MTL::ComputePipelineState* Device::get_kernel(
+       linked_functions);
+ }
+ 
++} // namespace mlx::core::metal
++
++// holistech fork: see Device::set_max_mb_per_buffer. Returns the previous limit.
++extern "C" MLX_API int mlx_holistech_set_max_mb_per_buffer(int mb) {
++  return mlx::core::metal::device(mlx::core::Device(mlx::core::Device::gpu))
++      .set_max_mb_per_buffer(mb);
++}
++
++namespace mlx::core::metal {
++
+ Device& device(mlx::core::Device) {
+   // Leak singleton device intentionally, to avoid cases where a compute kernel
+   // returns and tries to access the object after it has been freed by the main
+diff --git a/mlx/backend/metal/device.h b/mlx/backend/metal/device.h
+index 2d2228335..1b8a8f8be 100644
+--- a/mlx/backend/metal/device.h
++++ b/mlx/backend/metal/device.h
+@@ -2,6 +2,8 @@
+ 
+ #pragma once
+ 
++#include <atomic>
++
+ #include <Metal/Metal.hpp>
+ #include <functional>
+ #include <mutex>
+@@ -162,7 +164,13 @@ class MLX_API Device {
+     return arch_gen_;
+   }
+   std::tuple<int, int> get_max_ops_mb_per_buffer() const {
+-    return std::make_tuple(max_ops_per_buffer_, max_mb_per_buffer_);
++    return std::make_tuple(
++        max_ops_per_buffer_,
++        max_mb_per_buffer_.load(std::memory_order_relaxed));
++  }
++  // holistech fork: the host switches the MB limit between prefill and decode.
++  int set_max_mb_per_buffer(int mb) {
++    return max_mb_per_buffer_.exchange(mb, std::memory_order_relaxed);
+   }
+ 
+   MTL::Library* get_library(
+@@ -245,7 +253,7 @@ class MLX_API Device {
+   std::string arch_;
+   int arch_gen_;
+   int max_ops_per_buffer_;
+-  int max_mb_per_buffer_;
++  std::atomic<int> max_mb_per_buffer_;
+ };
+ 
+ MLX_API Device& device(mlx::core::Device);
