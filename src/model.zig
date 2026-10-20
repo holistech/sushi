@@ -189,6 +189,9 @@ pub const ModelConfig = struct {
     expert_quant_rate: expert_exl3.Rate = .{ .n = 64 },
     expert_quant_codebook: expert_exl3.Codebook = .mul1,
     expert_quant_window: expert_exl3.Window = .w16,
+    expert_quant_table: ?u8 = null,
+    /// The bank rates the pack's codebook table has a row for (bit n/2); null admits every rate.
+    expert_quant_rates: ?u128 = null,
     expert_source_dir: ?[]u8 = null,
     /// `SUSHI_NGRAM_BF16_DIR`: serve the PLE n-gram table from the ORIGINAL bf16
     /// shards in this HF checkpoint dir instead of the pack's quantized `ngram_table.bin`
@@ -197,6 +200,8 @@ pub const ModelConfig = struct {
     expert_cache_bytes: u64 = 0,
     expert_ssd_budget_bytes: u64 = 0,
     expert_workspace_bytes: u64 = 0,
+    /// What the streamed store bills beyond its mean expert, set by the streaming plan.
+    expert_shape: expert_quant.StoreShape = .{},
     expert_bounce_bytes: u64 = 0,
     expert_fill_peak_bytes: u64 = 0,
     /// A streamed load's resident vision tower (in the ssd budget) and its largest single-image
@@ -885,6 +890,8 @@ pub const ModelConfig = struct {
             .intermediate = self.moe_intermediate_size,
             .first_moe_layer = @intCast(self.first_k_dense_replace),
             .exl3_n = self.expert_quant_rate.n,
+            .exl3_rates = self.expert_quant_rates,
+            .shape = self.expert_shape,
         };
     }
 
@@ -903,6 +910,10 @@ pub const ModelConfig = struct {
 
     /// A MiMo checkpoint keeps its trunk in the source FP8 layout beside source
     /// MXFP4 or EXL3 experts, so both take the source loader.
+    pub fn expertDecode(self: *const ModelConfig) expert_exl3.Decode {
+        return .{ .codebook = self.expert_quant_codebook, .window = self.expert_quant_window, .table = self.expert_quant_table };
+    }
+
     pub fn usesMimoSourceTrunk(self: *const ModelConfig) bool {
         return std.mem.eql(u8, self.model_type, "mimo_v2") and
             (self.expert_layout == .mxfp4_individual or self.expert_layout == .exl3_k4);
@@ -1214,6 +1225,8 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
                 config.expert_quant_rate = spec.rate;
                 config.expert_quant_codebook = spec.codebook;
                 config.expert_quant_window = spec.window;
+                config.expert_quant_table = spec.table;
+                config.expert_quant_rates = spec.rates;
                 var k_buf: [8]u8 = undefined;
                 log.info("[expert-exl3] engaged K={s} codebook={s} window={d}\n", .{ spec.rate.kText(&k_buf), @tagName(spec.codebook), spec.window.bits() });
             }
@@ -2610,7 +2623,10 @@ fn indexedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
             const start = offsets.array.items[0].integer;
             const end = offsets.array.items[1].integer;
             if (start < 0 or end < start or @as(u64, @intCast(end)) > stat.size -| header_len -| 8) return error.InvalidSafetensorsHeader;
-            const size: u64 = @intCast(end - start);
+            var size: u64 = @intCast(end - start);
+            if (tensor.value_ptr.object.get("shape")) |shape| if (shape == .array and shape.array.items.len != 0 and shape.array.items[0] == .integer) {
+                size += expert_quant.rateGroupMetaBytes(canonical, std.math.cast(u64, shape.array.items[0].integer) orelse 0);
+            };
             const bucket = if (is_mtp) &mtp else if (is_vision) &tower else &total;
             bucket.* = std.math.add(u64, bucket.*, size) catch return error.InvalidSafetensorsHeader;
             found += 1;
@@ -2665,8 +2681,9 @@ pub fn mimoMtpResidentBytes(io: std.Io, allocator: std.mem.Allocator, model_dir:
 pub const served_model_types = [_][]const u8{ "qwen4_exp", "mimo_v2", "glm5_next" };
 
 /// The engine's thinking-effort vocabulary. Each served arch accepts a subset
-/// (`effortArms`); a word outside it is refused, never rounded (`selectEffort`
-/// has the one exception).
+/// (`effortArms`); a word outside it is refused. `selectEffortPick` folds Qwen
+/// `high`/`max` to `xhigh`, GLM `medium` to `high` and `xhigh` to `max`, and
+/// MiMo's thinking words to `on` (that fold is silent).
 pub const Effort = enum { off, on, minimal, low, medium, high, xhigh, max };
 
 /// Explicit --think default for serving, CLI and later model loads.
@@ -2745,11 +2762,35 @@ pub fn findEffortArm(arms: []const EffortArm, effort: Effort) ?EffortArm {
     return null;
 }
 
-/// The effort `e` selects on a model offering `offered`; null = refused. On an
-/// on/off model (mimo_v2) every thinking word selects `on`.
+/// The effort `e` selects on a model offering `offered`; null = refused.
+pub const EffortPick = struct {
+    effort: Effort,
+    /// Set when the asked word was re-routed. MiMo's on-fold leaves this null.
+    rerouted_from: ?Effort = null,
+};
+
+pub fn selectEffortPick(offered: []const Effort, e: Effort) ?EffortPick {
+    if (std.mem.indexOfScalar(Effort, offered, e) != null) return .{ .effort = e };
+    if ((e == .high or e == .max) and std.mem.indexOfScalar(Effort, offered, .xhigh) != null)
+        return .{ .effort = .xhigh, .rerouted_from = e };
+    if (e == .medium and std.mem.indexOfScalar(Effort, offered, .high) != null)
+        return .{ .effort = .high, .rerouted_from = e };
+    if (e == .xhigh and std.mem.indexOfScalar(Effort, offered, .max) != null)
+        return .{ .effort = .max, .rerouted_from = e };
+    if (e != .off and std.mem.indexOfScalar(Effort, offered, .on) != null) return .{ .effort = .on };
+    return null;
+}
+
 pub fn selectEffort(offered: []const Effort, e: Effort) ?Effort {
-    if (std.mem.indexOfScalar(Effort, offered, e) != null) return e;
-    return if (e != .off and std.mem.indexOfScalar(Effort, offered, .on) != null) .on else null;
+    const pick = selectEffortPick(offered, e) orelse return null;
+    return pick.effort;
+}
+
+/// `{model} has no `{asked}` effort; served at `{served}`.
+pub const effort_reroute_notice = "{s} has no `{s}` effort; served at `{s}`";
+
+pub fn formatEffortRerouteNotice(allocator: std.mem.Allocator, model_name: []const u8, from: Effort, to: Effort) ![]u8 {
+    return std.fmt.allocPrint(allocator, effort_reroute_notice, .{ model_name, @tagName(from), @tagName(to) });
 }
 
 /// The arm a client's effort word selects (`selectEffort`); null = refused.
@@ -5943,6 +5984,58 @@ test "thinking policy: --think binds the models that take it, the rest keep thei
     } else |err| try testing.expect(err != error.ThinkingUnsupported);
 }
 
+test "selectEffort: Qwen high and max re-route to xhigh; other unknowns stay refused" {
+    const qwen = [_]Effort{ .off, .low, .medium, .xhigh };
+    try testing.expectEqual(@as(?Effort, .xhigh), selectEffort(&qwen, .high));
+    try testing.expectEqual(@as(?Effort, .xhigh), selectEffort(&qwen, .max));
+    try testing.expectEqual(@as(?Effort, .xhigh), selectEffort(&qwen, .xhigh));
+    try testing.expectEqual(@as(?Effort, null), selectEffort(&qwen, .minimal));
+    const glm = [_]Effort{ .low, .high, .max };
+    try testing.expectEqual(@as(?Effort, .high), selectEffort(&glm, .high));
+    try testing.expectEqual(@as(?Effort, .max), selectEffort(&glm, .max));
+    try testing.expectEqual(@as(?Effort, .high), selectEffort(&glm, .medium));
+    try testing.expectEqual(@as(?Effort, .max), selectEffort(&glm, .xhigh));
+    const mimo = [_]Effort{ .off, .on };
+    try testing.expectEqual(@as(?Effort, .on), selectEffort(&mimo, .high));
+    try testing.expectEqual(@as(?Effort, .on), selectEffort(&mimo, .max));
+    try testing.expectEqual(@as(?Effort, .off), selectEffort(&mimo, .off));
+}
+
+test "selectEffort: GLM medium re-routes to high and xhigh to max; other missing words stay refused" {
+    const glm = [_]Effort{ .low, .high, .max };
+    try testing.expectEqual(@as(?Effort, .high), selectEffort(&glm, .medium));
+    try testing.expectEqual(@as(?Effort, .max), selectEffort(&glm, .xhigh));
+    try testing.expectEqual(Effort.medium, selectEffortPick(&glm, .medium).?.rerouted_from.?);
+    try testing.expectEqual(Effort.xhigh, selectEffortPick(&glm, .xhigh).?.rerouted_from.?);
+    try testing.expect(selectEffortPick(&glm, .high).?.rerouted_from == null);
+    try testing.expect(selectEffortPick(&glm, .max).?.rerouted_from == null);
+    try testing.expect(selectEffort(&glm, .off) == null);
+    try testing.expect(selectEffort(&glm, .minimal) == null);
+    try testing.expect(selectEffort(&glm, .on) == null);
+    const mimo = [_]Effort{ .off, .on };
+    try testing.expect(selectEffortPick(&mimo, .medium).?.rerouted_from == null);
+    try testing.expect(selectEffortPick(&mimo, .xhigh).?.rerouted_from == null);
+}
+
+test "selectEffortPick: only Qwen high and max carry a re-route; MiMo's on-fold stays quiet" {
+    const qwen = [_]Effort{ .off, .low, .medium, .xhigh };
+    const high = selectEffortPick(&qwen, .high).?;
+    try testing.expectEqual(Effort.xhigh, high.effort);
+    try testing.expectEqual(Effort.high, high.rerouted_from.?);
+    try testing.expect(selectEffortPick(&qwen, .xhigh).?.rerouted_from == null);
+    try testing.expect(selectEffortPick(&qwen, .minimal) == null);
+    const mimo = [_]Effort{ .off, .on };
+    try testing.expect(selectEffortPick(&mimo, .max).?.rerouted_from == null);
+    try testing.expectEqual(Effort.on, selectEffortPick(&mimo, .max).?.effort);
+    const glm = [_]Effort{ .low, .high, .max };
+    try testing.expect(selectEffortPick(&glm, .high).?.rerouted_from == null);
+    try testing.expectEqual(Effort.max, selectEffortPick(&glm, .xhigh).?.effort);
+    try testing.expectEqual(Effort.xhigh, selectEffortPick(&glm, .xhigh).?.rerouted_from.?);
+    const notice = try formatEffortRerouteNotice(testing.allocator, "Qwen3.8-Flash-Next", .high, .xhigh);
+    defer testing.allocator.free(notice);
+    try testing.expectEqualStrings("Qwen3.8-Flash-Next has no `high` effort; served at `xhigh`", notice);
+}
+
 test "thinking policy: default_reasoning_effort is the word a request naming none runs at" {
     const saved = think_effort_flag;
     defer think_effort_flag = saved;
@@ -5958,8 +6051,10 @@ test "thinking policy: default_reasoning_effort is the word a request naming non
     try testing.expectEqualStrings("off", defaultReasoningEffort(&qwen).?);
     try testing.expectEqualStrings("low", defaultReasoningEffort(&qwen_on).?);
     try testing.expect(defaultReasoningEffort(&ModelConfig{ .model_type = "llama" }) == null);
-    think_effort_flag = .xhigh;
+    think_effort_flag = .medium;
     try testing.expectEqualStrings("high", defaultReasoningEffort(&glm).?);
+    think_effort_flag = .xhigh;
+    try testing.expectEqualStrings("max", defaultReasoningEffort(&glm).?);
     try testing.expectEqualStrings("on", defaultReasoningEffort(&mimo_off).?);
     try testing.expectEqualStrings("xhigh", defaultReasoningEffort(&qwen).?);
 }

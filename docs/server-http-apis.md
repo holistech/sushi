@@ -17,10 +17,15 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   on Responses a `reasoning` object decides alone, and without one the same rule applies; `n>1` 400s.
 - **Effort vocabulary** `off on minimal low medium high xhigh max` (`none` = off; `minimal` keeps the legacy 1024
   budget on inherited arches): each served arch accepts a subset (`model.effortArms`), read through
-  `model.selectEffort` on chat, Responses, Anthropic, `--think` and the REPL's `/think` alike; a word outside it is
-  refused with the accepted list, never rounded. Uncapped = `--reasoning-budget`.
-- qwen4_exp: off, low (2048), medium (8192), xhigh (uncapped); the template reads the word; `minimal`, high, max 400.
-- glm5_next: low, high, max (uncapped, a prompt instruction); off and every other word 400.
+  `model.selectEffort` on chat, Responses, Anthropic, `--think` and the REPL's `/think` alike. A word outside it
+  is refused with the accepted list. Announced folds: Qwen `high` and `max` → `xhigh`, GLM `medium` → `high` and
+  `xhigh` → `max`. The request is served, and every re-route logs `[effort]` and rides back as
+  `X-Sushi-Effort-Notice` plus `effort_notice` (not in the answer text). MiMo's silent on-fold is unchanged.
+  Uncapped = `--reasoning-budget`.
+- qwen4_exp: off, low (2048), medium (8192), xhigh (uncapped); the template reads the word; `high` and `max`
+  are served as `xhigh` with that notice; `minimal` still 400.
+- glm5_next: low, high, max (uncapped, a prompt instruction); `medium` is served as `high` and `xhigh` as `max`
+  with that notice; off and every other word 400.
 - mimo_v2 advertises off, on: its template has only on/off, so every thinking word (`minimal` through `max`) is on,
   uncapped, and off/none is off.
 - `/v1/models` rows, loaded or not, list `reasoning_efforts` and `default_reasoning_effort`, the word a request naming
@@ -128,8 +133,9 @@ before reading a completed stream and requires clean EOF.
   (`completionShowsToken`, vLLM's default `skip_special_tokens`). Chat refuses it with a named 400
   (`chatIgnoreEosRejectReason`): past its end of turn the model writes another turn, and that turn's think block is
   merged into the reasoning by the non-stream reply (`normalizeEmbeddedThinkBlocks`) but not by the live stream.
-- **A repeat/presence penalty samples on the synchronous serial path** (`samplesSync`, like logprobs): no draft
-  path (`draftsRefused`), no batched tick (`.penalty`), never the lazy pipeline, which never applied it.
+- **A repeat/presence penalty samples on the synchronous serial path** (`samplesSync`, like logprobs): no DFlash or
+  drafter path (`draftsRefused`), no batched tick (`.penalty`), never the lazy pipeline, which never applied it.
+  MTP does run: each verify row carries the penalty ([engine-mtp](engine-mtp.md#spec-verify-invariant)).
   A penalty-mask allocation failure fails the request instead of sampling without its penalty. Chat and
   completions parse it alike (`parseRepeatPenalty`); a repeat penalty of 0 or below is off.
 - **Think penalty** (`think_penalty` request > `--think-penalty` > model-settings.json > off, 0-20; arXiv 2606.00206):
@@ -241,11 +247,22 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
 - `/props` `memory.kv_cache_bytes` = the current model's hot-cache residency + every live slot's state, published
   each tick with or without `--metrics`; a donated checkout's buffers, which the entry bills until release, count once.
 
-## Chat page (`GET /`, `GET /chat`)
+## Chat page (`GET /`, `GET /chat`, `GET /dashboard`)
 
 - One self-contained file, `src/webui/index.html` (CSS, JS and the logo inline, no external fetch), embedded with
-  `@embedFile` and served as `text/html; charset=utf-8`. Any other method on those two paths is a 405 answered BEFORE
-  model resolution, so it can never cold-load a model. Guards: `tests/test_webui.sh`, the `chat page:` tests.
+  `@embedFile` and served as `text/html; charset=utf-8`. Any other method on those three paths is a 405 answered BEFORE
+  model resolution, so it can never cold-load a model. `GET /dashboard` serves the same page and is open under
+  `--api-key` like the other two. Guards: `tests/test_webui.sh`, the `chat page:` and `dashboard page:` tests.
+- A **Chat | Dashboard** navigator in the top bar switches two views of that one page in place (`history.pushState`,
+  `popstate` for Back/Forward). The chat panel is hidden with `inert` and `visibility`, never detached, so the open
+  conversation, a streaming answer, the composer, the scroll position and the API key overlay survive a switch.
+- The dashboard (ported from @cosmic-quokka's contribution, #55) polls this server's own `/metrics.json`,
+  `/v1/models` and `/props` with the chat's stored API key as `Authorization: Bearer`, at 2 s or slower. The live
+  charts need `--metrics` (without it the page says so; the Models table still works). While hidden it polls only
+  `/metrics.json`, and only when no chat request is in flight and the browser tab is visible. Switches and tab
+  returns keep the 2 s minimum between polls; a transient error backs off (2 s doubling, up to 30 s), while a 503 or
+  401 stops the hidden poll until the dashboard is shown again. It follows the chat's
+  theme. Guard: `node tests/test_webui_dashboard.cjs` (headless Chromium through Playwright; skips if absent).
 - The right sidebar's "Prefix cache (SSD)" section is a bar meter of `/props` `settings.prefix_cache`
   (`disk_used_bytes / disk_bytes`, "<used> / <budget> GB" and the entry count beside it). It is read after each reply
   and again 2.5 s later (the server stores a turn's entry after answering) and stays hidden while `disk_bytes` is 0.
@@ -368,7 +385,7 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   disallowed. The result loads in an isolated image, never as live SVG in the chat DOM. The original code stays
   copyable. The upstream minified bundle is inline to keep the page self-contained; its license is in
   `src/webui/DOMPurify.LICENSE`. Updates should use a reviewed upstream release and rerun the renderer checks.
-- Checks: `node tests/test_webui_tools.cjs`, `node tests/test_webui_effort.cjs`, `node tests/test_webui_prefix_cache.cjs`, `tests/test_webui.sh`, and the
+- Checks: `node tests/test_webui_tools.cjs`, `node tests/test_webui_effort.cjs`, `node tests/test_webui_prefix_cache.cjs`, `node tests/test_webui_dashboard.cjs`, `tests/test_webui.sh`, and the
   `web tools:` unit test. Generate the
   browser renderer suite with `node tests/test_webui_render.cjs /tmp/sushi-render-tests/index.html`, serve that
   directory locally (or open the HTML), and require **All renderer checks passed**.

@@ -2858,8 +2858,10 @@ pub fn planExpertStreaming(io: std.Io, allocator: std.mem.Allocator, config: *co
     split.trunk +|= mimoCoarseHeadBytes(&streamed) +| fp8ExpertScratchBytes(streamed.expert_layout, geometry);
     if (!config.has_vision) split.vision = 0;
     if (!config.stream_mtp_head) split.mtp = 0;
-    const per_expert = try expert_stream_mod.expertBytesFor(allocator, model_dir, geometry, streamed.expert_layout);
-    const picked = resolveStreamedVision(budget_bytes, config, split, per_expert, vision) catch |err| {
+    const bill = try expert_stream_mod.expertBillFor(allocator, model_dir, geometry, streamed.expert_layout);
+    const per_expert = bill.expert_bytes;
+    streamed.expert_shape = bill.shape;
+    const picked = resolveStreamedVision(budget_bytes, &streamed, split, per_expert, vision) catch |err| {
         if (err == error.SsdBudgetBelowVision) log.err("[vision] --ssd-budget-gb {d} cannot hold the vision tower ({d:.2} GB) beside two expert slots per layer; raise the budget or drop --vision\n", .{
             budget_bytes >> 30,
             @as(f64, @floatFromInt(split.vision)) / 1e9,
@@ -2867,7 +2869,7 @@ pub fn planExpertStreaming(io: std.Io, allocator: std.mem.Allocator, config: *co
         return err;
     };
     if (!picked.cost.on) split.vision = 0;
-    const cache = try expert_stream_mod.cachePlanBytesForGeometry(picked.resolved.cache_bytes, geometry, per_expert);
+    const cache = try expert_stream_mod.cachePlanBytesForGeometry(picked.resolved.cache_bytes, streamed.expertGeometry(), per_expert);
     return .{ .layout = streamed.expert_layout, .split = split, .resolved = picked.resolved, .cache = cache, .vision = picked.cost };
 }
 
@@ -2966,6 +2968,7 @@ pub fn resolveExpertCache(
         @intCast(config.num_experts_per_tok),
         per_expert,
         expert_stream_mod.BOUNCE_BYTES,
+        config.expert_shape,
     );
     return .{ .cache_bytes = ledger.cache_bytes, .ledger = ledger };
 }
@@ -3960,7 +3963,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (params.config.isGlm5()) {
         const kv = transformer_mod.KvCacheChoice.resolve(params.config.kv_quant_override, params.kv_quant_config, params.kv_quant_explicit);
         if (kv.config.glmLatentBits() == null) {
-            log.err("[glm] native MLA cache supports --kv-quant 8 or off\n", .{});
+            log.err("[glm] native MLA cache supports --kv-quant 8, 6 or off\n", .{});
             return error.GlmKvQuantUnsupported;
         }
     }
@@ -4192,7 +4195,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const mtp_enabled = mtp.on and !mtp_streaming_off and !params.config.isGlm5();
     if (params.config.isGlm5()) {
         const latent_bits: u64 = if (kv_quant_config.isQuant()) kv_quant_config.bits else 16;
-        log.info("[glm] native {s} MLA: {d} latent + {d} pooled-index bytes/token; serial decode\n", .{ if (kv_quant_config.isQuant()) "kv8" else "BF16", @import("server.zig").kvBytesPerTokenAtBits(params.config.kvBytesPerToken(), latent_bits), params.config.qsaHistoryBytesPerToken() });
+        log.info("[glm] native {s} MLA: {d} latent + {d} pooled-index bytes/token; serial decode\n", .{ if (!kv_quant_config.isQuant()) "BF16" else if (kv_quant_config.bits == 6) "kv6" else "kv8", @import("server.zig").kvBytesPerTokenAtBits(params.config.kvBytesPerToken(), latent_bits), params.config.qsaHistoryBytesPerToken() });
         log.info("[glm] NAX arms {s}\n", .{if (@import("glm5_model.zig").naxArms()) "on: packed sparse and B1/B3 attention, NAX index scores, KDA cluster, A6 dense-once, MLA head batches" else "off: FP32 composite sparse and B1/B3 attention, scalar index scores, staged KDA cluster, affine QMM trunk"});
         if (mtp.on) log.warn("[glm] MTP head is not integrated with serving; MTP off\n", .{});
         if (params.prefix_cache_capacity > 0 and params.ssm_checkpoint_stride > 0) log.info("[glm] prefix cache: KDA checkpoints at every prefill chunk and the prompt end (<= {d} per entry, {d} MiB each)\n", .{ @import("glm5_prefix.zig").checkpointMax(params.ssm_checkpoint_max), params.config.ssmCheckpointBytes() >> 20 });
@@ -7417,7 +7420,7 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         while (i < mtp_n) {
             var j = i + 1;
             while (j < mtp_n and mtp_buf[j].model == mtp_buf[i].model) j += 1;
-            if (j - i >= mtpCrowdThresholdFor(mtp_buf[i]) and batchable_n + (j - i) <= batchable_buf.len) {
+            if (j - i >= mtpCrowdThresholdFor(mtp_buf[i]) and batchable_n + (j - i) <= batchable_buf.len and !anyPenalised(mtp_buf[i..j])) {
                 for (mtp_buf[i..j]) |slot| {
                     const gen = &slot.legacy_gen.?;
                     gen.mtpDetachHead(slot.allocator, true) catch |e| {
@@ -8187,7 +8190,7 @@ fn slotMimoMtpCrowdable(slot: *const Slot) bool {
     const gen = if (slot.legacy_gen) |*g| g else return false;
     if (!slot.enable_mtp or gen.mtp == null or gen.mtp_cache == null or !gen.has_last_hidden) return false;
     if (gen.spec_disabled_runtime or gen.mtp_serial_left > 0 or gen.mtp_serial_exit != .none) return false;
-    if (slot.sampling.constraint != null or slot.logprobs_n > 0) return false;
+    if (slot.sampling.constraint != null or slot.logprobs_n > 0 or generate_mod.penaltyActive(slot.sampling)) return false;
     const t = slot.model.transformer orelse return false;
     if (!t.supportsBatchedMimoDecode()) return false;
     return specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.dflash != null) == .mtp;
@@ -8510,6 +8513,7 @@ fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
     var pending_draft = false;
     for (active, 0..) |slot, i| {
         if (slot.model != active[0].model or !slot.allow_batch_mtp) return false;
+        if (generate_mod.penaltyActive(slot.sampling)) return false;
         const gen = if (slot.legacy_gen) |*g| g else return false;
         if (gen.ctx.mrope_pos != null) return false;
         pending_pipeline = pending_pipeline or gen.has_pending_logits or gen.has_pending_token;
@@ -8663,6 +8667,14 @@ fn mtpRoundsStaySolo(slot: *const Slot) bool {
     if (t.config.isMimo()) return true;
     // qwen4_exp verify rows are expert bytes, so a batched verify measured no better than solo rounds.
     return t.qwen4 != null;
+}
+
+/// A plain batched tick samples no repeat or presence penalty, so a penalised slot keeps its MTP round.
+fn anyPenalised(slots: []const *Slot) bool {
+    for (slots) |slot| {
+        if (generate_mod.penaltyActive(slot.sampling)) return true;
+    }
+    return false;
 }
 
 fn mtpCrowdThresholdFor(slot: *const Slot) usize {
@@ -9009,6 +9021,7 @@ fn runBatchedMtpTickInner(sch: *Scheduler, group: []*Slot) !void {
         st.verify_hidden_all = all_rows[i];
         st.verify_len = width;
         _ = try slot.legacy_gen.?.thinkShiftRows(&st.verify_logits, padded[i]);
+        _ = try slot.legacy_gen.?.penaltyShiftRows(&st.verify_logits, padded[i]);
     }
     if (sch.metrics) |m| m.batched_group_size.set(n);
     for (states[0..n], live[0..n]) |*st, slot| {
@@ -10819,6 +10832,36 @@ test "MiMo crowded MTP takes an eligible slot" {
     try testing.expect(slotMimoMtpCrowdable(&slot));
 }
 
+test "a penalised MTP slot never joins a plain batched tick, which samples no penalty" {
+    var xfm: Transformer = undefined;
+    xfm.config = .{ .model_type = "mimo_v2" };
+    xfm.moe_layers = &.{};
+    xfm.expert_stream = null;
+    var model: model_registry_mod.LoadedModel = undefined;
+    model.transformer = &xfm;
+    var gen: Generator = undefined;
+    gen.mtp = .{ .mimo = undefined };
+    gen.mtp_cache = .{ .mimo = undefined };
+    gen.has_last_hidden = true;
+    gen.spec_disabled_runtime = false;
+    gen.mtp_serial_left = 0;
+    gen.mtp_serial_exit = .none;
+    gen.dflash = null;
+    var slot: Slot = undefined;
+    slot.model = &model;
+    slot.legacy_gen = gen;
+    slot.enable_mtp = true;
+    slot.enable_drafter = false;
+    slot.logprobs_n = 0;
+    slot.sampling = .{ .presence_penalty = 1.5 };
+    try testing.expect(!slotMimoMtpCrowdable(&slot));
+    var plain: Slot = slot;
+    plain.sampling = .{};
+    try testing.expect(slotMimoMtpCrowdable(&plain));
+    try testing.expect(anyPenalised(&.{ &plain, &slot }));
+    try testing.expect(!anyPenalised(&.{&plain}));
+}
+
 test "single MTP slot reaches the round entry through runDecodeTick" {
     var xfm: Transformer = undefined;
     var model: model_registry_mod.LoadedModel = undefined;
@@ -10956,6 +10999,8 @@ test "group cost geometry rejects partial rounds and keeps complete cache format
     b.group_size = 128;
     try testing.expect(cacheCostFormat(a) != cacheCostFormat(b));
     try testing.expect(cacheCostFormat(a) != cacheCostFormat(transformer_mod.KVQuantConfig.affine(4)));
+    try testing.expect(cacheCostFormat(a) != cacheCostFormat(transformer_mod.KVQuantConfig.affine(6)));
+    try testing.expect(cacheCostFormat(transformer_mod.KVQuantConfig.affine(4)) != cacheCostFormat(transformer_mod.KVQuantConfig.affine(6)));
 }
 
 test "scheduler prices each shared execution once and preserves row sampling geometry" {
@@ -11567,7 +11612,7 @@ test "every GLM slot owns its native request and hands it to its forward context
     while (sch.cleanup_queue.items.len > 0) sch.cleanup_queue.orderedRemove(0).deinit();
 }
 
-test "a per-request kv_quant override (16, \"16\", 8, 4) reaches the submitted slot's cache as that scheme" {
+test "a per-request kv_quant override (16, \"16\", 8, 6, 4) reaches the submitted slot's cache as that scheme" {
     const allocator = testing.allocator;
     var sch: Scheduler = undefined;
     sch.allocator = allocator;
@@ -11599,6 +11644,8 @@ test "a per-request kv_quant override (16, \"16\", 8, 4) reaches the submitted s
         .{ .body = .{ .integer = 16 }, .want = transformer_mod.KVQuantConfig.dense },
         .{ .body = .{ .string = "16" }, .want = transformer_mod.KVQuantConfig.dense },
         .{ .body = .{ .integer = 8 }, .want = transformer_mod.KVQuantConfig.affine(8) },
+        .{ .body = .{ .integer = 6 }, .want = transformer_mod.KVQuantConfig.affine(6) },
+        .{ .body = .{ .string = "6" }, .want = transformer_mod.KVQuantConfig.affine(6) },
         .{ .body = .{ .integer = 4 }, .want = transformer_mod.KVQuantConfig.affine(4) },
     }) |c| {
         const override = transformer_mod.KVQuantConfig.fromJsonValue(c.body).?;

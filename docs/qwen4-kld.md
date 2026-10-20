@@ -108,6 +108,11 @@ against a different binary and flag set, which is why the delta is quoted rather
 Sushi-2.6bpw (4-bit n-gram table, binary `ad5e6be8`, same settings): `--kv-quant 4` scores 0.145841 / top-1 88.84% /
 NLL 0.465802 against kv8's 0.135508 / 89.08% / 0.454090, +7.63% KLD and -0.24 pp.
 
+kv6 (Sushi-2.6bpw, the f32-GDN raw teacher `qwen38-flash-next-bf16-gdnf32-v1`, binary `84d3ed8f`, `--qwen-gdn 32 --no-mtp`, 7539
+positions to first EOS, `taskpolicy -a`, GPU lock): kv8 0.114252 / 90.79% / NLL 0.376931, kv6 0.115611 / 91.07% / 0.377234
+(+1.19% KLD, at the rounding-flip floor), kv4 0.123894 / 90.53% / 0.387879 (+8.44%). kv6 keeps 77% of the cache's bytes
+against kv8 (6.5 against 8.5 bits per element) for a cost the floor can hide.
+
 <a id="gdn-f32-teacher"></a>
 ## The f32 GDN teacher (gate and state)
 
@@ -182,3 +187,28 @@ Memorized control (`serde_json/src/de.rs`, teacher NLL 0.058 / 0.0038 / 0.0014 a
   highly autocorrelated rows, and the block CI is optimistic. Read no position trend from them.
 - Fixture B prefills in one forward, so it carries no chunk-boundary state rounding and under-measures the state benefit.
 - A memorized text (NLL near 0.001) has no KLD to resolve: keep any long-context text only if the teacher's NLL on it is above ~0.1.
+
+<a id="eight-category"></a>
+## Eight categories, 16x512 (2026-10-20)
+
+The [8-category fixture](quality-kld.md#eight-category) on the served packs, at bf16 KV and `--qwen-gdn 32`. Each cell is
+the mean KLD to the first EOS against the BF16 teacher.
+- Teacher: the BF16 checkpoint streamed (`--ssd-budget-gb 94`), dense KV, f32 GDN state and gate, MTP off. The capture took
+  864 s at a 100.8 GB peak, mean strict NLL 0.1934.
+- Students: binary main `4511de70` (sha256 `f6d10384...`, the served path unchanged at `87089338`), `taskpolicy -a`, GPU lock
+  per run.
+- 7283 positions: 1024 in each of code, math, reasoning, design and story; stem 937, wikitext 641, multilingual 585.
+- Two prompts per category: a category is a coarse reading, and the `all` column ranks.
+
+| pack | code | math | reasoning | design | wikitext | multilingual | story | stem | all | top-1 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Sushi-2bpw | 0.0188 | 0.0218 | 0.0482 | 0.0545 | 0.2227 | 0.0909 | 0.1118 | 0.0350 | 0.0673 | 91.90% |
+| Sushi-2.6bpw | 0.0090 | 0.0088 | 0.0255 | 0.0266 | 0.1445 | 0.0380 | 0.0471 | 0.0155 | 0.0342 | 94.63% |
+| Sushi-4bpw | 0.0042 | 0.0030 | 0.0128 | 0.0116 | 0.0490 | 0.0137 | 0.0187 | 0.0074 | 0.0135 | 96.14% |
+
+- Raw wikitext is the hardest category for every pack, 3-4x its `all`. The prose-only standard reading measures each pack
+  where it is weakest.
+- Code (thinking off) and math (thinking on, low effort) are the easiest. At 2bpw, story loses 6x and multilingual 5x
+  what code loses.
+- Each step from 2bpw to 2.6bpw to 4bpw about halves `all` or better. From 2bpw to 2.6bpw, math, multilingual and story
+  gain 2.4-2.5x and wikitext the least (1.5x).

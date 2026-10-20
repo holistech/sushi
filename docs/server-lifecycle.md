@@ -27,8 +27,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   process; in the serve loop it is the ordinary graceful shutdown. Test: `tests/test_parent_pid.sh`.
 - **`sushi --guest-manifest`** prints the JSON such a host checks before routing (`version.writeGuestManifest`):
   version, commit, `guest_api`, the mlx/mlx-c pins, `min_macos` from the binary's own target, `model_types`
-  (`version.guest_model_types`, a subset of the served types) and the EXL3 codebooks and window range the decoder
-  accepts. The release tarball ships it as `guest.json`, next to a `.sha256` of the tarball.
+  (`version.guest_model_types`, a subset of the served types) and the codebooks and window range the decoder
+  accepts: `codebooks` under format `exl3`, `stq_codebooks` under format `stq` (the pairs `parseExpertQuant` admits).
+  The release tarball ships it as `guest.json`, next to a `.sha256` of the tarball.
 
 <a id="self-update"></a>
 ## Self-update
@@ -67,8 +68,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   and exit, even with redirected stdin. The prompt is passed verbatim, including leading/trailing whitespace.
 - Explicit prompts use the normal scheduler and chat request policy through a private loopback listener on an OS-assigned
   port. They never connect to an existing server or enter the REPL; the client is joined and the listener closes on exit.
-- `--think` enables thinking; `--think <word>` selects an effort the `--model` model takes (GLM low|high|max, Qwen
-  off|low|medium|xhigh, MiMo off or any level as on; `/think` alike); another word fails with the accepted list and a
+- `--think` enables thinking; `--think <word>` selects an effort the `--model` model takes (GLM low|high|max, with
+  `medium` served as `high` and `xhigh` as `max` and logged; Qwen off|low|medium|xhigh, with `high` and `max` served as `xhigh` and logged; MiMo off or any level as on; `/think` alike); another word fails with the accepted list and a
   nonzero exit. Omission keeps the model default, one-shot and REPL alike. A model loaded on demand takes the word where it can, else keeps its own
   default ([server-http-apis](server-http-apis.md)).
 - MTP/KV settings, context, timeout, reasoning budgets, and sampling flags follow the serving policy, including

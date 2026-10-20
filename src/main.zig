@@ -5,6 +5,10 @@ pub const mlx = @import("mlx.zig");
 pub const io_util = @import("io_util.zig");
 const model_mod = @import("model.zig");
 const tokenizer_mod = @import("tokenizer.zig");
+pub const tokenizer = tokenizer_mod;
+pub const kld = kld_mod;
+pub const imatrix = @import("imatrix.zig");
+pub const transformer = transformer_mod;
 const transformer_mod = @import("transformer.zig");
 const round_cost_mod = @import("round_cost.zig");
 const generate_mod = @import("generate.zig");
@@ -21,6 +25,7 @@ const model_settings_mod = @import("model_settings.zig");
 const vision_mod = @import("vision.zig");
 const cli_mod = @import("cli.zig");
 const kld_mod = @import("kld.zig");
+const encoder_cli = @import("sushi_encoder").cli;
 const launch_mod = @import("launch.zig");
 pub const log = @import("log.zig");
 const metrics_mod = @import("metrics.zig");
@@ -119,6 +124,10 @@ fn printUsage(io: std.Io) void {
         \\                      every greedy position), or teacher-force one
         \\                      through a model and report KLD / top-1 / NLL.
         \\                      `sushi kld --help` for options
+        \\  convert exl3        Convert a Qwen3.8-Flash-Next, MiMo-V2.6-Flash or
+        \\                      GLM-5.3-Flash source checkpoint into a Sushi pack
+        \\                      (routed experts as EXL3). `sushi convert --help`
+        \\                      for options
         \\  update              Replace this install with the newest release,
         \\                      after checking its SHA-256, its signature and
         \\                      that it runs; the old one stays as
@@ -231,7 +240,7 @@ fn printUsage(io: std.Io) void {
         \\                      Flash-Next) to save memory on smaller machines.
         \\                      No effect on GLM or MiMo, which have no GDN arm.
         \\  --kv-quant <mode>   KV-cache quantization scheme:
-        \\                        8 or 4 — affine group quant; default 8 on
+        \\                        8, 6 or 4 — affine group quant; default 8 on
         \\                          every model (GLM refuses 4). 16 (or `off`)
         \\                          keeps dense bf16 KV. It outranks a
         \\                          model's model-settings.json `kv_quant`.
@@ -484,11 +493,14 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, cmd, "kld")) {
             try kld_mod.cmdKld(allocator, io, args[2..]);
             return;
+        } else if (std.mem.eql(u8, cmd, "convert")) {
+            try encoder_cli.cmdConvert(allocator, io, args[2..]);
+            return;
         } else if (std.mem.eql(u8, cmd, "update")) {
             try update_mod.cmdUpdate(allocator, io, args[2..]);
             return;
         } else {
-            log.err("unknown command '{s}' (expected run, pull, list, launch, kld, update, or serve)\n", .{cmd});
+            log.err("unknown command '{s}' (expected run, pull, list, launch, kld, convert, update, or serve)\n", .{cmd});
             std.process.exit(1);
         }
     }
@@ -879,7 +891,7 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             kv_quant_explicit = true;
             kv_quant_config = transformer_mod.KVQuantConfig.fromJsonValue(.{ .string = args[i] }) orelse {
-                log.err("--kv-quant: expected one of {{16, 8, 4}} (16 = BF16, also `off`); got '{s}'\n", .{args[i]});
+                log.err("--kv-quant: expected one of {{16, 8, 6, 4}} (16 = BF16, also `off`); got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
         } else if (std.mem.eql(u8, args[i], "--ssd-budget-gb") and i + 1 < args.len) {
@@ -1195,15 +1207,17 @@ pub fn main(init: std.process.Init) !void {
     const config = config_storage;
     scheduler_mod.applyModelSettings(config, model_settings_mod.overrideFor(allocator, io, model_dir));
     if (model_mod.think_effort_flag) |e| if (model_mod.effortArms(config.model_type)) |arms| {
+        var choices: [std.enums.values(model_mod.Effort).len]model_mod.Effort = undefined;
+        for (arms, 0..) |arm, ai| choices[ai] = arm.effort;
         if (model_mod.armForWord(arms, @tagName(e)) == null) {
-            var choices: [std.enums.values(model_mod.Effort).len]model_mod.Effort = undefined;
-            for (arms, 0..) |arm, ai| choices[ai] = arm.effort;
             var w = std.Io.Writer.Allocating.init(allocator);
             defer w.deinit();
             try cli_mod.writeEffortRefusal(&w.writer, @tagName(e), config.model_type, choices[0..arms.len]);
             log.err("--think: {s}\n", .{w.written()});
             std.process.exit(1);
-        }
+        } else if (model_mod.selectEffortPick(choices[0..arms.len], e)) |pick| if (pick.rerouted_from) |from| {
+            log.info("[effort] " ++ model_mod.effort_reroute_notice ++ "\n", .{ config.model_type, @tagName(from), @tagName(pick.effort) });
+        };
     };
     if (config.glm_fp8_trunk) {
         log.info("Model: {s} ({d} layers, {d}-dim, raw FP8 E4M3FN block128 trunk)\n", .{ config.model_type, config.num_hidden_layers, config.hidden_size });
