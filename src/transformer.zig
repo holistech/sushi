@@ -4462,19 +4462,20 @@ fn qsaUltraDie() bool {
 /// the same, 8 splits lose. More splits change the merge's summation order (last bf16 bit).
 pub const QSA_ATTN_ULTRA_MIN_TGS: c_int = 64;
 
-/// Split count for a call: the flat default, or on an Ultra die enough splits that the grid
-/// reaches `QSA_ATTN_ULTRA_MIN_TGS` (verify widths already do at the default).
-pub fn qsaAttnNSplitFor(seq_len: c_int, h_kv: c_int) c_int {
+/// Split count on an Ultra die: Flash-Next's 2 KV heads at one row reach
+/// `QSA_ATTN_ULTRA_MIN_TGS` threadgroups.
+pub const QSA_ATTN_ULTRA_NSPLIT: c_int = 32;
+
+/// Split count for a call: the flat default, on an Ultra die `QSA_ATTN_ULTRA_NSPLIT`. Fixed
+/// per chip, never per grid: the splits set the merge's summation order, and an MTP verify row
+/// must sum like its serial decode, one KV head serving many q heads like many serving one.
+pub fn qsaAttnNSplitFor() c_int {
     if (qsa_attn_nsplit_override != null) return qsaAttnNSplit();
-    var n = QSA_ATTN_NSPLIT_DEFAULT;
-    if (qsaUltraDie()) {
-        while (seq_len * h_kv * n < QSA_ATTN_ULTRA_MIN_TGS and n < QSA_ATTN_MAX_NSPLIT) n *= 2;
-    }
-    return n;
+    return if (qsaUltraDie()) QSA_ATTN_ULTRA_NSPLIT else QSA_ATTN_NSPLIT_DEFAULT;
 }
 
 /// Simdgroups per QSA split-K threadgroup: a small grid stages each tile with loader simdgroups.
-/// On an Ultra the grid is twice as wide (see `qsaAttnNSplitFor`) and 8 simdgroups read best
+/// On an Ultra the grid is twice as wide (see `QSA_ATTN_ULTRA_NSPLIT`) and 8 simdgroups read best
 /// (kernel 136 us vs 141 at 16 and 160 at 2, same meter run).
 pub fn qsaAttnSimdgroups(seq_len: c_int, h_kv: c_int, nsg: c_int, nsplit: c_int) c_int {
     const ultra = qsaUltraDie();
@@ -4550,10 +4551,10 @@ pub fn qsaAttnBk() c_int {
 
 /// Tile depth for a call: on an Ultra the widened one-row grid reads best at 32 (decode meter
 /// 2026-10-17, 32 splits / 8 simdgroups: 28.74 -> 28.67 ms at 4k keys, 29.35 -> 29.24 at 32k).
-pub fn qsaAttnBkFor(seq_len: c_int, h_kv: c_int) c_int {
+/// Fixed per chip like the split count, for the same reason.
+pub fn qsaAttnBkFor() c_int {
     if (qsa_attn_bk_override != null) return qsaAttnBk();
-    if (qsaUltraDie() and seq_len * h_kv * QSA_ATTN_NSPLIT_DEFAULT < QSA_ATTN_ULTRA_MIN_TGS) return 32;
-    return QSA_ATTN_BK;
+    return if (qsaUltraDie()) 32 else QSA_ATTN_BK;
 }
 
 var qsa_attn_q_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
@@ -4807,8 +4808,9 @@ pub fn qsaSparseAttn(
         .quant = quant,
         .sparse = true,
         .nsg = @divTrunc(gqa + 7, 8),
-        .nsgt = qsaAttnSimdgroups(seq_len, h_kv, @divTrunc(gqa + 7, 8), qsaAttnNSplitFor(seq_len, h_kv)),        .nsplit = qsaAttnNSplitFor(seq_len, h_kv),
-        .bk = qsaAttnBkFor(seq_len, h_kv),
+        .nsgt = qsaAttnSimdgroups(seq_len, h_kv, @divTrunc(gqa + 7, 8), qsaAttnNSplitFor()),
+        .nsplit = qsaAttnNSplitFor(),
+        .bk = qsaAttnBkFor(),
         .ratio = ratio,
         .dtype = .bfloat16,
     };
@@ -54820,51 +54822,56 @@ test "QSA verify rows are bit-identical to decode at both KV tile sizes" {
 test "QSA verify preserves serial arithmetic across the sparse budget boundary" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
-    const a = testing.allocator;
-    const budget: c_int = 64;
-    const ratio: c_int = 4;
-    const width: c_int = 8;
-    const length: c_int = 71;
-    var random = std.Random.DefaultPrng.init(0xb0d9e7);
-    for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(8) }) |config| {
-        var cache = try KVCache.initWithConfig(a, 1, config);
-        defer cache.deinit();
-        const kd = try qkvIdentityArray(s, 2, length, 256, 0.7, .bfloat16);
-        defer _ = mlx.mlx_array_free(kd);
-        const vd = try qkvIdentityArray(s, 2, length, 256, 1.7, .bfloat16);
-        defer _ = mlx.mlx_array_free(vd);
-        var view = try qsaAttnCacheFixture(a, s, kd, vd, length, 32, config, &cache);
-        defer view.deinit();
-        const q = try qkvIdentityArray(s, 24, width, 256, 0.31, .bfloat16);
-        defer _ = mlx.mlx_array_free(q);
-        const bh = try qsaVerifyBlocksHost(a, random.random(), width, length, budget / ratio, ratio);
-        defer a.free(bh);
-        const blocks = mlx.mlx_array_new_data(bh.ptr, &[_]c_int{ 1, width, budget / ratio }, 3, .int32);
-        defer _ = mlx.mlx_array_free(blocks);
-        const together = (try qsaAlignedSparseAttn(s, q, &view, blocks, ratio, 1.0 / 16.0, budget)) orelse return error.QsaVerifyDeclined;
-        defer _ = mlx.mlx_array_free(together);
-        for (0..@intCast(width)) |ri| {
-            const row: c_int = @intCast(ri);
-            const length_r = length - width + row + 1;
-            var prefix = try KvPrefixView.init(s, view, length_r);
-            defer prefix.deinit();
-            const qr = try sliceAttentionSeq(s, q, row, row + 1);
-            defer _ = mlx.mlx_array_free(qr);
-            var br = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(br);
-            try mlx.check(mlx.mlx_slice(&br, blocks, &[_]c_int{ 0, row, 0 }, 3, &[_]c_int{ 1, row + 1, budget / ratio }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
-            var serial = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(serial);
-            if (length_r <= budget + ratio - 1) {
-                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&serial, qr, prefix.view.k, prefix.view.v, 1.0 / 16.0, "", .{ .ctx = null }, .{ .ctx = null }, false, s));
-            } else {
-                const result = try qsaIdentityServingArm(s, qr, &prefix.view, br);
-                _ = mlx.mlx_array_free(serial);
-                serial = result;
+    // Both chip rows: the Ultra's wider split-K grid must keep the identity too, on any Mac.
+    defer qsa_ultra_override = null;
+    for ([_]bool{ false, true }) |ultra| {
+        qsa_ultra_override = ultra;
+        const a = testing.allocator;
+        const budget: c_int = 64;
+        const ratio: c_int = 4;
+        const width: c_int = 8;
+        const length: c_int = 71;
+        var random = std.Random.DefaultPrng.init(0xb0d9e7);
+        for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(8) }) |config| {
+            var cache = try KVCache.initWithConfig(a, 1, config);
+            defer cache.deinit();
+            const kd = try qkvIdentityArray(s, 2, length, 256, 0.7, .bfloat16);
+            defer _ = mlx.mlx_array_free(kd);
+            const vd = try qkvIdentityArray(s, 2, length, 256, 1.7, .bfloat16);
+            defer _ = mlx.mlx_array_free(vd);
+            var view = try qsaAttnCacheFixture(a, s, kd, vd, length, 32, config, &cache);
+            defer view.deinit();
+            const q = try qkvIdentityArray(s, 24, width, 256, 0.31, .bfloat16);
+            defer _ = mlx.mlx_array_free(q);
+            const bh = try qsaVerifyBlocksHost(a, random.random(), width, length, budget / ratio, ratio);
+            defer a.free(bh);
+            const blocks = mlx.mlx_array_new_data(bh.ptr, &[_]c_int{ 1, width, budget / ratio }, 3, .int32);
+            defer _ = mlx.mlx_array_free(blocks);
+            const together = (try qsaAlignedSparseAttn(s, q, &view, blocks, ratio, 1.0 / 16.0, budget)) orelse return error.QsaVerifyDeclined;
+            defer _ = mlx.mlx_array_free(together);
+            for (0..@intCast(width)) |ri| {
+                const row: c_int = @intCast(ri);
+                const length_r = length - width + row + 1;
+                var prefix = try KvPrefixView.init(s, view, length_r);
+                defer prefix.deinit();
+                const qr = try sliceAttentionSeq(s, q, row, row + 1);
+                defer _ = mlx.mlx_array_free(qr);
+                var br = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(br);
+                try mlx.check(mlx.mlx_slice(&br, blocks, &[_]c_int{ 0, row, 0 }, 3, &[_]c_int{ 1, row + 1, budget / ratio }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+                var serial = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(serial);
+                if (length_r <= budget + ratio - 1) {
+                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&serial, qr, prefix.view.k, prefix.view.v, 1.0 / 16.0, "", .{ .ctx = null }, .{ .ctx = null }, false, s));
+                } else {
+                    const result = try qsaIdentityServingArm(s, qr, &prefix.view, br);
+                    _ = mlx.mlx_array_free(serial);
+                    serial = result;
+                }
+                const actual = try sliceAttentionSeq(s, together, row, row + 1);
+                defer _ = mlx.mlx_array_free(actual);
+                try qkvExpectBitsEqual(s, serial, actual);
             }
-            const actual = try sliceAttentionSeq(s, together, row, row + 1);
-            defer _ = mlx.mlx_array_free(actual);
-            try qkvExpectBitsEqual(s, serial, actual);
         }
     }
 }
