@@ -8049,7 +8049,12 @@ test "volumeSpace: free is what the OS grants, never statfs' f_bavail" {
     try testing.expectEqual(@as(u64, 36 * GB), freeForUse(0, 500 * GB, 36 * GB));
     try testing.expectEqual(@as(u64, 36 * GB), freeForUse(500 * GB + 1, 500 * GB, 36 * GB));
     // The grant probe is wired: absent it, every volume would fall back to f_bavail.
-    try testing.expect(sushi_volume_free_for_use("/") > 0);
+    // Without a GUI login (a suite run over ssh) macOS answers the important-usage key
+    // with 0, the probe's "failed": the wiring is then not observable, only skipped.
+    const granted = sushi_volume_free_for_use("/");
+    if (granted == 0) return error.SkipZigTest;
+    const vs = volumeSpace("/") orelse return error.VolumeSpaceProbeFailed;
+    try testing.expect(granted <= vs.total);
 }
 
 test "DiskTier: SSD-first declines to store when the VOLUME is short, and says so" {

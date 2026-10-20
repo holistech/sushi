@@ -56033,6 +56033,10 @@ test "sushi coder GPU a loaded grouped layer keeps its stored bytes resident onc
     var w = Weights.init(t.allocator);
     defer w.deinit();
     var buf: [256]u8 = undefined;
+    // Freed buffers wait in MLX's cache, and an allocation may reuse a larger cached one:
+    // whatever earlier tests left there would inflate the delta. Start from an empty cache.
+    try mlx.check(mlx.mlx_synchronize(s));
+    _ = mlx.mlx_clear_cache();
     var before: usize = 0;
     try mlx.check(mlx.mlx_get_active_memory(&before));
     var stored: usize = 0;
