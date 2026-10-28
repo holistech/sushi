@@ -11,6 +11,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 ## Entry points
 
 - `src/main.zig`: entry, CLI flags + subcommands (`run/pull/list/serve/launch/kld/update`).
+- `--model <path>` and `sushi run <path>` accept a relative path: `cli.resolveRelativeDir` makes an existing directory absolute (cwd at launch) before anything reads it, because the layout, discovery and cache helpers take absolute paths only.
 - `src/cli.zig`: alias → HF repo, resumable pull into `~/.sushi/models/<org>/<repo>`, `list`, `run` REPL.
 - `pull` takes top-level files, `mtp/` and GLM's `GLM-5.3-Flash-DFlash2/` assistant (the loader auto-detects that folder; a
   pull that skips it serves GLM with DFlash2 off, logged as `[glm-dflash] off: no assistant found`).
@@ -94,7 +95,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   `ensurePortFree` probes the address with a connect AND a bind, so a listener or a bound-but-silent socket both refuse
   with "port N is already in use"; the listener binds with SO_REUSEADDR only, so a racing second sushi fails its bind
   with the same message instead of co-binding. Guard: `tests/test_port_conflict.sh`.
-- The arch gate: the loader refuses any `model_type` outside `model.served_model_types` (`qwen4_exp`, `mimo_v2`, `glm5_next`) by
+- The arch gate: the loader refuses any `model_type` outside `model.served_model_types` (`qwen4_exp`, `mimo_v2`, `glm5_next`, `deepseek_v41`) by
   name (`ArchitectureUnsupported` → 503). A checkpoint in an unsupported file format is refused by name
   (`ModelFormatUnsupported` → 503; `--model` exits).
 - **The weight loader is ONE decision** (`model.loadWeightsForConfig`: streaming index > MiMo source trunk > vision >
@@ -161,16 +162,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   drafting GLM slot joins as a plain row when its model has company ([glm5-arch](glm5-arch.md#concurrency)).
 - A cold prefill YIELDS to decode ticks at chunk boundaries (`scheduler.interleaveDecodeTick`;
   `SUSHI_PREFILL_INTERLEAVE=0` restores). Greedy byte-identical.
-- `--prefill-decode-share S` (default 0) targets the fraction of wall time given
+- `--prefill-decode-share S` (default 0.25) targets the fraction of wall time given
   to existing decoders during another request's prefill. Values above 0.9 clamp; negative values and NaN refuse.
   Zero preserves one decode tick per boundary; a nonzero share adds ticks until `chunk_ns*S/(1-S)` is spent or
-  decoders finish. `SUSHI_PREFILL_INTERLEAVE=0` disables both the share and its width cap.
-- While decoders are live, the share caps the base prefill width at 1024 after explicit/environment chunk settings;
-  normal tail merging still applies. Admission bills the original width, and adaptive widening retains its memory
-  confirmation. An adaptive slot can lift the cap after the other decoders finish; a pinned slot keeps its cap.
-  Hosted decode time is excluded from prefill compute time but remains part of request latency.
-- **GLM prefill chunks never narrow for company** (`prefillShareCapFor`): its numerics depend on chunk boundaries, so a
-  request's output must not depend on what else decodes; it yields only between whole chunks.
+  decoders finish. `SUSHI_PREFILL_INTERLEAVE=0` disables the share.
+- **The share never narrows a prefill chunk** (any arch): a request's chunk width, bill and numerics do not depend on
+  what else decodes; decoders get time only between whole chunks. Hosted decode time is excluded from prefill compute
+  time but remains part of request latency.
 - **Serial ≠ exclusive**: only a slot driving a module-owned decode state is exclusive (`slotExclusiveDecode`);
   qwen4's state is read-only shared and batches freely. The batched-decode gate reads DISPATCH, not ARMED flags
   (`slotTicksRegular` asks `specTickMode`). A batched decode guard that only runs at N=1 pins nothing:
@@ -181,6 +179,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - **An exclusive slot blocks admission until the inference thread releases it** (`heldExclusive`: `decoding` plus
   `cleanup_queue`; `complete()` keeps a slot in `decoding` until its pass is out): a disconnect must not let the next
   request prefill while the slot still owns the stream (`GlmStreamRequestBusy`).
+- **A cancelled slot commits at the cull when its state is not the slot's own** (`commitsAtCull`: GLM's native request,
+  DeepSeek's live record), and its cleanup drain skips the commit (`committed_at_cull`). The cull drops the slot from
+  `decoding` before `complete()` queues it, so the next exclusive request is admitted in between; a DeepSeek commit
+  run after that publishes onto the next request's state.
 - **A plain batched tick stop-checks a slot with no pipeline state** (`batchEntryStops`) before forwarding its pending
   token: a fresh DFlash2 slot whose prefill sampled EOS finishes `stop` with nothing published, as solo does.
 - **A slot the inference thread drops releases its GLM state there** (`releaseNativeState`: finish, error, cancel
@@ -211,8 +213,18 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - A request's sampling state (`think_bound`, `constraint`) lives in its handler's frame: `complete` waits out any
   inference pass holding the slot (`Slot.in_pass`, taken under `queue_mu`) before the handler may free it.
   Guard: `tests/test_cancel_mid_tick.sh`.
+- **A request the admission tick holds (single-flight arch, memory) logs `[queue] waiting behind N request(s); running: P+G of
+  max M tokens (~S s at R tok/s)` once, and `[queue] started after X s` when it starts**; the ETA is the running request's
+  remaining max, an upper bound. Visibility only: no priority, preemption or queue limit.
+- **A turn that finishes `stop` on an EOS or a pad run logs `[stop] reason=eos|pad-run token=<id> "<text>" after=<id> "<text>"
+  completion=<n> path=serial|spec|batch`; a request's own stop sequence logs `[stop] reason=stop-seq match="..."`** (grep
+  `[stop]`). The EOS is never pushed or counted, so `Slot.stop_token` / `Generator.stop_token` (set where the stop is
+  decided) are the only record of it; a length finish or a disconnect logs nothing.
 - **A slot whose prefill runs is in `Scheduler.prefilling`**, neither `pending` nor `decoding`, so a SIGTERM's
   `cancelAllInFlight` stops it at the next chunk; it ran a MiMo 512k prefill on past 120 s until SIGKILL.
+- **A shutdown drain is an ERROR, never a finish reason**: `cancelAllInFlight` marks `Slot.shutdown_cancelled`, so the
+  reader gets `.err` (`error.ServerShutdown`, 503 "Server is shutting down") instead of `.done`, whose default
+  `finish_reason` is `length` (a queued request logged `0+0 tokens [length]`).
 
 ## Request ownership and media
 
@@ -220,21 +232,39 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   `server.RequestMedia`; `Message` BORROWS. Ownership by PROVENANCE (`{slice, owned}` returns), never
   free-unless-equals-literal.
 - **A media placeholder id occurs in ordinary TEXT**, so a media boundary is gated on the request CARRYING media
-  (`firstMediaPlaceholder(has_media)`); media on a tower-less load is refused by NAME (`mediaRejectReason`; a streamed load without `--vision` names the flag).
+  (`firstMediaPlaceholder(has_media)`); media on a tower-less load is refused by NAME (`mediaRejectReason`; a streamed load that left the tower off by default names `--vision`).
 - **Every message's media is decoded and placed where it was sent**: user parts, OpenAI `tool` messages, Anthropic
   `tool_result` blocks, Responses `input_image` (tool outputs too). The wire walk (`readOpenAiMessages`,
   `readAnthropicMessages`, `responses.parseInput`) records each part's offset in the joined text
   (`Message.media_parts`); the serializer hands the template a typed part list, so the TEMPLATE renders each
-  placeholder; `prepareRequestMedia` expands every pad to its block's rows and encodes all blocks in prompt order.
+  placeholder; `prepareRequestMedia` expands every pad to its block's rows and keys each block for the prefix cache.
   The engine never inserts pads itself: a template that renders fewer placeholders than blocks is a named 400.
+  DeepSeek-V4.1's template reads `content` as a string, so `ChatConfig.image_placeholder` renders each image's atom at
+  its offset instead, and `placeMedia` expands it to the image's whole span (`dsv41_vision.spanRows`: aligner rows,
+  newlines, start and end), not a merged-grid count.
+- **The tower runs after the prefix restore, on the inference thread** (`encodeMediaAfterRestore`, `DeferredMedia`):
+  a leading block whose every placeholder row sits inside the restored prefix is not encoded (its KV is restored),
+  the encode and its bill (`visionEncodeBill`) cover the blocks after it, and a block the restore cuts through is
+  encoded whole. The slot's splice offset is the placeholder rows in the prefix less the rows skipped.
+- **A patch-grid image is held as its file, never as f32 patches**: the connection thread base64-decodes the payload,
+  reads the size from the JPEG/PNG/GIF/BMP/WebP header and plans the grid with the processor's resize rule (`planImage`), so
+  the prompt places its rows and the request keeps the compressed bytes (`ImageData.undecoded`); a 1080p screenshot is
+  19.8 MB of patches on DeepSeek-V4.1. The media key is unchanged, a hash of the decoded pixels: `keyMedia` decodes
+  `decode_workers` (8) images at a time on that many threads (`ImageDecodeWindow`), feeds each to the chain and frees
+  it, so keying holds at most 8 decoded images, and a file that will not decode is a 400 naming its place there.
+  `encodeMediaAfterRestore` decodes again, only the images it encodes, through the same window, freeing each after
+  its tower call; an image its restored prefix holds is decoded once, for its key. Qwen, MiMo and GLM take the same
+  path; Gemma's fixed square and `x-mlx-pixels` decode on the connection thread. The `Multimodal: encoded N of M` line gives decode and
+  encode ms, and the encode counts in the request's prefill time.
 - **Media refusals are named**: an undecodable image is a 400 naming `messages[i]`/`input[i]` and the reason
   (`imageRejectReason`), an `input_audio` part a 400 unless the model encodes audio (`RequestMedia.accepts_audio`),
-  more than `chat.MAX_REQUEST_IMAGES` (64) a 400 with both counts, a prompt the media pushes past the context a 400
+  more than `chat.MAX_REQUEST_IMAGES` (1024) a 400 with both counts, a prompt the media pushes past the context a 400
   naming the media's tokens, an encode that does not fit a 400 (`towerFitFault`), a failed encode a 500
-  (`MediaFault`); never a text-only answer.
+  (`MediaFault`); both of the last two are raised after the restore as the slot's `MediaRefused`; never a text-only answer.
 - Media INPUT code: `src/vision.zig` / `src/vision_common.zig` (shared preprocessing) / `src/qwen_vision.zig` / `src/mimo_vision.zig` / `src/mrope.zig` (Qwen3-VL
   image/video tower, M-RoPE positions over every block; MiMo-ViT images, [mimo2-arch](mimo2-arch.md#vision));
-  `stb_image` + libwebp decode image input.
+  `src/dsv41_vision.zig` (DeepSeek-V4.1 images, [dsv41-arch](dsv41-arch.md#image-input));
+  `stb_image` (JPEG, PNG, GIF first frame, BMP) + libwebp decode image input; `lib/stb_image_impl.c` names the formats compiled in.
 
 ## Config reading
 

@@ -26,8 +26,7 @@ const sushi_exl3 = @import("sushi_exl3");
 /// `model_type` branches in `model.zig:parseConfigFromJson`. Discovery
 /// silently skips any subdirectory whose `config.json` declares a
 /// `model_type` outside this list — that prevents `--model-dir` from
-/// picking up partially-downloaded or unsupported checkpoints (e.g. a
-/// `deepseek_v4` directory next to gemma/qwen ones) which would otherwise
+/// picking up partially-downloaded or unsupported checkpoints which would otherwise
 /// crash the server when the tokenizer for the unknown arch is loaded.
 ///
 /// `gemma4_assistant` is deliberately excluded: those are speculative-
@@ -48,10 +47,6 @@ const supported_model_types = [_][]const u8{
     "lfm2", // also matches any "lfm2*" prefix (lfm2_vl etc. when added)
     "nemotron_h",
     "bert",
-    "deepseek_v4",
-    "hy_v3", // Tencent Hunyuan 3 (295B-A21B MoE)
-    "laguna", // poolside Laguna S 2.1 (117.6B-A8.5B MoE coder)
-    "inkling_mm_model", // Thinking Machines Inkling Small (276B-A12B MoE)
     "muse_glimmer", // meta-models Muse-Glimmer-30B (dense VL; text served, vision pending)
     "muse_glimmer_text",
     "bailing_hybrid", // inclusionAI Ling 3.0 (KDA + MLA hybrid MoE)
@@ -60,6 +55,7 @@ const supported_model_types = [_][]const u8{
     "k2_horizon", // IFM K2-Horizon dense (Llama trunk, grouped RMS norms)
     "mimo_v2", // MiMo-V2.6-Flash: resident EXL3 packs (text + image), or the original checkpoint streamed.
     "glm5_next", // GLM-5.3-Flash (MLA + KDA hybrid MoE)
+    "deepseek_v41", // DeepSeek-V4.1-Flash: the original checkpoint, experts streamed (text only).
 };
 
 fn isSupportedModelType(model_type: []const u8) bool {
@@ -97,7 +93,7 @@ const ConfigPeek = union(enum) {
 
 /// Peek at a candidate's `config.json`: classify by `model_type` and
 /// `quantization.mode`. Discovery uses this to filter out:
-///   - unsupported archs (e.g. deepseek_v4, which crashes the tokenizer)
+///   - unsupported archs (which crash the tokenizer)
 ///   - unsupported quantization modes (anything outside
 ///     `supported_quant_modes` — affine, nvfp4, mxfp4, mxfp8).
 ///
@@ -280,7 +276,7 @@ pub fn qwen4StreamingIndexComplete(io: std.Io, allocator: std.mem.Allocator, mod
             var experts = expert_quant.QuantStore.open(allocator, model_dir, geometry) catch return null;
             experts.deinit();
         },
-        .bf16_individual, .fp8_individual, .mxfp4_split, .mxfp4_individual => {
+        .bf16_individual, .fp8_individual, .mxfp4_split, .mxfp4_individual, .mxfp4_w123 => {
             var experts = expert_quant.QuantStore.openForLayout(allocator, model_dir, geometry, layout) catch return null;
             experts.deinit();
         },
@@ -756,7 +752,7 @@ fn tryAddModel(
 
         // Filter by supported model_type AND quantization scheme. Catches:
         //   - partially-downloaded checkpoints (missing/garbage config)
-        //   - unsupported arches (e.g. deepseek_v4, MLA + indexer)
+        //   - unsupported arches
         //   - unsupported quants (modes outside supported_quant_modes)
         // before they reach the tokenizer/weight loaders.
         break :blk switch (peekConfig(io, allocator, parent, name)) {
@@ -1963,10 +1959,6 @@ test "readStubMeta: has_mtp follows the checkpoint's MTP head" {
     defer allocator.free(model_dir);
 
     try std.testing.expect(!readStubMeta(io, allocator, model_dir).has_mtp);
-    try tmp.dir.writeFile(io, .{ .sub_path = "m/model.safetensors.index.json", .data =
-        \\{"weight_map":{"mtp.fc.weight":"model-00002-of-00002.safetensors"}}
-    });
-    try std.testing.expect(readStubMeta(io, allocator, model_dir).has_mtp);
     // qwen4_exp's head is the checkpoint's own layer.
     try tmp.dir.writeFile(io, .{ .sub_path = "m/model.safetensors.index.json", .data =
         \\{"weight_map":{"language_model.mtp.fc_hidden.weight":"model-00002.safetensors"}}

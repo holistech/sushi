@@ -4,7 +4,7 @@
 #
 # Live layer of the format test suite (the hermetic layer is
 # src/format_corpus_test.zig — run `zig build test -Dtest-filter="format corpus"`).
-# Boots each served model (qwen4_exp, mimo_v2) one at a time and asserts, per model:
+# Boots each served model (qwen4_exp, mimo_v2, deepseek_v41) one at a time and asserts, per model:
 #
 #   1. Thinking OFF baseline: answer in content, no control-tag leak
 #   2. Thinking ON truncated: reasoning_content only, content empty/clean
@@ -47,8 +47,9 @@ NC='\033[0m'
 
 # logical|display|path|has_thinking|extra server flags
 MODELS=(
-    "qwen4_exp|Qwen3.8 Flash-Next (think tags + XML tools)|${QWEN4_EXP_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}|yes|"
+    "qwen4_exp|Qwen3.8 Flash-Next (think tags + XML tools)|${QWEN4_EXP_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}|yes|"
     "mimo_v2|MiMo-V2.6-Flash (EXL3 experts)|${MIMO_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.3bpw}|yes|--no-vision"
+    "deepseek_v41|DeepSeek-V4.1-Flash (DSML tools, streamed experts)|${DSV41_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw}|yes|--ssd-budget-gb ${DSV41_SSD_BUDGET_GB:-96}"
 )
 
 # FORMAT_MODELS=csv filter of logical names. Unknown names simply match
@@ -89,7 +90,7 @@ no_leak() {
     python3 - "$1" <<'PY'
 import sys
 text = sys.argv[1]
-tags = ["<think>", "</think>", "<tool_call"]
+tags = ["<think>", "</think>", "<tool_call", "DSML"]
 for t in tags:
     if t in text:
         print(f"  leaked tag: {t}", file=sys.stderr)
@@ -311,7 +312,7 @@ if tool:
     try:
         a=json.loads(tool["json"]); json_ok=isinstance(a,dict); path_ok=1 if a.get("path")=="report_v2.html" else 0
     except Exception: pass
-tags=["<think>","</think>","<tool_call"]
+tags=["<think>","</think>","<tool_call","DSML"]
 text="".join(b["text"] for b in blocks.values() if b["type"]!="tool_use")
 leak=next((t for t in tags if t in text),"")
 print(f"{name_ok}|{int(json_ok)}|{path_ok}|{leak}")')

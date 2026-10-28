@@ -29,15 +29,24 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
 - mimo_v2 advertises off, on: its template has only on/off, so every thinking word (`minimal` through `max`) is on,
   uncapped, and off/none is off.
 - `/v1/models` rows, loaded or not, list `reasoning_efforts` and `default_reasoning_effort`, the word a request naming
-  none runs at (`model.defaultReasoningEffort`: `--think`, else GLM high, else off/on per `defaultEnableThinking`,
-  where a thinking Qwen silence renders low), and `reasoning_effort_budgets`, the thinking-token cap of each capped word
+  none runs at (`model.defaultReasoningEffort`: `--think`, else Qwen medium, else GLM high, else off/on per
+  `defaultEnableThinking`), and `reasoning_effort_budgets`, the thinking-token cap of each capped word
   (Qwen `low` 2048, `medium` 8192; `{}` for MiMo and GLM).
 - CLI `--think X` requires an explicit effort word and is checked against the `--model` model only; a model loaded on demand takes X by the same rule (MiMo:
   any X but off is on) or, lacking it, keeps its own default. It never fails a load.
-- A thinking request that names NO effort gets no server budget (decided): Qwen3.8 renders it as low
-  (`chat.qwen38EffortFor`), whose preamble shortens the thought without truncating it. `/v1/responses`:
+- **Qwen thinks at medium by default** (owner decision): a request naming no thinking field (no `enable_thinking`,
+  `reasoning_effort`, Anthropic `thinking` or Responses `reasoning`, as `sushi run` sends none) runs with thinking on
+  at `medium` and its 8192-token cap (`model.archDefaultArm`, read by `defaultEnableThinking`, `defaultEffortWord`
+  and `defaultThinkBudget`). Precedence: the request's own fields, then `--think`, then an explicit
+  `--reasoning-budget` over the cap, then this default; a checkpoint whose `generation_config.json` declares
+  `enable_thinking` false stays off. Explicit thinking off stays off. MiMo and GLM keep their defaults. A thinking
+  request on another arch that names NO effort gets no server budget: Qwen3.8's template renders an absent word as
+  low (`chat.qwen38EffortFor`), whose preamble shortens the thought without truncating it. `/v1/responses`:
   `sequence_number` on every event, stateful via
-  `ResponseStore`, WS via Upgrade. Continuing a partial reply: `continue_final_message` explicit on chat, INFERRED on
+  `ResponseStore`, WS via Upgrade. A replayed `reasoning` input item (`content[].reasoning_text`, else
+  `summary[].summary_text`) joins the following message and calls as ONE assistant turn's `reasoning_content`, and the
+  store keeps it in the same field, so an input replay and a `previous_response_id` chain render the same prompt;
+  an encrypted, empty or malformed item is dropped, never a 400. Continuing a partial reply: `continue_final_message` explicit on chat, INFERRED on
   `/v1/messages`.
 - **Anthropic `/v1/messages`** (Claude Code): typed blocks, `input_schema`→`parameters`, stop-reason map incl.
   `stop_sequence` echo, full SSE block lifecycle (a block opens only once the open one is stopped, so each owns its
@@ -46,6 +55,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   (Claude Code's hook output, Codex's mid-input `developer` turn on Responses) renders where it was sent, folded only
   for a template that cannot place it ([server-tool-calling](server-tool-calling.md#templates)); `developer` reads as
   `system` (`canonicalRole`).
+- **`/v1/messages/count_tokens`** takes a `/v1/messages` body (`max_tokens` optional, ignored) and answers
+  `{"input_tokens": N}`: the prompt `/v1/messages` prefills for it, through the same `renderAnthropicPrompt`.
+  Image and video rows count as `placeMedia` expands them, without the tower (`placeRequestMedia`); a body
+  `/v1/messages` refuses for its shape is refused with the same Anthropic error, and the model routes as there.
+  Nothing generates or queues, the prefix cache and the tokenize LRU are untouched, and a prompt past the context
+  is still counted (only `/v1/messages` 400s it). The effort word counts as the word it is served at (the template
+  renders it), and a rerouted one carries the effort notice, header and field, as on `/v1/messages`. The count equals
+  `usage.input_tokens + cache_read_input_tokens`.
 - **`preserve_thinking`** (templates that read it: Qwen3.8), resolved per request as `chat_template_kwargs.preserve_thinking`
   (bool, all three surfaces) > `--preserve-thinking on|off` > `preserve_thinking` in model-settings.json > the template
   default (undefined: every turn's thinking kept). Off renders only the latest user turn's thinking.
@@ -67,7 +84,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   (`tool` included), Anthropic `image` blocks beside the text or inside a `tool_result`, Responses `input_image` in
   a message or a `function_call_output` array. Only base64 data URLs decode (remote URLs are refused, not fetched);
   a failure is a 400 naming the message index and the reason, an `input_audio` part a 400 on a model without an
-  audio encoder, more than 64 images a 400 with both counts, an encode failure a 500 (Anthropic: `api_error`).
+  audio encoder, more than 1024 images a 400 with both counts, an encode failure a 500 (Anthropic: `api_error`).
   Stored Responses history keeps text only.
 
 ## Streaming
@@ -95,6 +112,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   ONE chunk; a client cannot time our stream — use the final chunk's server `timings`.
 - Liveness is a property of the SOCKET: `beatStreamKeepalive` at the bottom of every streaming loop, emit on 5 s
   byte-silence. SSE comments keep the transport alive but do not count as model progress for every client.
+  While a stream waits in the queue behind another request, the comment reads `: queued behind N
+  request(s); running G of M tokens (~S s at R tok/s)` (G/M: the running request's generated tokens and max); an
+  Anthropic stream gets it before each `ping`.
   `sushi launch omp` sets the Sushi provider's `compat.streamIdleTimeoutMs: 0` so buffered calls can finish;
   explicit omp timeout settings, environment overrides and per-call options still take precedence (verified with
   omp 18.3.0). Non-loopback `--url` targets also have a separate first-event deadline: omp's
@@ -128,16 +148,19 @@ before reading a completed stream and requires clean EOF.
   constantly; `ranksDescending` ties by lowest id); the nucleus is the mass STRICTLY above each rank, cumsum in f32;
   `top_p` 0 is GREEDY (`applyTopP` floors at `floatMin(f32)`).
 - A sampler never draws a RESERVED special or PADDING row (`installSuppressMask`; logprobs stay RAW).
+- **A non-streaming `/v1/completions` reply carries the chat reply's `timings`** (`prompt_n`, `cached_n`, `prompt_ms`, `predicted_ms`; `prompt_ms` includes the prefix restore); `sushi bench` reads it.
 - **`ignore_eos: true`** (vLLM's field) decodes a `/v1/completions` request past EOS to `max_tokens`
   (`requestEosSlice`); stop sequences and the loop stops still end it, and its text skips `special: true` tokens
   (`completionShowsToken`, vLLM's default `skip_special_tokens`). Chat refuses it with a named 400
   (`chatIgnoreEosRejectReason`): past its end of turn the model writes another turn, and that turn's think block is
   merged into the reasoning by the non-stream reply (`normalizeEmbeddedThinkBlocks`) but not by the live stream.
-- **A repeat/presence penalty samples on the synchronous serial path** (`samplesSync`, like logprobs): no DFlash or
+- **A repeat/presence/frequency penalty samples on the synchronous serial path** (`samplesSync`, like logprobs): no DFlash or
   drafter path (`draftsRefused`), no batched tick (`.penalty`), never the lazy pipeline, which never applied it.
   MTP does run: each verify row carries the penalty ([engine-mtp](engine-mtp.md#spec-verify-invariant)).
   A penalty-mask allocation failure fails the request instead of sampling without its penalty. Chat and
-  completions parse it alike (`parseRepeatPenalty`); a repeat penalty of 0 or below is off.
+  completions parse it alike (`parseRepeatPenalty`); a repeat penalty of 0 or below is off. OpenAI's `presence_penalty` and
+  `frequency_penalty` (-2 to 2, `parseAdditivePenalty`) are subtracted from the logit once per seen id and once per
+  occurrence; `frequency_penalty` is never read as `repeat_penalty` 1 + x, which halved every seen logit at 1.0.
 - **Think penalty** (`think_penalty` request > `--think-penalty` > model-settings.json > off, 0-20; arXiv 2606.00206):
   while the thought is open every single-token spelling of the paper's markers (bare or space-led, lower or capital)
   loses λ; a split spelling is skipped (its first piece starts other words). The paper penalises everywhere; we stop
@@ -203,6 +226,7 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   no whitespace OUTSIDE the root value, the model's OWN layout inside (`MAX_FREE_WS` 16).
 - A root number ends only at EOS, so it is complete once terminable; the empty-mask disable in `nextConstrainedToken`
   is the logged last resort (a new dead end gets a schema in the `no reachable grammar state is a dead end` test).
+- DeepSeek's DSpark verifies each row under that row's mask (`row_grammar.zig`), before and after the reasoning close; logprobs and forced calls still disable spec.
 - Every schema-mask surface uses ONE thinking policy (`schemaMasksThinking`); tools present = no mask. Per-model
   grammar table lives on `LoadedModel`.
 - Code: `src/json_schema.zig` / `src/json_grammar.zig` / `src/token_mask.zig` / `src/regex.zig` (schema IR →
@@ -233,7 +257,8 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   `phase`, `context_tokens` (prompt + decoded; the FULL prompt on a prefill row), `context_length` (the model's
   effective limit, 0 = not ready/unknown), `cached_tokens`, `generated_tokens`, `max_tokens` (the request's own
   output cap), `elapsed_seconds` (age since arrival, refreshed every publish) and `state_bytes` (GPU bytes of the
-  slot's own KV + SSM buffers; a restored share stays billed to the hot-cache entry, never to the row).
+  slot's own KV + SSM buffers; a restored share stays billed to the hot-cache entry, never to the row; a DeepSeek
+  slot's is the model-held state, rows and rings, plus the live restore points).
 - A live row's `state_bytes` is at capacity: a ringed layer's ring, each QSA bank by its capacity buffer (never also
   its view), and the ring restore points the slot holds.
 - After the live rows come `cached` rows, one per hot-cache entry of every ready model (cap 32, published under
@@ -306,6 +331,9 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   `~/.sushi/<agent>/`. Launcher env: `ANTHROPIC_BASE_URL` + dummy keys + `ANTHROPIC_DEFAULT_*_MODEL=sushi`.
 - Every model id and URL in the zsh script is one single-quoted word (`appendQuoted`) and every config writer escapes
   them for its format (JSON/TOML/YAML `Esc`): ids come from folder names or a `--url` server, so never interpolate bare.
+- codex gets `model_instructions_file` (`~/.sushi/codex/model-instructions.md`, written each launch from `src/assets/codex_model_instructions.md`): without it codex sends fallback instructions naming an `apply_patch` tool it no longer declares; keep the asset's tool list equal to codex's declared tools.
+- opencode runs the newest version among every `opencode` on PATH, not the first (an old npm or `~/.opencode` copy
+  would otherwise shadow Homebrew's 2.x); `--standalone` is probed on that binary.
 - Claude Code's stream watchdogs and 10-min request timeout are raised and its non-stream fallback is off: a long
   prefill plus a long think tripped them, and each fallback re-sent the whole prompt, then timed out and retried.
 - Agent budgets (`launch.budgetForContext` + `compactionReserve`): output share ctx/2, compaction reserve ctx/4

@@ -1,8 +1,12 @@
 const std = @import("std");
 const glm5_mod = @import("glm5_forward.zig");
+const dsv41_model = @import("dsv41_model.zig");
+const dsv41_stream = @import("dsv41_stream.zig");
+const dsv41_borrow = @import("dsv41_borrow.zig");
 const GlmRequest = glm5_mod.Request;
 const qwen4_mod = @import("qwen4_exp.zig");
 const expert_stream_mod = @import("expert_stream.zig");
+const expert_usage = @import("expert_usage.zig");
 const expert_bf16 = @import("expert_bf16_kernels.zig");
 const imatrix_capture = @import("imatrix.zig");
 const sushi_exl3 = @import("sushi_exl3");
@@ -1459,6 +1463,7 @@ pub fn macosProductVersion(buf: []u8) ?[]const u8 {
 fn gpuArchitecture(buf: []u8) ?[]const u8 {
     var dev = mlx.mlx_device{ .ctx = null };
     if (mlx.mlx_get_default_device(&dev) != 0) return null;
+    defer _ = mlx.mlx_device_free(dev);
     var info = mlx.mlx_device_info_new();
     defer _ = mlx.mlx_device_info_free(info);
     if (mlx.mlx_device_info_get(&info, dev) != 0) return null;
@@ -6663,8 +6668,7 @@ fn freeKVEntry(e: *KVCacheEntry) void {
 /// chunks out while the mask pairing was unproven; with `band_in_kernel` now
 /// gating the only consumer that reads ABSOLUTE positions and every other
 /// consumer deriving its query offset as `kv_len - q_len`, width needs no
-/// bound — and wide chunks are the only multi-token forward a serial arch
-/// (laguna, inkling) ever does.
+/// bound.
 pub const SLIDING_TRIM_UNBOUNDED: usize = std.math.maxInt(usize);
 
 /// How many TAIL KV entries a forward of `q_len` queries needs from a SLIDING
@@ -8028,6 +8032,9 @@ pub const SSMCacheEntry = struct {
     /// re-running it for the accepted prefix is pure waste. Null outside a
     /// capturing verify; freed at the end of every `nextPld` round.
     spec_state_seq: mlx.mlx_array = .{ .ctx = null },
+    /// The verify that stored only its final state: what rollback replays the accepted rows from.
+    /// Held instead of `spec_state_seq`, never beside it.
+    spec_replay: gdn_decode.Replay = .{},
     /// PLD spec-decode capture: the conv1d input `[B, (kernel-1)+T, conv_dim]`
     /// of the verify forward, so the accepted-position `conv_state` is just a
     /// slice (no re-forward). Null outside capture.
@@ -8562,6 +8569,7 @@ pub fn ssmRestore(dst: *SSMCacheEntry, snap: *const SSMCacheEntrySnapshot) !void
 /// entry that never captured. Called at the end of every `nextPld` round and
 /// in the cache teardown paths so the capture never outlives a round.
 pub fn ssmFreeSpecCapture(entry: *SSMCacheEntry) void {
+    entry.spec_replay.deinit();
     if (entry.spec_state_seq.ctx != null) {
         _ = mlx.mlx_array_free(entry.spec_state_seq);
         entry.spec_state_seq = .{ .ctx = null };
@@ -8637,6 +8645,11 @@ fn splitSpecCaptures(s: mlx.mlx_stream, m: *const SSMCacheEntry, e: *SSMCacheEnt
 /// only `spec_conv_input`, whose leading `kernel-1` rows cannot be told from
 /// verify positions without it. Passing it explicitly is what lets one helper
 /// roll back both shapes.
+/// True when a verify left this entry's recurrent state recoverable at any accepted row.
+pub fn ssmHasSpecCapture(entry: *const SSMCacheEntry) bool {
+    return entry.spec_state_seq.ctx != null or entry.spec_replay.held();
+}
+
 pub fn ssmRollbackFromCapture(entry: *SSMCacheEntry, accepted: u32, verify_len: u32, s: mlx.mlx_stream) !void {
     // qwen4_exp per-request state beside the GDN pair. PLE layer: the conv
     // window + token history slice at 1+accepted (same shape as conv_state
@@ -8698,7 +8711,12 @@ pub fn ssmRollbackFromCapture(entry: *SSMCacheEntry, accepted: u32, verify_len: 
         }
     }
     const acc: c_int = @intCast(accepted);
-    if (entry.spec_state_seq.ctx != null) {
+    if (entry.spec_state_seq.ctx == null and entry.spec_replay.held() and entry.spec_conv_input.ctx != null) {
+        const replayed = try gdn_decode.replayState(entry.spec_replay, entry.spec_conv_input, acc + 1, s);
+        _ = mlx.mlx_array_free(entry.ssm_state);
+        entry.ssm_state = replayed;
+        patch_ssm = true;
+    } else if (entry.spec_state_seq.ctx != null) {
         const seq_shape = mlx.getShape(entry.spec_state_seq); // [T, B, Hv, Dv, Dk]
 
         // ssm_state = spec_state_seq[accepted]  →  [B, Hv, Dv, Dk]
@@ -10347,6 +10365,7 @@ test "persistent group: forwardWith releases a bound member between batched tick
     }
     p_xfm.glm5 = null;
     p_xfm.qwen4 = null;
+    p_xfm.dsv41 = null;
     p_xfm.moe_layers = null;
     p_xfm.emb_w = .{ .ctx = null };
     p_xfm.config = std.mem.zeroes(ModelConfig);
@@ -13033,6 +13052,9 @@ pub const ForwardCtx = struct {
     /// without this every chunk would restart at vision row 0. Set per chunk
     /// by the generate.zig prefill loop; 0 for unchunked/decode forwards.
     vision_splice_offset: usize = 0,
+    /// DeepSeek-V4.1 chunked prefill: the prompt tokens after this chunk, whose Engram rows the model reads while the
+    /// chunk runs. Empty for the last chunk and for decode.
+    ahead_ids: []const i32 = &.{},
     /// Qwen3-VL interleaved M-RoPE. `mrope_pos` is the server-computed flat
     /// [3 × mrope_total] i32 position-id table (axis-major: t,h,w rows), borrowed
     /// from the slot. `mrope_delta` shifts the scalar decode RoPE (decode tokens
@@ -14067,7 +14089,7 @@ pub const Transformer = struct {
     // the pass-through tail), and `yarn_inv_freq` the same spectrum as the
     // HOST inverse frequencies the M-RoPE cos/sin tables and the QSA pooled-key
     // ladder are filled from (angle = pos×inv_freq). All three null on
-    // unscaled checkpoints. laguna uses them on full-attention layers only.
+    // unscaled checkpoints.
     rope_freqs_yarn: ?mlx.mlx_array = null,
     yarn_mscale: ?mlx.mlx_array = null,
     yarn_inv_freq: ?[]const f64 = null,
@@ -14078,6 +14100,12 @@ pub const Transformer = struct {
 
     glm5: ?*glm5_mod.Model = null,
     glm5_request: ?glm5_mod.Request = null,
+
+    // deepseek_v41: the model owns its one request's state (single flight), its routed experts
+    // stream through `dsv41_experts` over `expert_stream`.
+    dsv41: ?*dsv41_model.Model = null,
+    dsv41_experts: ?*dsv41_stream.Stream = null,
+    dsv41_stq_experts: ?*dsv41_stream.StqStream = null,
 
     // Qwen3.8-Flash-Next (qwen4_exp): the n-gram hash + mmapped table are
     // module-owned (serial, spec-off); the trunk itself rides moe_layers
@@ -14195,6 +14223,7 @@ pub const Transformer = struct {
         var name_buf: [256]u8 = undefined;
 
         if (config.isGlm5()) return initGlm5(allocator, config, weights, s);
+        if (config.isDsv41()) return initDsv41(allocator, config, weights, s);
 
         const emb_base: []const u8 = "embed_tokens";
         const emb_w = getNamedWeight(weights, &name_buf, prefix, emb_base, "weight") orelse {
@@ -14208,7 +14237,7 @@ pub const Transformer = struct {
         // in mixed QAT checkpoints. A mandatory fetch would be a spurious
         // MISSING WEIGHT crash (issue #24).
         // Mixed checkpoints can also leave the WHOLE embedding table dense
-        // beside quantized layers (hy_v3 2-bit ships a bf16 embed_tokens) —
+        // beside quantized layers (a 2-bit pack can ship a bf16 embed_tokens) —
         // scales-presence is decided by the TABLE's dtype (float ⇒ dense),
         // never by the config's global bits. A packed (uint32) table missing
         // its scales still crashes honestly.
@@ -14567,6 +14596,7 @@ pub const Transformer = struct {
     /// Reset all caches for a new request (KV cache + SSM state for MoE).
     pub fn resetCache(self: *Transformer) !void {
         if (self.glm5_request) |*request| request.reset();
+        if (self.dsv41) |m| dsv41_model.resetState(m);
         const prev_config = self.cache.config;
         try self.cache.reinit(self.config.num_hidden_layers, prev_config);
         if (self.ssm_entries) |entries| {
@@ -14810,6 +14840,18 @@ pub const Transformer = struct {
             m.deinit(self.allocator);
             self.qwen4_mtp = null;
         }
+        if (self.dsv41) |m| {
+            m.deinit();
+            self.dsv41 = null;
+        }
+        if (self.dsv41_experts) |st| {
+            self.allocator.destroy(st);
+            self.dsv41_experts = null;
+        }
+        if (self.dsv41_stq_experts) |st| {
+            self.allocator.destroy(st);
+            self.dsv41_stq_experts = null;
+        }
         if (self.expert_stream) |engine| {
             engine.deinit();
             self.allocator.destroy(engine);
@@ -14844,6 +14886,7 @@ pub const Transformer = struct {
     pub fn useCurrentThreadStream(self: *Transformer) void {
         self.s = mlx.gpuStream();
         if (self.glm5) |mdl| mdl.s = self.s;
+        if (self.dsv41) |m| m.s = self.s;
     }
 
     // ── Core ops ──
@@ -14960,39 +15003,6 @@ pub const Transformer = struct {
         // Probe window saturated — fall through to direct detect, no cache write.
         return computeQuantParams(&self.config, w, sc, in_dim);
     }
-
-    /// Whether `diagProjBench`'s hand-rebuilt attention can actually reshape
-    /// this q_proj back. `q_shape` is the loaded (pre-transposed) [in, out]
-    /// matrix; `head_width` is `num_attention_heads * head_dim`, the width the
-    /// rungs reshape through.
-    fn projLadderFits(q_shape: []const c_int, head_width: c_int) bool {
-        if (q_shape.len != 2) return false;
-        return q_shape[1] == head_width;
-    }
-
-    /// How much of the real attention chain a `diagProjBench` rung rebuilds.
-    /// The rungs are cumulative, so the ladder walks FORWARD from the bare
-    /// matmul loop to the full attention block — the direction that localizes
-    /// the cost. Walking backward from the whole forward made every component
-    /// measure cheap while the parts summed to a third of the whole.
-    const ProjRung = enum {
-        matmul_only, // q/k/v/o back to back, nothing between them
-        reshape, // + [B,S,H,D] reshape
-        qk_norm, // + per-head QK RMS-norm
-        transpose, // + [B,H,S,D] transpose
-        rope, // + RoPE
-        sdpa, // + SDPA over this step's own K/V (no cache)
-        gate, // + softplus per-head output gate
-        norms, // + input/post-attention RMS-norms and both residual adds
-        mlp, // + the layer's real MLP (MoE or dense) — a whole layer
-        yarn_rope, // + laguna's REAL rope arguments (YaRN freqs on full layers)
-        real_attn, // same layer, but attention is the SHIPPED lagunaAttnWith
-    };
-
-    /// Whether a rung issues each projection immediately before its own
-    /// dependent chain (how `lagunaAttnWith` builds the graph) or issues q/k/v
-    /// together and only then post-processes them.
-    const ProjOrder = enum { interleaved, hoisted };
 
     fn mtpNaxProfileEnabledForTrunk(self: *const Transformer, profiled_trunk: bool) bool {
         if (self.config.isMoe()) return false;
@@ -15655,7 +15665,7 @@ pub const Transformer = struct {
     /// per request, so the ladder is the only overlap it can buy. sushi
     /// already overlaps at the step boundary (`generate.zig`'s build-next →
     /// async_eval → resolve-pending), so the overlap is already collected and
-    /// the ladder only adds submissions. Swept on Laguna XS 2.1 NVFP4 / M4 Max,
+    /// the ladder only adds submissions. Swept on a 40-layer MoE / M4 Max,
     /// 512-token prompt / 128 decode steps, medians of 2:
     ///   off 39.88 | stride 8 40.22 | 4 40.37 | 2 41.08 | 1 41.49 ms/token
     /// Monotonically worse as the stride tightens. Kept as a knob because the
@@ -15741,7 +15751,7 @@ pub const Transformer = struct {
     pub fn ownsModuleDecodeState(self: *const Transformer) bool {
         // A streamed GLM load (the KLD teacher) admits one claimant per expert stream.
         if (self.glm5) |m| if (m.expert_stream != null) return true;
-        return false;
+        return self.dsv41 != null;
     }
 
     pub fn sharesModuleReadonlyState(self: *const Transformer) bool {
@@ -15772,7 +15782,9 @@ pub const Transformer = struct {
     pub fn moduleStateSpecRollback(self: *const Transformer) bool {
         // qwen4_exp: GDN per-position capture + PLE window/token capture +
         // positional QSA key histories (`ssmRollbackFromCapture`), so the MTP
-        // head's verify can rewind. dsv4 cannot.
+        // head's verify can rewind. dsv4 cannot. deepseek_v41 cuts its own rows
+        // back to the accepted prefix (`dsv41_model.finishVerify`).
+        if (self.dsv41) |m| return m.dspark != null;
         return self.qwen4_mtp != null;
     }
 
@@ -15916,9 +15928,22 @@ pub const Transformer = struct {
     pub const verifyRowsJoined = qwen4_forward.verifyRowsJoined;
     pub const warmupMimoVerify = mimo_forward.warmupMimoVerify;
 
+    pub fn dsv41Draft(self: *Transformer, t1: u32) !dsv41_model.Draft {
+        return dsv41DraftImpl(self, t1);
+    }
+
+    pub fn dsv41Verify(self: *Transformer, ctx: *ForwardCtx, ids: []const u32) !mlx.mlx_array {
+        return dsv41VerifyImpl(self, ctx, ids);
+    }
+
+    pub fn dsv41Finish(self: *Transformer, ctx: *ForwardCtx, accepted: usize) !void {
+        return dsv41FinishImpl(self, ctx, accepted);
+    }
+
     pub fn forwardWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
         if (ctx.batch_slots == null) try self.ssmGroupRelease(ctx);
         if (self.glm5) |mdl| return forwardGlm5WithImpl(self, ctx, token_ids, mdl);
+        if (self.dsv41) |m| return forwardDsv41With(self, ctx, token_ids, m);
         if (self.qwen4 != null) return self.forwardQwen4With(ctx, token_ids);
         return self.forwardMoeWith(ctx, token_ids);
     }
@@ -16869,7 +16894,7 @@ pub const Transformer = struct {
         if (@import("builtin").is_test and !single_verify_test_features[@backingInt(feature)]) return false;
         // Capture marks speculative verification. A short prefill tail has the
         // same shape but must keep the ordinary forward path and shared expert.
-        return self.spec_capture_ssm and batch == 1 and width >= 2 and width <= 6;
+        return self.spec_capture_ssm and batch == 1 and width >= 2 and width <= 8;
     }
 
 
@@ -17348,7 +17373,22 @@ pub const Transformer = struct {
     fn newExpertEngine(allocator: std.mem.Allocator, config: *const ModelConfig, s: mlx.mlx_stream) !*expert_stream_mod.Engine {
         const engine = try allocator.create(expert_stream_mod.Engine);
         errdefer allocator.destroy(engine);
-        engine.* = try expert_stream_mod.Engine.initWithOptions(allocator, config.expert_source_dir orelse return error.MissingExpertSourceDir, config.expertGeometry(), config.expert_cache_bytes, s, .{ .layout = config.expert_layout });
+        const dir = config.expert_source_dir orelse return error.MissingExpertSourceDir;
+        // The engine owns the drop for its life; nothing else lets go of it.
+        const drop: ?*expert_usage.Drop = if (config.drop_expert == 0) null else blk: {
+            if (!config.isDsv41()) return error.LaunchFlagUnsupported;
+            const d = try allocator.create(expert_usage.Drop);
+            errdefer allocator.destroy(d);
+            d.* = try expert_usage.load(allocator, dir, config.expertDropRequest());
+            break :blk d;
+        };
+        errdefer if (drop) |d| {
+            d.deinit();
+            allocator.destroy(d);
+        };
+        var geometry = config.expertGeometry();
+        geometry.drop = drop;
+        engine.* = try expert_stream_mod.Engine.initWithOptions(allocator, dir, geometry, config.expert_cache_bytes, s, .{ .layout = config.expert_layout, .drop_owned = drop, .tile_major = config.isDsv41() and config.expert_layout == .exl3_k4 });
         return engine;
     }
 
@@ -17727,13 +17767,7 @@ pub const Transformer = struct {
     // de-interleaves q and k identically before a halves-rotation, and a
     // consistent permutation of both operands leaves q·k unchanged — so the
     // traditional kernel is exact here, not an approximation.
-    // ── Laguna attention (per-layer heads, YaRN/default RoPE, softplus gate) ──
-    // Full-attention layers: 48 Q-heads, YaRN RoPE (theta 5e5, partial 0.5),
-    // no sliding window. Sliding layers: 72 Q-heads, default RoPE (theta 1e4,
-    // full rotary), 512-window mask. KV heads uniform (8). Per-head QK RMS-norm
-    // before RoPE (qwen3 pattern); softplus per-head output gate before o_proj.
-    // Mirrors gemma4MoeAttnWith's sliding-mask plumbing (head_dim 128 → no
-    // fused hd-256 kernel). Reference: modeling_laguna.py LagunaAttention.
+
     /// The angle row for `offset` in the given rope family, rebuilt when the
     /// offset moves (per decode token: 38-of-40 layers hit the cache).
     pub fn qkAngleFor(self: *Transformer, family: usize, rd: c_int, base: mlx.mlx_optional_float, freqs: mlx.mlx_array, offset: c_int, mscale: f32) !mlx.mlx_array {
@@ -17979,7 +18013,7 @@ pub const Transformer = struct {
                     return if (skip_output) standinRef(f.gated) else self.qmatmul(f.gated, la.out_w, la.out_s, la.out_b);
                 }
             }
-            var r = (try gdn_decode.step(geo, seq_len, inputs, self.s)) orelse break :recur;
+            var r = (try gdn_decode.step(geo, seq_len, inputs, false, self.s)) orelse break :recur;
             defer r.deinit();
             if (self.gdn_eps == null) self.gdn_eps = mlx.mlx_array_new_float(cfg.rms_norm_eps);
             const flat = (try gdnNormGateFused(self.s, r.y, z_proj, 0, value_dim, la.norm_w, self.gdn_eps.?, !cfg.kda_sigmoid_out_gate, num_v_heads, dv, 1, seq_len)) orelse break :recur;
@@ -17995,13 +18029,15 @@ pub const Transformer = struct {
                 if (ssm.spec_conv_input.ctx != null) _ = mlx.mlx_array_free(ssm.spec_conv_input);
                 ssm.spec_conv_input = conv_input;
                 if (ssm.spec_state_seq.ctx != null) _ = mlx.mlx_array_free(ssm.spec_state_seq);
-                ssm.spec_state_seq = r.state_seq;
-                r.state_seq = .{ .ctx = null };
+                ssm.spec_state_seq = .{ .ctx = null };
+                const pre_state = ssm.ssm_state;
+                ssm.ssm_state = .{ .ctx = null };
+                try ssm.spec_replay.hold(pre_state, geo, inputs);
             }
             _ = mlx.mlx_array_free(ssm.conv_state);
             ssm.conv_state = r.conv_state;
             r.conv_state = .{ .ctx = null };
-            _ = mlx.mlx_array_free(ssm.ssm_state);
+            if (ssm.ssm_state.ctx != null) _ = mlx.mlx_array_free(ssm.ssm_state);
             ssm.ssm_state = r.ssm_state;
             r.ssm_state = .{ .ctx = null };
             const once = if (seq_len == 1) &gdn_decode_recur_engaged else &gdn_verify_recur_engaged;
@@ -19294,7 +19330,7 @@ pub const Transformer = struct {
         };
 
         // Top-K + softmax/renormalize as a single fused kernel (when compiled).
-        // Hy3 (expert_bias bound): sigmoid+bias selection instead of softmax.
+        // expert_bias bound: sigmoid+bias selection instead of softmax.
         // At one decode row the shared-expert gate's logit rides the softmax router kernel.
         const gate_fold: ?RouterGate = blk: {
             if (routing_override != null or router_override != null or stream_ctx != null or skip_shared) break :blk null;
@@ -19375,6 +19411,7 @@ pub const Transformer = struct {
             const fold_shared = shared != null and moeDumpDir() == null;
             const tail_shared = routing_override == null and !skip_shared and mw.shared_expert_gate_w != null and !qwen4Standin().moe_shared;
             if (tail_shared and moeDumpDir() == null) {
+                if (try @import("qwen4_shared.zig").folded(self.s, expert_x, mw, inds, norm_scores, self.config.expertDecode(), routed.gate_logit)) |folded| return folded;
                 const down = (try self.moeSharedDown(.qmatmul, expert_x, mw, &.{})).?;
                 defer _ = mlx.mlx_array_free(down);
                 const own_logit = routed.gate_logit.ctx == null;
@@ -19606,7 +19643,7 @@ pub const Transformer = struct {
             // ── Decode fast path: in-place gather-qmv kernel ──
             // Reads the expert bank directly with GPU-resident indices, so it
             // moves the ideal 9.8 MB/projection instead of the take path's 3x
-            // (µbench at Laguna's 201 MB bank: 37 us vs batched 72 vs stock
+            // (µbench at a 201 MB bank: 37 us vs batched 72 vs stock
             // gather_qmm 349). Everything is done inside the predicate; a null
             // return (unsupported quant mode or width) falls through to the
             // stock gather_qmm path below with no behaviour change.
@@ -20441,7 +20478,7 @@ pub inline fn lastDim(x: mlx.mlx_array) ?u32 {
 /// group size.
 /// True when an embedding/lm_head TABLE is stored dense (float dtype) even
 /// though the config declares global quantization. Mixed checkpoints quantize
-/// per-tensor — hy_v3 2-bit ships a bf16 embed_tokens beside 2-bit experts —
+/// per-tensor — a 2-bit pack can ship a bf16 embed_tokens beside 2-bit experts —
 /// so scales-presence must be decided by the WEIGHT's dtype, never the
 /// config's bits (a packed uint32 table missing scales still crashes
 /// honestly at the mandatory fetch).
@@ -20866,8 +20903,8 @@ fn yarnMscale(config: *const ModelConfig) f64 {
 /// Pure f64 math (no MLX) so it unit-tests directly against reference values.
 /// The spectrum itself lives in `mrope.Yarn` — shared with the host cos/sin
 /// tables, which need inv_freq and not the reciprocal — so the device and host
-/// rope paths can never drift apart. `truncate` is the HF flag (laguna's
-/// rope_parameters omits it → true).
+/// rope paths can never drift apart. `truncate` is the HF flag (an omitted
+/// flag means true).
 fn computeYarnFreqs(
     out: []f64,
     head_dim: u32,
@@ -20892,15 +20929,6 @@ fn computeYarnFreqs(
     for (out) |*v| v.* = 1.0 / v.*;
 }
 
-/// Hy3 (hy_v3 / DeepSeek-V3-style) sigmoid routing chain — mirrors the
-/// reference `expert_select` (hy_v3.py):
-///   scores = sigmoid(logits) in FLOAT32 (the fp32-router class: a bf16
-///   sigmoid+bias flips near-tie expert picks on real checkpoints);
-///   top-k SELECTED on scores + expert_bias, WEIGHTED by the unbiased scores;
-///   if route_norm and k > 1: weights /= (sum + 1e-20);
-///   weights *= route_scale; cast bf16 for the expert-combine multiply
-///   (shipped checkpoints run enable_moe_fp32_combine = false).
-/// Returns owned `inds` + `norm_scores` — caller must free both.
 /// Group-limited routing mask (DeepSeek-style `group_limited_topk`): split the BIASED scores
 /// into `n_group` equal groups, score each group by the SUM OF ITS TOP TWO
 /// experts, keep the best `topk_group` groups, and drop every expert outside
@@ -21013,7 +21041,7 @@ fn groupLimitMask(
     return out;
 }
 
-/// Group-limited routing = hy3's sigmoid+bias chain with the group limit inserted
+/// Group-limited routing = the sigmoid+bias chain with the group limit inserted
 /// between the bias and the top-k. Weights still come from the UNBIASED
 /// sigmoid scores, sum-normalized with the reference's 1e-20 and scaled by
 /// `routed_scaling_factor`.
@@ -21111,8 +21139,7 @@ pub fn groupLimitedRouting(
         try mlx.check(mlx.mlx_array_set(&scaled, weights_f32));
     }
 
-    // Weights stay f32. hy3's chain casts to bf16 here because that arch's
-    // stream is bf16 anyway, but a group-limited arch multiplies these into the
+    // Weights stay f32: a group-limited arch multiplies these into the
     // routed expert sum AFTER `routed_scaling_factor` (2.5), so a bf16 round trip lands ~0.4%
     // of 2.5 on every token -- measured 2.6e-3 max error on the reference MoE
     // block, which is 500x the tolerance the rest of the port holds. The caller
@@ -21212,7 +21239,7 @@ pub fn sigmoidBiasRoutingChain(
 // eps add, divide, scale multiply, cast — over a [rows, E] tensor that is 512
 // bytes wide at decode. Every one of them is launch-latency bound, and a MoE
 // model pays the whole chain once per LAYER: 40 layers x 11 = 440 dispatches
-// per token on Laguna, none of which move meaningful data.
+// per token, none of which move meaningful data.
 //
 // One threadgroup per row does all of it: phase 1 computes the selection key
 // for every expert into threadgroup memory, phase 2 runs K rounds of
@@ -21445,7 +21472,7 @@ fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
             \\    w = float(TOUT(fast::exp(float(logits[rbase + myidx]) - smax) * snorm));
         ,
         if (sigmoid)
-            // The hy3 chain sums FLOAT32 sigmoid scores, so the accumulator is
+            // The chain sums FLOAT32 sigmoid scores, so the accumulator is
             // float — but still ascending, still sequential.
             \\  for (int j = 0; j < NK; ++j) tot += simd_shuffle(w, ushort(j));
         else
@@ -21524,7 +21551,7 @@ fn moeRouterThreadGroup(num_experts: c_int) c_int {
 /// bakes the OUTPUT SHAPES (and grid) of the call that built it, so the key
 /// must carry the caller's actual dims: keying on a PRODUCT (rows, n) collides
 /// across layouts with equal element counts and hands the colliding caller an
-/// output labeled with the FIRST caller's shape. Live 2026-07-29 (Laguna XS):
+/// output labeled with the FIRST caller's shape. Live 2026-07-29:
 /// a MoE-layer SwiGLU at a 16-token hot-cache-restore prefill is (1,16,512) =
 /// 8192 elements — the same count/rank/dtype as a dense mlp_only layer at
 /// decode (1,1,8192) — and the mislabeled activation killed the server in the
@@ -21641,7 +21668,7 @@ fn moeRouterTopKGate(
 
     // The whole point of the kernel is to spend ONE dispatch where the chain
     // spent a dozen; rebuilding the config every call would just move that cost
-    // to the CPU side (measured +0.16 ms of graph-build per token on Laguna).
+    // to the CPU side (measured +0.16 ms of graph-build per token on a 40-layer MoE).
     // A model's routing geometry is fixed, so one cached config per mode covers
     // decode, and prefill re-arms it once per width.
     const key = RouterCfgKey{
@@ -22306,8 +22333,8 @@ pub fn diagEnvOnCached(cache: *?bool, name: [*:0]const u8) bool {
 /// Whether decode should try the in-place gather-qmv kernels at all.
 ///
 /// The gate is "would the FUSED gate+up+SwiGLU kernel engage", because that is
-/// what changed the answer. SPLIT gatherQmv loses to stock `gather_qmm` (Laguna
-/// XS, GPU eval 12.73 vs 12.47 ms) and lost on gemma4-26B-A4B too, which is why
+/// what changed the answer. SPLIT gatherQmv loses to stock `gather_qmm` (a
+/// 40-layer MoE, GPU eval 12.73 vs 12.47 ms) and lost on a 26B-A4B too, which is why
 /// no arch opted in. Fusing the two projections and the activation into one
 /// simdgroup flips it: 13.007/13.568 -> 12.768/13.114 ms/forward, both pairs.
 ///
@@ -22333,7 +22360,7 @@ const QkAngleSlot = struct {
 // ── Fused decode QK-norm+RoPE (mlxfast 9e06de6 class) ──
 //
 // At decode the chain q/k reshape → per-head RMSNorm → transpose → RoPE
-// (→ YaRN mscale on Laguna full layers) is strictly serial — SDPA needs its
+// (→ YaRN mscale on scaled layers) is strictly serial — SDPA needs its
 // output and nothing overlaps it — and costs 4-6 dispatches per layer for a
 // few KB of work. One 32-thread-per-head kernel does all of it. cos/sin are
 // never re-derived: a per-token PROBE row (ones|zeros through the stock
@@ -23447,7 +23474,7 @@ fn shortlistAudit(s: mlx.mlx_stream, full: mlx.mlx_array, sparse: mlx.mlx_array,
 // `h = h + branch; normed = rms_norm(h, w)` is two dispatches, and unlike the
 // attention gate they are STRICTLY serial with everything around them: the norm
 // waits on the add, the projections wait on the norm. Every transformer layer
-// in the shared MoE/qwen3.5/laguna loop pays it.
+// in the shared MoE loop pays it.
 //
 // The kernel is `rms_single_row` (rms_norm.metal) with the add folded into its
 // load, and it keeps MLX's launch geometry — ceil(AXIS/4) threads, four
@@ -23458,7 +23485,7 @@ fn shortlistAudit(s: mlx.mlx_stream, full: mlx.mlx_array, sparse: mlx.mlx_array,
 // it is emitted as a second output because the residual is still needed.
 // `metal::precise::rsqrt` is deliberately the precise variant, as upstream.
 //
-// MEASURED NEUTRAL-TO-NEGATIVE on the Laguna-era MoE loop, so only MiMo's
+// MEASURED NEUTRAL-TO-NEGATIVE on the shared MoE loop, so only MiMo's
 // fused-norm path wires it. Six pairs, both orders, on a
 // machine under other GPU load so only the RATIO is meaningful: ON median
 // 14.890 vs OFF 14.747 ms/forward, 4 of 6 pairs favouring OFF.
@@ -23673,47 +23700,13 @@ fn addRmsNormKernel(
     return .{ .sum = sum, .normed = normed, .normed_f32 = normed_f32 };
 }
 
-// ── Fused per-head attention output gate ──
-//
-// Laguna gates attention by `softplus(g_proj(x))` per head before o_proj. As
-// separate ops that is four dispatches a layer (cast to f32, logaddexp, cast
-// back, broadcast multiply) over tensors of a few KB — 160 launches per token
-// on a 40-layer model, priced by SUSHI_DISPATCH_PROBE at ~1.7 us each.
-//
-// One kernel does all four. The arithmetic is MLX's, op for op: `LogAddExp`'s
-// exact max/min/log1p form from binary_ops.h (including the infinity
-// short-circuit), the same f32 -> output-dtype rounding of the gate before the
-// multiply, and the same promote-multiply-round for the product — pinned
-// bit-identical by the test below.
-//
-// MEASURED NEUTRAL, so it ships DEFAULT OFF (`SUSHI_ATTN_GATE_FUSED=1`
-// opts in). Paired A/B on Laguna XS, 3 pairs, ms/forward: off 13.112 / 13.098 /
-// 13.030 against on 13.117 / 13.116 / 13.160. Removing three dispatches a layer
-// is worth ~0.2 ms by the SUSHI_DISPATCH_PROBE slope (~1.5 us each) and
-// none of it showed up, because THE GATE CHAIN IS NOT ON THE CRITICAL PATH: it
-// depends only on the layer input, so the GPU already overlaps it with the
-// q/k/v projections and SDPA. Only fusions that shorten the dependency chain
-// (router, expert gathers, lm_head) convert dispatch savings into time — price
-// a candidate by where it sits in the chain, not by counting its launches.
-// Shape is one thread per OUTPUT ELEMENT, not one threadgroup per row. The
-// first version staged the per-head gate in threadgroup memory and had a
-// single 256-thread group walk all 6144 activations of a row; at decode that
-// is one GPU core doing what the elementwise multiply it replaced spread over
-// the whole device, and it measured 2.3% SLOWER than the four-dispatch chain
-// on three consecutive pairs. Recomputing softplus once per element is ~10 ALU
-// ops against a value that is in cache — far cheaper than serializing.
-const AttnGateCfgKey = struct { shape: ShapeKey, nh: c_int, dtype: mlx.mlx_dtype };
-var attn_gate_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
-var attn_gate_cfg_key: AttnGateCfgKey = std.mem.zeroes(AttnGateCfgKey);
-
 // ── Fused SwiGLU: silu(gate) * up in one dispatch ──
 //
-// `computeGeglu` only had a fused path for `gelu_approx`, so every SILU model —
-// Laguna, Qwen, Llama, Mistral, i.e. most of the matrix — ran sigmoid +
+// `computeGeglu` only had a fused path for `gelu_approx`, so every SILU model ran sigmoid +
 // multiply + multiply as three dispatches, and a MoE layer pays it TWICE
 // (routed experts + shared expert). It sits on the expert chain's critical
-// path, so unlike the attention gate the launches are not overlapped: paired
-// A/B on Laguna XS measured 13.12 -> 12.81 ms/forward, 3/3 pairs.
+// path, so the launches are not overlapped: paired
+// A/B on a 40-layer MoE measured 13.12 -> 12.81 ms/forward, 3/3 pairs.
 //
 // Extending mlx_compile to the silu arm gets the same 2.4% but is NOT
 // output-preserving — a same-binary greedy A/B diverged at token ~55, so the
@@ -23750,7 +23743,7 @@ const SWIGLU_SOURCE =
 /// `mlx_sigmoid` tabulated over every 16-bit float pattern, indexed [bf16, f16].
 var swiglu_sig_tables: [2]?mlx.mlx_array = @splat(null);
 
-fn swigluSigTable(s: mlx.mlx_stream, dt: mlx.mlx_dtype, allocator: std.mem.Allocator) !mlx.mlx_array {
+pub fn swigluSigTable(s: mlx.mlx_stream, dt: mlx.mlx_dtype, allocator: std.mem.Allocator) !mlx.mlx_array {
     const slot: usize = switch (dt) {
         .bfloat16 => 0,
         .float16 => 1,
@@ -23915,7 +23908,7 @@ pub fn decodeProfReport() void {
 // any C/C++ process (it is flat under pip-Python with the identical dylib —
 // measured E-sweep in the `MoE decode gather` µbench: 30/50/77/300 us at banks
 // of 8/25/50/201 MB, all reading the SAME 10 experts). 141 gathers/token x 300 us
-// is the whole 42 ms/token Laguna decode. `take` from the same 201 MB bank does
+// is the whole 42 ms/token decode. `take` from the same 201 MB bank does
 // NOT pay it, so indexed reads are fine; the penalty is specific to gather_qmm's
 // addressing.
 //
@@ -23934,14 +23927,14 @@ pub fn decodeProfReport() void {
 //
 // `NVFP4` picks the dequant arithmetic: false = affine (q * scale + bias, the
 // mlx-quantized checkpoints), true = NVFP4 (e2m1 nibbles + uint8 e4m3 group
-// scales, no biases — poolside's Laguna checkpoints).
+// scales, no biases).
 fn gatherQmvSource(comptime nvfp4: bool, comptime x_per_expert: bool) [:0]const u8 {
     // Everything is indexed off the raw buffer names rather than through
     // explicitly address-spaced pointers: MLX generates the signature from each
     // input's ACTUAL dtype and puts arrays with fewer than 8 elements in
     // `constant` instead of `device` (backend/common/metal_kernel.cpp), so a
     // hand-declared `const device T*` would mismatch on both counts. `x` in
-    // particular arrives as float32 on Laguna while scales/biases are bf16.
+    // particular can arrive as float32 while scales/biases are bf16.
     //
     // A uint4 (128-bit) load variant was measured and is NOT kept: 38.9 us vs
     // 37.3 for the scalar form. At ~5 ALU ops per dequantized value this loop
@@ -24661,7 +24654,7 @@ pub fn gatherQmv(
 
     // CACHED, not rebuilt per call. This runs three times per MoE layer, and a
     // fresh config is ~10 FFI calls: measured `ops/forward` 3226 vs 2329 and
-    // +0.4 ms of CPU graph build per token on Laguna XS, which is roughly 60%
+    // +0.4 ms of CPU graph build per token on a 40-layer MoE, which is roughly 60%
     // of the margin this path was being charged against stock `gather_qmm`.
     const key = GqmvCfgKey{ .topk = topk, .n = N, .bits = bits, .gs = group_size, .dtype = xd, .x_per_expert = x_per_expert };
     const slot = &gqmv_cfg_cache[@intFromBool(x_per_expert)];
@@ -27750,15 +27743,6 @@ fn loadSwitchMlpBank(weights: *const Weights, buf: *[256]u8, prefix: []const u8,
     };
 }
 
-/// Build a "<container>.<leaf>" layer-weight suffix into `buf`. Used where the
-/// stacked-MoE-expert container is named differently across converters — hy_v3
-/// experts are `mlp.experts.*` in ox-ox-style MLX builds and `mlp.switch_mlp.*`
-/// in mlx-lm builds (mlx-community Hy3-oQ2*, pipenetwork Hy3-REAP*), same
-/// [E, out, in] tensor either way. Uses its own buffer so it can compose with
-/// getLayerWeight's separate key buffer in one expression.
-fn moeExpertSuffix(buf: []u8, container: []const u8, leaf: []const u8) []const u8 {
-    return std.fmt.bufPrint(buf, "{s}.{s}", .{ container, leaf }) catch unreachable;
-}
 
 /// Fetch a quantization scale/bias tensor, tolerant of dense bf16 models.
 /// quant_bits == 0 ⇒ dense bf16 (no .scales/.biases exist anywhere) ⇒ return a
@@ -27849,6 +27833,130 @@ fn initGlm5(allocator: std.mem.Allocator, config: ModelConfig, weights: *const W
     shell.glm5_request = request;
     shell.expert_stream = engine;
     return shell;
+}
+
+fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights, s: mlx.mlx_stream) !Transformer {
+    const stq = config.dsv41.?.expert_dec != null;
+    if (!config.expert_streaming or config.expert_layout != (if (stq) expert_quant_mod.Layout.exl3_k4 else .mxfp4_w123)) return error.ExpertStreamingRequired;
+    const engine = try Transformer.newExpertEngine(allocator, &config, s);
+    errdefer {
+        engine.deinit();
+        allocator.destroy(engine);
+    }
+    // The load drops each tensor from the map once its arrays are bound.
+    const mdl = try dsv41_model.init(allocator, config.dsv41.?, @constCast(weights), config.expert_source_dir orelse return error.MissingExpertSourceDir, s, .{ .experts = false, .dspark = config.dsparkOn(), .drop = engine.geometry.drop });
+    errdefer mdl.deinit();
+    dsv41_model.logMemory(mdl);
+    dsv41_model.setFused(mdl, diagEnvOn("SUSHI_DSV41_COMPOSED"));
+    if (diagEnvOn("SUSHI_DSV41_NO_DECODE_ENGRAM_AHEAD")) mdl.decode_engram_ahead = false;
+    dsv41_model.setDsparkExact(mdl, if (std.c.getenv("SUSHI_DSV41_DSPARK_EXACT")) |v| diagEnvValueOn(v) else true);
+    dsv41_model.setReadDiag(diagEnvOn("SUSHI_DSV41_READ_DIAG"));
+    if (mdl.ced_split) |split|
+        log.info("[dsv41] CED: layers {d}..{d} run the last {d} rows of a prefill chunk\n", .{ split, mdl.cfg.layers - 1, mdl.cfg.window });
+    const verify_profile = diagEnvOn("SUSHI_DSV41_VERIFY_PROFILE");
+    if (verify_profile or diagEnvOn("SUSHI_DSV41_PREFILL_PROFILE")) {
+        mdl.profile = try allocator.create(dsv41_model.Profile);
+        mdl.profile.?.* = .init(verify_profile);
+    }
+    var shell = try initModuleShell(allocator, config, s);
+    if (stq) {
+        // CED runs the decoder over a chunk's last rows, so a prefill can take the decoder's pools for its working set.
+        if (mdl.ced_split) |split| engine.borrow_from = @intCast(split);
+        const experts = try allocator.create(dsv41_stream.StqStream);
+        experts.* = .{ .engine = engine, .cfg = &mdl.cfg };
+        mdl.experts = .{ .hook = experts.hook() };
+        shell.dsv41_stq_experts = experts;
+        if (engine.startPrefetch()) {
+            mdl.prefetch_lead_rows = 3;
+        } else |e| log.warn("[dsv41] expert prefetch off: {s}\n", .{@errorName(e)});
+    } else {
+        const experts = try allocator.create(dsv41_stream.Stream);
+        experts.* = .{ .engine = engine, .cfg = &mdl.cfg, .act = mdl.act };
+        mdl.experts = .{ .hook = experts.hook() };
+        shell.dsv41_experts = experts;
+    }
+    shell.dsv41 = mdl;
+    shell.expert_stream = engine;
+    // A failed warm costs the first requests their compiles, not the load.
+    var clock = expert_stream_mod.Clock.init();
+    const had_error = mlx.errorPending();
+    if (dsv41_model.warmKernels(mdl)) {
+        log.info("[dsv41] kernels warmed for 1..{d} rows{s} in {d} ms\n", .{ expert_exl3_kernels.DECODE_ROWS_MAX, if (mdl.dspark != null) " and the DSpark rounds" else "", clock.lap() / std.time.ns_per_ms });
+    } else |e| {
+        mlx.dropLatchedErrorUnless(had_error);
+        log.warn("[dsv41] kernel warm failed ({s}); requests compile their own\n", .{@errorName(e)});
+    }
+    // The warm's transients leave the pool, so the load's memory reading is the model's.
+    _ = mlx.mlx_clear_cache();
+    return shell;
+}
+
+/// One request at a time: the model holds its state, which `cache.step` mirrors. Logits are the last row.
+fn forwardDsv41With(self: *Transformer, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *dsv41_model.Model) !mlx.mlx_array {
+    if (ctx.cache.step == 0) dsv41_model.resetState(m);
+    const st = try dsv41_model.ensureState(m);
+    if (st.n != ctx.cache.step) return error.Dsv41CachePositionMismatch;
+    m.s = self.s;
+    const rows = mlx.getShape(ids);
+    if (rows.len != 2 or rows[0] != 1) return error.InvalidDsv41Input;
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_astype(&flat, ids, .uint32, self.s));
+    try mlx.check(mlx.mlx_array_eval(flat));
+    const host = mlx.mlx_array_data_uint32(flat) orelse return error.InvalidDsv41Input;
+    const n: usize = @intCast(rows[1]);
+    if (self.expert_stream) |engine| {
+        try dsv41_borrow.beforeForward(engine, &self.config, &m.cfg, n, st.n + n);
+        engine.beginForward();
+    }
+    // The model splices the image rows itself: the span's embedding never leaves it.
+    const vision: ?dsv41_model.VisionRows = if (ctx.vision_embeddings) |ve| .{ .rows = ve, .offset = ctx.vision_splice_offset } else null;
+    const ahead = try m.gpa.alloc(u32, ctx.ahead_ids.len);
+    defer m.gpa.free(ahead);
+    for (ctx.ahead_ids, ahead) |t, *o| o.* = @intCast(t);
+    const last = try dsv41_model.extendAhead(m, host[0..n], .last, dsv41_model.SPAN, vision, ahead);
+    defer _ = mlx.mlx_array_free(last);
+    if (self.expert_stream) |engine| engine.finishForward(n);
+    ctx.cache.step = st.n;
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_reshape(&out, last, &[_]c_int{ 1, 1, @intCast(m.cfg.vocab) }, 3, self.s));
+    return out;
+}
+
+/// DeepSeek-V4.1's DSpark round on the request's state (`ctx.cache.step` mirrors it): the drafter's block from `t1`.
+fn dsv41DraftImpl(self: *Transformer, t1: u32) !dsv41_model.Draft {
+    const m = self.dsv41 orelse return error.Dsv41NoDspark;
+    m.s = self.s;
+    return dsv41_model.draftHeads(m, t1, .conf);
+}
+
+/// Advances the request by `ids` (`[t1, drafts...]`) as a chunk `dsv41Finish` trims; the logits of every row,
+/// f32 `[1, L, vocab]`.
+fn dsv41VerifyImpl(self: *Transformer, ctx: *ForwardCtx, ids: []const u32) !mlx.mlx_array {
+    const m = self.dsv41 orelse return error.Dsv41NoDspark;
+    m.s = self.s;
+    const st = try dsv41_model.ensureState(m);
+    if (st.n != ctx.cache.step) return error.Dsv41CachePositionMismatch;
+    if (self.expert_stream) |engine| {
+        try dsv41_borrow.beforeForward(engine, &self.config, &m.cfg, ids.len, st.n + ids.len);
+        engine.beginForward();
+    }
+    const all = try dsv41_model.verify(m, ids);
+    defer _ = mlx.mlx_array_free(all);
+    if (self.expert_stream) |engine| engine.finishForward(ids.len);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_reshape(&out, all, &[_]c_int{ 1, @intCast(ids.len), @intCast(m.cfg.vocab) }, 3, self.s));
+    return out;
+}
+
+/// Keeps the first `accepted + 1` rows of the open verify chunk.
+fn dsv41FinishImpl(self: *Transformer, ctx: *ForwardCtx, accepted: usize) !void {
+    const m = self.dsv41 orelse return error.Dsv41NoDspark;
+    m.s = self.s;
+    try dsv41_model.finishVerify(m, accepted);
+    ctx.cache.step = (try dsv41_model.ensureState(m)).n;
 }
 
 fn forwardGlm5WithImpl(self: *Transformer, ctx: *ForwardCtx, ids: mlx.mlx_array, mdl: *glm5_mod.Model) !mlx.mlx_array {
@@ -27949,8 +28057,7 @@ test "slidingTailSpan covers the whole block, not just the last query" {
     try testing.expectEqual(@as(u32, 2052), slidingTailSpan(2048, 5, SLIDING_TRIM_UNBOUNDED));
     try testing.expectEqual(@as(u32, 2063), slidingTailSpan(2048, 16, SLIDING_TRIM_UNBOUNDED));
     // A PREFILL CHUNK is not special-cased any more: the old 32-wide cap kept
-    // laguna and inkling — serial archs whose only multi-token forward IS a
-    // chunk — from ever taking the trim.
+    // a chunk from ever taking the trim.
     try testing.expectEqual(@as(u32, 2080), slidingTailSpan(2048, 33, SLIDING_TRIM_UNBOUNDED));
     try testing.expectEqual(@as(u32, 2559), slidingTailSpan(512, 2048, SLIDING_TRIM_UNBOUNDED));
     // Non-sliding layer and empty forward still decline.
@@ -27993,8 +28100,7 @@ test "slidingViewFor declines the trim only where the fused kernel really bands"
         try testing.expectEqual(@as(c_int, 20000), chunk.kv_len);
     }
 
-    // hd 128 (laguna, inkling): no fused kernel, so even a wide prefill chunk
-    // trims — that is the whole win on a serial arch.
+    // hd 128: no fused kernel, so even a wide prefill chunk trims.
     cfg.head_dim = 128;
     {
         const chunk = slidingViewFor(&cfg, 32768, 2048);
@@ -31548,7 +31654,7 @@ test "fused MoE router reproduces the sigmoid+bias routing chain" {
 
 test "fused MoE router reproduces the mimo_v2 sigmoid+bias routing chain in f32" {
     // The pairing mimo_v2 SHIPS: ungrouped `.sigmoid_bias` with an f32 output and
-    // f32 router inputs (the router is widened once at load). hy3's arm above
+    // f32 router inputs (the router is widened once at load). The arm above
     // proves the same kernel at a bf16 output, which absorbs a last-ulp
     // difference between the kernel's `w / (tot + 1e-20f)` and MLX's divide
     // chain; MiMo keeps the weights in f32 into the expert sum, so nothing
@@ -31813,7 +31919,7 @@ test "the router declines the gate fold when it has no idle simdgroups or the do
 test "fused SwiGLU is bit-identical to the sigmoid+multiply+multiply chain" {
     // The reason this kernel exists instead of extending mlx_compile to the
     // silu arm: the compiled fusion is NOT bit-identical (greedy diverged at
-    // token ~55 on Laguna XS). Assert what the compiled path could not.
+    // token ~55 on a 40-layer MoE). Assert what the compiled path could not.
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x51117001);
@@ -31875,9 +31981,9 @@ test "fused SwiGLU is bit-identical to the sigmoid+multiply+multiply chain" {
     }
 }
 
-test "fused SwiGLU config cache keys on the SHAPE, not the element count (Laguna restore crash)" {
-    // Live 2026-07-29: a 16-token hot-cache-restore suffix prefill on Laguna
-    // XS killed the server with "[matmul] (1,16,512) vs (8192,2048)". A MoE
+test "fused SwiGLU config cache keys on the SHAPE, not the element count (restore crash)" {
+    // Live 2026-07-29: a 16-token hot-cache-restore suffix prefill on a MoE
+    // killed the server with "[matmul] (1,16,512) vs (8192,2048)". A MoE
     // layer's SwiGLU at 16 tokens is (1,16,512) = 8192 elements — the SAME
     // count, rank and dtype as a dense mlp_only layer at decode (1,1,8192).
     // The config cache was keyed on {n, tg, ndim, dtype}, so the second call
@@ -33718,7 +33824,7 @@ test "gatherQmv is no worse than stock gather_qmm vs fp32 dequant ground truth" 
         .{ .bits = 4, .gs = 64 },
         .{ .bits = 8, .gs = 32 },
     }) |cfg| {
-        // fp32 is the LIVE Laguna case: expert_x arrives as float32 while the
+        // fp32 is the LIVE case: expert_x arrives as float32 while the
         // bank's scales/biases are bf16. A bf16-only test missed it entirely.
         for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |xdt| {
             for ([_]bool{ false, true }) |x_per_expert| {
@@ -33832,8 +33938,8 @@ test "gatherQmv is no worse than stock gather_qmm vs fp32 dequant ground truth" 
 }
 
 test "gatherQmv nvfp4 is no worse than stock gather_qmm vs fp32 dequant ground truth" {
-    // Laguna's upstream checkpoints ship NVFP4 routed experts, so the affine-only
-    // gatherQmv declined them and decode fell back to take + batched
+    // NVFP4 routed experts were declined by the affine-only
+    // gatherQmv, and decode fell back to take + batched
     // quantized_matmul (~3x the ideal traffic). Same no-worse-than-reference
     // discipline as the affine test: fp32 dequant ground truth, never
     // kernel-vs-kernel agreement.
@@ -33851,7 +33957,7 @@ test "gatherQmv nvfp4 is no worse than stock gather_qmm vs fp32 dequant ground t
     const TOPK: c_int = 3;
     const null_bi = mlx.mlx_array{ .ctx = null };
 
-    // fp32 x is the LIVE Laguna case (expert activations arrive float32 while
+    // fp32 x is the LIVE case (expert activations arrive float32 while
     // the bank's scales are uint8); bf16 covers the shared-x gate/up shape.
     for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |xdt| {
         for ([_]bool{ false, true }) |x_per_expert| {
@@ -34642,9 +34748,9 @@ test "qwen4_exp yarn: the device denominator and the host spectrum are one spect
     try testing.expect(c.yarn_attention_factor > 1.0); // factor 4 ⇒ mscale 1.1386…
 }
 
-test "computeYarnFreqs matches HF _compute_yarn_parameters (Laguna full-attn rope)" {
-    // Golden values from the reference YaRN math (tests/dump_laguna_fixtures.py
-    // and the pure-Python cross-check): head_dim 128, partial 0.5 → dim 64 →
+test "computeYarnFreqs matches HF _compute_yarn_parameters (full-attn rope)" {
+    // Golden values from the reference YaRN math and the pure-Python
+    // cross-check: head_dim 128, partial 0.5 → dim 64 →
     // 32 freqs; base 5e5, factor 32, beta_fast 32, beta_slow 1, orig_max 8192.
     // low/high correction dims truncate to 9/18.
     var freqs: [32]f64 = undefined;
@@ -34667,55 +34773,6 @@ test "computeYarnFreqs matches HF _compute_yarn_parameters (Laguna full-attn rop
     try testing.expectApproxEqRel(std.math.pow(f64, 500000.0, 0.0), freqs[0], 1e-9);
     // Above the high correction dim (18): pure interpolation → freqs = factor·base^(2i/64).
     try testing.expectApproxEqRel(32.0 * std.math.pow(f64, 500000.0, @as(f64, 2 * 31) / 64.0), freqs[31], 1e-6);
-}
-
-fn jsonF64(v: std.json.Value) f64 {
-    return switch (v) {
-        .float => |f| f,
-        .integer => |i| @floatFromInt(i),
-        else => std.math.nan(f64),
-    };
-}
-
-// ── Inkling (inkling_mm_model) forward helpers ──
-// Reference: the checkpoint's bundled inkling_mlx/ package (Apache-2.0,
-// parity-validated vs transformers PR #47347). Dtype discipline mirrors the
-// reference EXACTLY: the residual stream runs in the checkpoint's dtype (bf16
-// on the shipped builds — the dense mlp.global_scale tensors are STORED bf16,
-// so no promotion), while the short convs, the router chain and the rel-bias
-// build compute in f32 and the shared-expert sum is f32-then-cast.
-
-const InkgroupLimitedRouting = struct { topk_weights: mlx.mlx_array, topk_idx: mlx.mlx_array, shared_gammas: mlx.mlx_array };
-
-fn jsonToMlxArray(allocator: std.mem.Allocator, v: std.json.Value) !mlx.mlx_array {
-    var shape: [8]c_int = undefined;
-    var ndim: usize = 0;
-    var cur = v;
-    while (cur == .array) {
-        if (ndim >= 8) return error.TooManyDims;
-        shape[ndim] = @intCast(cur.array.items.len);
-        ndim += 1;
-        if (cur.array.items.len == 0) break;
-        cur = cur.array.items[0];
-    }
-    var total: usize = 1;
-    for (shape[0..ndim]) |d| total *= @intCast(d);
-    const data = try allocator.alloc(f32, total);
-    defer allocator.free(data);
-    var idx: usize = 0;
-    const Fill = struct {
-        fn fill(val: std.json.Value, out: []f32, i: *usize) void {
-            switch (val) {
-                .array => |a| for (a.items) |item| fill(item, out, i),
-                else => {
-                    out[i.*] = @floatCast(jsonF64(val));
-                    i.* += 1;
-                },
-            }
-        }
-    };
-    Fill.fill(v, data, &idx);
-    return mlx.mlx_array_new_data(data.ptr, &shape, @intCast(ndim), .float32);
 }
 
 /// `[1, heads, len, dim]` of distinct, position-dependent values — two caches
@@ -37384,7 +37441,7 @@ test "NAX host scaffolding: zero-pad to 16 rows + slice-back are exact (runs off
 }
 
 test "MoE decode gather µbench (SUSHI_MOE_GATHER_UBENCH=1)" {
-    // Reproduces the Laguna decode expert-gather with OUR self-built MLX, to
+    // Reproduces a MoE decode expert-gather with OUR self-built MLX, to
     // compare against the pip-MLX Python sim (single gather ~133us, 47-layer
     // MoE ~7.5ms). If this is far slower, the gap is our MLX build/runtime;
     // if it matches, the gap is the live server context (stream/alloc/pipeline).
@@ -43640,8 +43697,8 @@ test "KV growth does not ratchet the MLX buffer pool" {
 
 // ── Constant-table dtype class guard ─────────────────────────────────────────
 // A constant lookup table built at load in f32 and multiplied into a bf16
-// activation PROMOTES the product to f32 (mlx's promotion rule). On Laguna that
-// product is post-RoPE q/k, so the f32 travelled through SDPA, o_proj and the
+// activation PROMOTES the product to f32 (mlx's promotion rule). Once that
+// product was post-RoPE q/k, so the f32 travelled through SDPA, o_proj and the
 // residual — every projection and expert weight for the REST of the forward was
 // upcast on read, at 3x the token cost, with nothing in the op count, the
 // kernel choice or a pre-loop dtype log to show for it.
@@ -43702,22 +43759,6 @@ test "a constant table must not widen the activation it scales" {
     try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(kept));
 }
 
-test "projLadderFits declines a shape its reconstruction cannot rebuild" {
-    // `diagProjBench` rebuilds attention by hand and reshapes q back through
-    // [1, 1, n_heads * head_dim]. When a checkpoint's q_proj is wider than
-    // that product the reshape raises an MLX error — and an MLX error is not
-    // a Zig error, it KILLS the process. Live on Qwen3.5-2B-bf16: q_proj
-    // emits 4096 against a computed 2048, so one diagnostic boot took the
-    // whole server down.
-    //
-    // q_w is stored [in, out] (pre-transposed at load).
-    try std.testing.expect(Transformer.projLadderFits(&.{ 2048, 2048 }, 2048));
-    try std.testing.expect(!Transformer.projLadderFits(&.{ 2048, 4096 }, 2048));
-    // Anything that is not a plain 2-D matrix is not a shape this can rebuild.
-    try std.testing.expect(!Transformer.projLadderFits(&.{ 1, 2048, 2048 }, 2048));
-    try std.testing.expect(!Transformer.projLadderFits(&.{}, 2048));
-}
-
 test "dtypeStep reports a residual change once, in the direction it moved" {
     // Pure decision layer of [dtype-trace]. The mscale bug presented as a
     // UNIFORM 3x with an identical op count, so the only cheap way to find the
@@ -43773,7 +43814,7 @@ test "moe down+reduce fused: no worse than gatherQmv + multiply + sum vs fp32 tr
     downred_override = true;
     defer downred_override = null;
 
-    // Two geometries: a small one, and Laguna XS's real decode shape. The fused
+    // Two geometries: a small one, and a real decode shape. The fused
     // kernel reduces each row over 8 lanes, the composed chain over 32, so the
     // bar is error against the f32 truth, never bit identity.
     const geoms = [_][4]c_int{
@@ -44880,7 +44921,7 @@ fn gdnRecurParityCase(s: mlx.mlx_stream, hk: c_int, hv: c_int, t_len: c_int, fol
 
     const geo = gdn_decode.Geometry{ .hk = hk, .hv = hv, .dk = dk, .dv = dv };
     const in = gdn_decode.Inputs{ .qkv = qkv, .a = a_in, .b = b_in, .conv_state = conv_state, .ssm_state = ssm_state, .conv_w = conv_w, .A_log = A_log, .dt_bias = dt_bias, .q_scale = q_scale, .k_scale = k_scale, .gate_dtype = gate_dt };
-    const got = (try gdn_decode.step(geo, t_len, in, s)) orelse return error.FusedDeclined;
+    const got = (try gdn_decode.step(geo, t_len, in, true, s)) orelse return error.FusedDeclined;
     defer got.deinit();
     const flat = (try gdnNormGateFused(s, got.y, z, 0, value_dim, norm_w, eps_arr, false, hv, dv, 1, t_len)) orelse return error.FusedDeclined;
     defer _ = mlx.mlx_array_free(flat);
@@ -44957,7 +44998,7 @@ fn gdnRecurParityCase(s: mlx.mlx_stream, hk: c_int, hv: c_int, t_len: c_int, fol
         one_in.b = row[2];
         one_in.conv_state = conv;
         one_in.ssm_state = state;
-        const one = (try gdn_decode.step(geo, 1, one_in, s)) orelse return error.FusedDeclined;
+        const one = (try gdn_decode.step(geo, 1, one_in, true, s)) orelse return error.FusedDeclined;
         defer one.deinit();
         _ = mlx.mlx_array_free(conv);
         conv = try gdnRecurRef(one.conv_state);
@@ -45036,7 +45077,7 @@ test "gdn_decode.step: bit-identical to prework -> recurrence -> norm-gate at S 
         const per_head = try gdnRecurRand(rnd, &.{hv}, 1.0, dt, s);
         defer _ = mlx.mlx_array_free(per_head);
         const in = gdn_decode.Inputs{ .qkv = qkv, .a = ab, .b = ab, .conv_state = conv_state, .ssm_state = ssm_state, .conv_w = conv_w, .A_log = per_head, .dt_bias = per_head, .q_scale = scale, .k_scale = scale };
-        try testing.expect((try gdn_decode.step(.{ .hk = hk, .hv = hv, .dk = 128, .dv = 128 }, t_len, in, s)) == null);
+        try testing.expect((try gdn_decode.step(.{ .hk = hk, .hv = hv, .dk = 128, .dv = 128 }, t_len, in, true, s)) == null);
     }
 }
 
@@ -45063,8 +45104,12 @@ fn gdnRecurArms(xfm: *Transformer, la: *const LinearAttnWeights, chain: *SSMCach
     try qkvExpectBitsEqual(s, chain.ssm_state, fused.ssm_state);
     if (capture) {
         try qkvExpectBitsEqual(s, chain.spec_conv_input, fused.spec_conv_input);
+        // From three rows on the fused verify stores its final state only and rollback replays.
+        const replays = seq >= 3;
+        try testing.expectEqual(replays, fused.spec_replay.held());
+        try testing.expectEqual(replays, fused.spec_state_seq.ctx == null);
         var i: c_int = 0;
-        while (i + 1 < seq) : (i += 1) {
+        while (!replays and i + 1 < seq) : (i += 1) {
             const ra = try gdnRecurRowsAxis0(chain.spec_state_seq, i, s);
             defer _ = mlx.mlx_array_free(ra);
             const rb = try gdnRecurRowsAxis0(fused.spec_state_seq, i, s);
@@ -45185,9 +45230,26 @@ fn gdnRecurLayerCase(wide: bool) !void {
                     .conv_state = try gdnRecurRef(e.conv_state),
                     .ssm_state = try gdnRecurRef(e.ssm_state),
                     .initialized = true,
-                    .spec_state_seq = try gdnRecurRef(e.spec_state_seq),
+                    .spec_state_seq = if (e.spec_state_seq.ctx != null) try gdnRecurRef(e.spec_state_seq) else .{ .ctx = null },
                     .spec_conv_input = try gdnRecurRef(e.spec_conv_input),
                 };
+                if (e.spec_replay.held()) {
+                    var rep = e.spec_replay;
+                    rep.pre_state = try gdnRecurRef(rep.pre_state);
+                    try back.spec_replay.hold(rep.pre_state, rep.geo, .{
+                        .qkv = .{},
+                        .a = rep.a,
+                        .b = rep.b,
+                        .conv_state = .{},
+                        .ssm_state = rep.pre_state,
+                        .conv_w = rep.conv_w,
+                        .A_log = rep.A_log,
+                        .dt_bias = rep.dt_bias,
+                        .q_scale = rep.q_scale,
+                        .k_scale = rep.k_scale,
+                        .gate_dtype = rep.gate_dtype,
+                    });
+                }
                 defer {
                     ssmFreeSpecCapture(&back);
                     _ = mlx.mlx_array_free(back.conv_state);
@@ -45292,7 +45354,7 @@ test "gdn state f32: prefill, decode, a restored bf16 state and verify capture a
     xfm.spec_capture_ssm = false;
     defer _ = mlx.mlx_array_free(out);
     try testing.expectEqual(f32_dt, mlx.mlx_array_dtype(live.ssm_state));
-    try testing.expectEqual(f32_dt, mlx.mlx_array_dtype(live.spec_state_seq));
+    try testing.expectEqual(f32_dt, mlx.mlx_array_dtype(if (live.spec_replay.held()) live.spec_replay.pre_state else live.spec_state_seq));
 
     const x0 = try gdnRecurRows(x, 0, 1, s);
     defer _ = mlx.mlx_array_free(x0);
@@ -45624,7 +45686,7 @@ test "qk norm rope fused: bit-identical incl. YaRN freqs + mscale (rd=64)" {
     const eps_arr = mlx.mlx_array_new_float(eps);
     defer _ = mlx.mlx_array_free(eps_arr);
 
-    // YaRN-shaped freqs vector [rd/2] f32 and a Laguna-shaped mscale table:
+    // YaRN-shaped freqs vector [rd/2] f32 and a YaRN mscale table:
     // the YaRN factor on the rotated 64, exactly 1.0 on the pass-through tail.
     var freq_buf: [32]f32 = undefined;
     for (&freq_buf, 0..) |*f, i| f.* = std.math.pow(f32, 500000.0, @as(f32, @floatFromInt(i)) / 32.0);
@@ -45807,6 +45869,53 @@ test "spliceVisionRows: two chunks with row offsets equal the whole-prompt splic
             for (0..4) |c| try std.testing.expectEqual(full_rows[ck.start + r][c], got[c]);
         }
     }
+}
+
+test "spliceVisionRows: the rows of a skipped leading block are not needed once the offset drops by their count" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const img_id: u32 = 99;
+    // [7, 99, 99, 8, 99, 9]: the first block holds one row; a prefix of three tokens restores it
+    // and the second block's first row, so the tail splices from row 2 of the whole array.
+    const ids = [_]i32{ 8, 99, 9 };
+    var h_data: [3 * 4]f32 = undefined;
+    for (0..3) |r| for (0..4) |c| {
+        h_data[r * 4 + c] = @floatFromInt(r + 1);
+    };
+    var ve_data: [3 * 4]f32 = undefined;
+    for (0..3) |r| for (0..4) |c| {
+        ve_data[r * 4 + c] = @floatFromInt(100 + r);
+    };
+    const h_shape = [_]c_int{ 1, 3, 4 };
+    const ids_shape = [_]c_int{ 1, 3 };
+    const tid = mlx.mlx_array_new_data(&ids, &ids_shape, 2, .int32);
+    defer _ = mlx.mlx_array_free(tid);
+
+    const whole = mlx.mlx_array_new_data(&ve_data, &[_]c_int{ 1, 3, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(whole);
+    const tail_only = mlx.mlx_array_new_data(ve_data[4..].ptr, &[_]c_int{ 1, 2, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(tail_only);
+
+    const h_a = mlx.mlx_array_new_data(&h_data, &h_shape, 3, .float32);
+    const via_whole = try Transformer.spliceVisionRows(h_a, tid, whole, img_id, 0, 2, s);
+    defer _ = mlx.mlx_array_free(via_whole);
+    const h_b = mlx.mlx_array_new_data(&h_data, &h_shape, 3, .float32);
+    const via_tail = try Transformer.spliceVisionRows(h_b, tid, tail_only, img_id, 0, 1, s);
+    defer _ = mlx.mlx_array_free(via_tail);
+
+    for ([_]mlx.mlx_array{ via_whole, via_tail }) |arr| try mlx.check(mlx.mlx_array_eval(arr));
+    var f_whole = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f_whole);
+    var f_tail = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f_tail);
+    try mlx.check(mlx.mlx_astype(&f_whole, via_whole, .float32, s));
+    try mlx.check(mlx.mlx_astype(&f_tail, via_tail, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(f_whole));
+    try mlx.check(mlx.mlx_array_eval(f_tail));
+    const a = mlx.mlx_array_data_float32(f_whole).?[0..12];
+    const b = mlx.mlx_array_data_float32(f_tail).?[0..12];
+    try std.testing.expectEqualSlices(f32, a, b);
+    try std.testing.expectEqual(@as(f32, 102), b[4]);
 }
 
 test "spliceVisionRows: video placeholders are scattered like image rows (Qwen video_token_id)" {
@@ -51677,6 +51786,27 @@ const L10VerifySlots = struct {
 /// The solo MTP verify: capture armed, PLE deferred, one `forwardWithCaptureAll`, flush
 /// after. `forwardRowAxisVerify` at one row must match it.
 fn logicalSsmCapture(s: mlx.mlx_stream, entry: *const SSMCacheEntry) !mlx.mlx_array {
+    if (entry.spec_state_seq.ctx == null and entry.spec_replay.held()) {
+        // A replaying verify: the state after every accepted prefix, rebuilt, then the final state.
+        const rows = mlx.getShape(entry.spec_conv_input)[1] - 3;
+        var parts: [gdn_decode.MAX_SEQ]mlx.mlx_array = undefined;
+        var built: usize = 0;
+        defer for (parts[0..built]) |part| {
+            _ = mlx.mlx_array_free(part);
+        };
+        var i: c_int = 1;
+        while (i < rows) : (i += 1) {
+            const state = try gdn_decode.replayState(entry.spec_replay, entry.spec_conv_input, i, s);
+            defer _ = mlx.mlx_array_free(state);
+            parts[built] = mlx.mlx_array_new();
+            built += 1;
+            try mlx.check(mlx.mlx_expand_dims(&parts[built - 1], state, 0, s));
+        }
+        parts[built] = mlx.mlx_array_new();
+        built += 1;
+        try mlx.check(mlx.mlx_expand_dims(&parts[built - 1], entry.ssm_state, 0, s));
+        return Transformer.concatAxis0(s, parts[0..built]);
+    }
     const shape = mlx.getShape(entry.spec_state_seq);
     if (shape.len != 5 or shape[0] < 1) return error.SpecCaptureShape;
     var final = mlx.mlx_array_new();
@@ -52972,8 +53102,8 @@ test "single-stream verify feature selection excludes prefill and ordinary decod
             for ([_]bool{ false, true }) |capture| {
                 xfm.spec_capture_ssm = capture;
                 for ([_]c_int{ 1, 2, 4 }) |batch| {
-                    for ([_]c_int{ 1, 2, 3, 4, 5, 6, 7, 16, 4096 }) |width| {
-                        try testing.expectEqual(is_qwen4 and capture and batch == 1 and width >= 2 and width <= 6, xfm.verifyFeatureEnabled(feature, false, batch, width));
+                    for ([_]c_int{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 4096 }) |width| {
+                        try testing.expectEqual(is_qwen4 and capture and batch == 1 and width >= 2 and width <= 8, xfm.verifyFeatureEnabled(feature, false, batch, width));
                         try testing.expectEqual(is_qwen4, xfm.verifyFeatureEnabled(feature, true, batch, width));
                     }
                 }
@@ -53005,6 +53135,7 @@ fn singleVerifyTestRound(xfm: *Transformer, slot: *Qwen4TestSlot, row: mlx.mlx_a
     var gen: Gen = undefined;
     gen.xfm = xfm;
     gen.ctx = slot.ctx;
+    gen.sampling = .{};
     defer slot.ctx = gen.ctx;
     var state: Gen.MtpRoundState = undefined;
     state.tracing = false;
@@ -53063,7 +53194,7 @@ test "single-stream verify optimizations preserve native outputs and captures (Q
     try testing.expectEqual(prefill_routes, mtp_verify_kernel_calls[2]);
     try testing.expectEqual(prefill_hc, qwen4_forward.mtp_verify_hc_prepared_calls);
     var position = prefix_len;
-    for ([_]usize{ 1, 2, 3, 4, 5, 6, 7 }) |width| {
+    for ([_]usize{ 1, 2, 3, 4, 5, 6, 7, 8 }) |width| {
         const input = mlx.mlx_array_new_data(@ptrCast(ids[position..][0..width].ptr), &.{ 1, @as(c_int, @intCast(width)) }, 2, .int32);
         defer _ = mlx.mlx_array_free(input);
         single_verify_test_features = @splat(false);
@@ -53083,13 +53214,13 @@ test "single-stream verify optimizations preserve native outputs and captures (Q
                     try testing.expect(x.ctx == null and y.ctx == null);
                 } else try expectRowsByteEqual(a, xfm.s, x, y, "single verify " ++ field);
             }
-            if (left.spec_state_seq.ctx != null) {
+            if (ssmHasSpecCapture(left)) {
                 const x = try logicalSsmCapture(xfm.s, left);
                 defer _ = mlx.mlx_array_free(x);
                 const y = try logicalSsmCapture(xfm.s, right);
                 defer _ = mlx.mlx_array_free(y);
                 try expectRowsByteEqual(a, xfm.s, x, y, "single verify logical capture");
-            } else try testing.expect(right.spec_state_seq.ctx == null);
+            } else try testing.expect(!ssmHasSpecCapture(right));
             try testing.expectEqual(left.ple_prev_valid, right.ple_prev_valid);
             try testing.expectEqualSlices(u32, &left.ple_prev, &right.ple_prev);
             ssmFreeSpecCapture(left);
@@ -53097,7 +53228,7 @@ test "single-stream verify optimizations preserve native outputs and captures (Q
         }
         errdefer std.debug.print("[single-verify-exact] context={d} width={d} before={any} after={any}\n", .{ prefix_len, width, before, after });
         for (before, after, 0..) |old, new, feature| {
-            if (feature == 4 and verifySharedHardware() and width >= 2 and width <= 6) {
+            if (feature == 4 and verifySharedHardware() and width >= 2 and width <= 8) {
                 try testing.expect(new > old);
             } else try testing.expectEqual(old, new);
         }
@@ -54407,8 +54538,8 @@ test "qwen4 dense rows evaluated verification replay (QWEN4_VERIFY_BENCH)" {
                         try testing.expectEqual(l.ctx == null, r.ctx == null);
                         if (l.ctx != null) try qkvExpectBitsEqual(s, l, r);
                     }
-                    try testing.expectEqual(left.spec_state_seq.ctx == null, right.spec_state_seq.ctx == null);
-                    if (left.spec_state_seq.ctx != null) {
+                    try testing.expectEqual(ssmHasSpecCapture(&left), ssmHasSpecCapture(&right));
+                    if (ssmHasSpecCapture(&left)) {
                         const l = try logicalSsmCapture(s, &left);
                         defer _ = mlx.mlx_array_free(l);
                         const r = try logicalSsmCapture(s, &right);
@@ -56805,6 +56936,7 @@ test "a GLM prefill interleaved with another stream's decode builds the solo pre
 test "a streamed GLM load keeps its one teacher stream exclusive" {
     var t: Transformer = undefined;
     t.qwen4 = null;
+    t.dsv41 = null;
     t.expert_stream = null;
     var glm: glm5_mod.Model = undefined;
     glm.expert_stream = null;

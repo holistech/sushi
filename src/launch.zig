@@ -319,13 +319,26 @@ fn writeOpencodeReasoning(allocator: std.mem.Allocator, out: *std.ArrayList(u8),
 
 /// OpenCode 2 needs --standalone to receive this process's inline config.
 /// OpenCode 1 has no such flag. Probe CLI support instead of assuming a version.
+/// Several installs can share PATH (npm, ~/.opencode, Homebrew): the newest wins, not the first.
 fn appendOpencodeInvocation(out: *std.ArrayList(u8), allocator: std.mem.Allocator, extras: []const []const u8) !void {
     try out.appendSlice(allocator,
+        \\autoload -Uz is-at-least
+        \\typeset -A sushi_seen
+        \\sushi_opencode_bin= sushi_opencode_ver=
+        \\for b in $(whence -ap opencode); do
+        \\  (( ${+sushi_seen[${b:A}]} )) && continue
+        \\  sushi_seen[${b:A}]=1
+        \\  [[ $("$b" --version 2>&1) =~ '[0-9]+\.[0-9]+\.[0-9]+' ]] && v=$MATCH || v=0
+        \\  if [[ -z $sushi_opencode_bin ]] || ! is-at-least $v $sushi_opencode_ver; then
+        \\    sushi_opencode_bin=$b sushi_opencode_ver=$v
+        \\  fi
+        \\done
+        \\if [[ -z $sushi_opencode_bin ]]; then echo "opencode is not installed" >&2; exit 127; fi
         \\sushi_opencode_flags=()
-        \\if opencode --help 2>&1 | grep -q -- '--standalone'; then
+        \\if "$sushi_opencode_bin" --help 2>&1 | grep -q -- '--standalone'; then
         \\  sushi_opencode_flags=(--standalone)
         \\fi
-        \\opencode
+        \\"$sushi_opencode_bin"
     );
     if (extras.len > 0 and extras[0].len > 0 and extras[0][0] != '-') {
         try out.append(allocator, ' ');
@@ -434,23 +447,27 @@ pub fn mergePiSettingsJson(allocator: std.mem.Allocator, existing: []const u8, c
     return try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
 }
 
+/// Replaces codex's fallback base instructions, which name tools it no longer declares.
+pub const codex_instructions = @embedFile("assets/codex_model_instructions.md");
+
 /// codex `config.toml` — Responses wire API only (codex-rs `WireApi` has one
 /// variant), pointing at our /v1/responses. Keyless: no `env_key` and
 /// `requires_openai_auth` unset means codex skips login; the loopback server
 /// ignores keys anyway.
-pub fn codexConfigToml(allocator: std.mem.Allocator, base_url: []const u8, model: []const u8, budget: Budget) ![]u8 {
+pub fn codexConfigToml(allocator: std.mem.Allocator, base_url: []const u8, model: []const u8, budget: Budget, instructions_path: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator,
         \\# written by sushi — dedicated CODEX_HOME, regenerated at each launch.
         \\model = "{f}"
         \\model_provider = "sushi"
         \\model_context_window = {d}
+        \\model_instructions_file = "{f}"
         \\
         \\[model_providers.sushi]
         \\name = "sushi (local)"
         \\base_url = "{f}/v1"
         \\wire_api = "responses"
         \\
-    , .{ esc(model), budget.context, esc(base_url) });
+    , .{ esc(model), budget.context, esc(instructions_path), esc(base_url) });
 }
 
 /// hermes `config.yaml` — mirrors what `hermes setup`'s custom-endpoint flow
@@ -838,8 +855,11 @@ fn writeConfigs(allocator: std.mem.Allocator, io: std.Io, kind: AgentKind, base_
             try writeAgentFile(allocator, io, "omp", "models.yml", yml);
         },
         .codex => {
-            const toml = try codexConfigToml(allocator, base_url, model, budget);
+            const instr_path = try std.fmt.allocPrint(allocator, "{s}/.sushi/codex/model-instructions.md", .{homeDir()});
+            defer allocator.free(instr_path);
+            const toml = try codexConfigToml(allocator, base_url, model, budget, instr_path);
             defer allocator.free(toml);
+            try writeAgentFile(allocator, io, "codex", "model-instructions.md", codex_instructions);
             try writeAgentFile(allocator, io, "codex", "config.toml", toml);
         },
         .hermes => {
@@ -1111,12 +1131,18 @@ test "omp models.yml: buffered tool calls have no provider progress deadline" {
 }
 
 test "codex config: responses wire API, keyless, context at the root" {
-    const toml = try codexConfigToml(t.allocator, "http://127.0.0.1:12345", "m1", .{ .context = 90112, .output = 22528 });
+    const toml = try codexConfigToml(t.allocator, "http://127.0.0.1:12345", "m1", .{ .context = 90112, .output = 22528 }, "/h/o\"me/.sushi/codex/model-instructions.md");
     defer t.allocator.free(toml);
     try t.expect(std.mem.indexOf(u8, toml, "wire_api = \"responses\"") != null);
     try t.expect(std.mem.indexOf(u8, toml, "model_context_window = 90112") != null);
     try t.expect(std.mem.indexOf(u8, toml, "base_url = \"http://127.0.0.1:12345/v1\"") != null);
     try t.expect(std.mem.indexOf(u8, toml, "env_key") == null);
+    try t.expect(std.mem.indexOf(u8, toml, "\nmodel_instructions_file = \"/h/o\\\"me/.sushi/codex/model-instructions.md\"\n") != null);
+}
+
+test "codex instructions file is the embedded asset and names no undeclared tool" {
+    try t.expectEqualStrings(@embedFile("assets/codex_model_instructions.md"), codex_instructions);
+    try t.expect(std.mem.indexOf(u8, codex_instructions, "apply_patch") == null);
 }
 
 test "pi models.json and opencode config parse as JSON and stay single-quote-free" {
@@ -1446,14 +1472,70 @@ test "opencode script: optional --standalone follows the subcommand, the model r
     const b = budgetForContext(1048576);
     const tui = try scriptFor(t.allocator, .opencode, "http://x:1", "m1", b, "{}", &.{});
     defer t.allocator.free(tui);
-    try t.expect(std.mem.indexOf(u8, tui, "\nopencode \"${sushi_opencode_flags[@]}\"\n") != null);
+    try t.expect(std.mem.indexOf(u8, tui, "\n\"$sushi_opencode_bin\" \"${sushi_opencode_flags[@]}\"\n") != null);
     try t.expect(std.mem.indexOf(u8, tui, "--model") == null);
     const run = try scriptFor(t.allocator, .opencode, "http://x:1", "m1", b, "{}", &.{ "run", "read it's" });
     defer t.allocator.free(run);
-    try t.expect(std.mem.indexOf(u8, run, "\nopencode 'run' \"${sushi_opencode_flags[@]}\" 'read it'\\''s'\n") != null);
+    try t.expect(std.mem.indexOf(u8, run, "\n\"$sushi_opencode_bin\" 'run' \"${sushi_opencode_flags[@]}\" 'read it'\\''s'\n") != null);
     const flag = try scriptFor(t.allocator, .opencode, "http://x:1", "m1", b, "{}", &.{"--continue"});
     defer t.allocator.free(flag);
-    try t.expect(std.mem.indexOf(u8, flag, "\nopencode \"${sushi_opencode_flags[@]}\" '--continue'\n") != null);
+    try t.expect(std.mem.indexOf(u8, flag, "\n\"$sushi_opencode_bin\" \"${sushi_opencode_flags[@]}\" '--continue'\n") != null);
+}
+
+/// Runs the opencode launch script under `zsh -f` with fake `opencode`s, each spec `dir|--version output|--help
+/// output`, on PATH in the order given. Returns what the chosen fake logged.
+fn runOpencodeFakes(extras: []const []const u8, specs: []const []const u8, exit_code: u8) ![]u8 {
+    const script = try scriptFor(t.allocator, .opencode, "http://x:1", "m1", FALLBACK_BUDGET, "{}", extras);
+    defer t.allocator.free(script);
+    const setup =
+        \\d=$(mktemp -d); trap 'rm -rf $d' EXIT
+        \\pdirs=()
+        \\for spec in "$@"; do
+        \\  f=("${(@s:|:)spec}")
+        \\  mkdir $d/$f[1]; pdirs+=($d/$f[1])
+        \\  print -r -- "#!/bin/sh
+        \\case \$1 in --version) echo '$f[2]';; --help) echo '$f[3]';; *) echo \"picked $f[1] \$*\" >> $d/log;; esac" > $d/$f[1]/opencode
+        \\  chmod +x $d/$f[1]/opencode
+        \\done
+        \\PATH="${(j.:.)pdirs}:/usr/bin:/bin"
+        \\
+    ;
+    const full = try std.mem.concat(t.allocator, u8, &.{ setup, script, "\ncat $d/log\n" });
+    defer t.allocator.free(full);
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(t.allocator);
+    try argv.appendSlice(t.allocator, &.{ "/bin/zsh", "-f", "-c", full, "sushi-test" });
+    try argv.appendSlice(t.allocator, specs);
+    const r = try std.process.run(t.allocator, t.io, .{ .argv = argv.items });
+    defer t.allocator.free(r.stderr);
+    errdefer t.allocator.free(r.stdout);
+    try t.expectEqual(exit_code, r.term.exited);
+    return r.stdout;
+}
+
+test "opencode script: the newest opencode on PATH launches, whichever comes first" {
+    const old = "old|1.4.2|usage: opencode [options]";
+    const new = "new|opencode v2.0.18|usage: opencode --standalone";
+    for ([_][2][]const u8{ .{ old, new }, .{ new, old } }) |order| {
+        const out = try runOpencodeFakes(&.{ "run", "hi" }, &order, 0);
+        defer t.allocator.free(out);
+        try t.expectEqualStrings("picked new run --standalone hi\n", out);
+    }
+    // Versions compare by number, not by text: 10.0.0 outranks 9.9.9.
+    const out = try runOpencodeFakes(&.{}, &.{ "nine|9.9.9|", "ten|10.0.0|" }, 0);
+    defer t.allocator.free(out);
+    try t.expectEqualStrings("picked ten \n", out);
+}
+
+test "opencode script: an unreadable version still launches when it is the only opencode, and none exits 127" {
+    const only = try runOpencodeFakes(&.{}, &.{"odd|not a version|"}, 0);
+    defer t.allocator.free(only);
+    try t.expectEqualStrings("picked odd \n", only);
+    const ranked = try runOpencodeFakes(&.{}, &.{ "odd|not a version|", "old|1.4.2|" }, 0);
+    defer t.allocator.free(ranked);
+    try t.expectEqualStrings("picked old \n", ranked);
+    const none = try runOpencodeFakes(&.{}, &.{}, 127);
+    defer t.allocator.free(none);
 }
 
 test "grok names" {
@@ -1585,7 +1667,7 @@ test "config writers escape ids and urls so hostile ones stay data" {
     defer aider_parsed.deinit();
     try t.expect(aider_parsed.value.object.get("openai/" ++ id) != null);
 
-    const codex = try codexConfigToml(t.allocator, "http://h:1", id, FALLBACK_BUDGET);
+    const codex = try codexConfigToml(t.allocator, "http://h:1", id, FALLBACK_BUDGET, "/x");
     defer t.allocator.free(codex);
     try t.expect(std.mem.indexOf(u8, codex, "\nmodel = \"a\\\"b\\\\c'd\"\n") != null);
 

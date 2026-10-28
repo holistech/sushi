@@ -23,7 +23,7 @@ hidden 2560, expert intermediate 640.
 | `src/transformer.zig` | shared `Transformer`, `KVCache`, `ForwardCtx`, arch dispatch; EXL3 MoE = `moeExl3` |
 | `src/qwen4_exp.zig` | Host side: n-gram hash (splitmix multipliers, per-head primes, eos-segment shifts) + the mmapped `ngram_table.bin` row gather (2/3/4/5/6/8-bit or raw bf16) + `PrefetchPool`/`startWarm` |
 | `src/hc_prefill.zig` | Fused hyper-connection norm/mix prefill kernels (chunk width as a scalar INPUT, never a template) |
-| `src/mtp.zig` | The native MTP head (`Qwen4Mtp`), see [engine-mtp](engine-mtp.md) |
+| `src/mtp.zig` | Shared MTP machinery (depth caps, cost profiles, draft rerank); the head itself is `Qwen4Mtp` in `qwen4_forward.zig`, see [engine-mtp](engine-mtp.md) |
 
 ## Trunk rules
 
@@ -47,6 +47,16 @@ hidden 2560, expert intermediate 640.
 <a id="vision-tower"></a>
 ## Vision tower
 
+- **Requantized at load** (`QwenVision.init`, `quantGroupAtLoad`): the packs ship the tower bf16 (333 tensors, 897,862,112
+  B); the load turns the 81 block matrices (`attn.qkv`, `attn.proj`, `mlp.linear_fc1`) and the merger's two into MLX
+  affine 8-bit and frees each bf16 copy. The group is 128 where the input width divides by 128 (every one of the 83: 1152
+  and 4608 wide), else 64, else the matrix stays bf16: `mlp.linear_fc2` reads 4304 wide, so its 27 matrices (268 MB) stay.
+  The patch embedding (Conv3d), position table, norms and biases stay. The tower holds 597,327,776 B, which is what
+  `indexedResidentSplit` bills, resident or streamed. One `[vision] tower requantized at load: ...` line reports it. `--vision-bf16` keeps the tower as stored (billed as stored, `[vision] tower kept bf16 (--vision-bf16): ...`).
+  Against the bf16 tower on house.jpeg stretched to a 40 x 64 grid (640 tokens): merger output cosine 0.99950, max abs
+  0.026, relative RMS 0.0317; load 32 ms; encode 211.5 ms against 209.7 ms (a tie; the transient peak is the same,
+  0.918 GiB). M5 Max, base 2db0e8d5 plus this change, GPU lock held, QUIET, `taskpolicy -a`, median of 9 interleaved warm
+  runs (`SUSHI_VISION_Q8_REPORT=1`, the `requantized tower stays within bf16's drift` test).
 - **The tower evaluates after every block and at its output** (`QwenVision.eval_per_block`): a lazy 27-block graph
   also held every block's transposed weights (~1 GB at any size) and more than one block's score sheets. The encode
   bill (`encodeScratchBytes`: 32 MB + 1.3 x one f32 score sheet + 107 KB per patch) covers the per-block peak by
@@ -103,8 +113,8 @@ native tree.
   drafter's context grows by the committed taps only.
 - **Verify**: ONE batched forward of `[t1, drafts]` with per-position GDN capture; a partial accept rolls GDN, PLE and
   QSA state back through `ssmRollbackFromCapture`, shared with the MTP verify (rows are decode-identical up to 9).
-  Greedy DFlash2 output equals greedy serial output byte for byte (`tests/test_dflash2_qwen.sh`: six prompts, stream ==
-  non-stream, opt-out, and that a drafter beside the pack is ignored; run on Sushi-2bpw, 2.6bpw, 4bpw and an STQ SPEC1
+  Greedy DFlash2 output equals greedy serial output byte for byte (`tests/test_dflash2_qwen.sh`: seven prompts incl. an image, stream ==
+  non-stream, opt-out, a sampled bank at T1.0 / top_p 0.95 / top_k 20, and that a drafter beside the pack is ignored; run on Sushi-2bpw, 2.6bpw, 4bpw and an STQ SPEC1
   pack, and streamed at `--ssd-budget-gb 32` on 2.6bpw).
 - **Rows**: a verify row is bytes, not dispatches (about 3.3 ms per row on Sushi-2.6bpw). The drafter drafts a block of
   `--drafter-max-depth` - 1 (default 8 rows) and the round verifies only as many rows as `dflash_policy.zig` finds worth
@@ -112,9 +122,15 @@ native tree.
   expected tokens per ladder cost, never below `--drafter-min-depth` (default 2). Prose and thinking settle near 2-3 rows,
   code, JSON and copy take 8. Equal min and max pin one row count.
 - **Yield gate**: a request whose DFlash rounds cost more per token than its serial decode (5% margin, after 8 rounds)
-  falls back to plain ticks for the rest of the request. The serial price is the round-cost table's width-0 cell of the
-  request's context bucket; without a sample the gate asks for the ladder's break-even yield at the request's MEAN
-  verified rows, never the block's.
+  falls back to plain ticks for the rest of the request, and drops the drafter's window with it (the plain tick does no
+  tap capture, window append or drafter forward). The serial price is the round-cost table's width-0 cell of the
+  request's own context bucket, never a shorter bucket's (a 24k token costs 17.7 ms, a 90k one about 30); without a
+  sample the gate asks for `dflash_policy.breakEvenDrafts` at the request's MEAN verified rows, never the block's:
+  0.42 accepted drafts at 2 rows, 0.69 at 4, 1.40 at 8.
+- **Image and video requests**: served by the drafter like text. The target's verify carries the M-RoPE positions (the
+  scalar `offset + delta` RoPE past the position table, as every decode and MTP verify does), so exactness never reads
+  the drafter's positions; the drafter keeps a 1-D sequential position over its sliding window, and the tapped hiddens of
+  image rows enter its context like any other row. On a DFlash2 server a request is DFlash2 or plain ticks, never MTP.
 - **Bill**: `dflashRequestBytes` (window x 4 + tap and encoder rows of one prefill chunk + 64 MiB) joins the request
   bill in the commit that loads the drafter; the weights join the load bill.
 - **Lessons**: an accepted-per-round floor that is right for a dense 27B target disabled rounds that beat serial here
@@ -136,7 +152,9 @@ native tree.
 
 | pack | directory under the models root | notes |
 |---|---|---|
-| MCG K3 w15 (served target) | `Qwen3.8-Flash-Next-Sushi-3bpw` | our MCG experts (window 15) |
+| Sushi 2bpw | `Qwen3.8-Flash-Next-Sushi-2bpw` | served, 48 GB tier (32 GB streamed) |
+| Sushi STQ 2.75bpw | `Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw` | served, 64 GB tier, the default `qwen3.8-flash-next` |
+| Sushi 4bpw | `Qwen3.8-Flash-Next-Sushi-4bpw` | served, 96 GB tier |
 | affine 4/8 control | `Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit` | the control column in every table |
 | bf16 source | `Qwen/Qwen3.8-Flash-Next` | the KLD teacher; streams (335 GB) |
 

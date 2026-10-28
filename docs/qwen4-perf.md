@@ -387,11 +387,11 @@ reads ~26%), so MTP nets ~1.1-1.35x here. ms per forward at 1 / 2 / 4 / 7 rows, 
   End to end on 68b6f9f, greedy, 4 prompts x 256 tokens (code / list / prose / story), decode tok/s: default adaptive
   MTP, two A B B A blocks, 131.8 -> 136.0 and 132.1 -> 135.5 summed (+3.2% / +2.5%, 28/28 outputs identical);
   forced depth 3, 43.75 / 38.15 / 28.3 / 25.3 -> 44.75 / 39.15 / 28.35 / 25.6 (+1.7%, faster on every prompt).
-- `SUSHI_MTP_DENSE_ROWS=1` read another 2-3% (35.6 / 49.3 / 78.0 / 129.1 and 35.6 / 49.4 / 78.3 / 127.0 -> 35.7 / 47.5
+- `SUSHI_MTP_DENSE_ROWS=1` (since removed: the kernel is the default at every width) read another 2-3% (35.6 / 49.3 / 78.0 / 129.1 and 35.6 / 49.4 / 78.3 / 127.0 -> 35.7 / 47.5
   / 76.1 / 125.0 and 35.2 / 48.2 / 75.8 / 125.5 ms). One `test_mtp_equivalence.sh` run of 8c16b2b + HC grouping +
   dense rows failed 3/11 (the story prompt left `--no-mtp` at output token 16, top-2 gap 1.125 nats; that boot decoded
   at 12 tok/s, under load). Seven reruns passed 11/11: the same commit, dense alone on 8c16b2b and 68b6f9f, router or
-  gate alone, and with HC grouping on 68b6f9f. The one wrong value is unexplained, so dense rows stay off by default.
+  gate alone, and with HC grouping on 68b6f9f. The one wrong value was unexplained then.
 - Ruled out: a vectorized affine-8 reader (one uint2 of codes and two vec4 activations per lane, 8 rows per simdgroup),
   bit-identical to per-row `qmv`. In a chained in-graph ubench it read 10-57% faster on 6k-12k x 2560 and 2560 x 6144
   at 1-3 rows. On the decode meter (8c16b2b + HC grouping + dense rows), A B B A off / on / on / off: 33.96 / 48.59 /
@@ -659,6 +659,124 @@ boot. The verify widths run unchanged kernels, so only the one-row forwards insi
 - The llmprobe cells swing 5-10% within an arm, as tokens per round varies. The server's own round log, summed over
   every request in the boot, puts the branch 0.9% faster: no regression.
 - `tests/test_mtp_equivalence.sh` on the branch binary: 18 passed, 0 failed.
+- **The shared expert inside the routed launches was priced here, and is built since ([below](#shared-fold)).** Flash-Next's shared expert is gate qmv, up qmv,
+  geglu, down qmv: 4 launches x 48 layers = 192 per serial token and per MTP verify round (the rows kernels at 2 to 8
+  rows, same count). The stand-in above puts the whole shared expert at 0.62 of the 17.99 ms forward (3.4% at most), and
+  the launches alone at 0.6-1.5 us each (the tail fold: 144 launches, 0.09 ms) are 0.1-0.3 ms, 0.7-1.6%. A fused launch
+  would also have to reproduce MLX's affine-8 qmv reduction tree bit for bit beside the EXL3 decode, and each down
+  threadgroup needs the whole geglu product of gate and up, so it recomputes it. DeepSeek's shared expert is a trellis
+  bank of the routed chain's own family, where the same fusion landed
+  ([engine-exl3-experts](engine-exl3-experts.md#dsv41-shared-fused)).
+
+<a id="shared-fold"></a>
+## Flash-Next: the shared expert rides the routed launches
+
+`exl3/qwen_riders.zig` (the shared kernels), `exl3/qwen_fold.zig` (one-bank MCG layers: Sushi-4bpw, Sushi-2bpw),
+`rate_groups.moeGatedSharedFolded` (rate-grouped STQ layers: Sushi-STQ-2.75bpw), glue `qwen4_shared.folded`, called
+from `moeMLP2WithRouter`'s tail-shared branch. The shared gate/up/SwiGLU kernel becomes extra threadgroups of the
+routed pair launch and the shared down those of the fused-mid down launch (`fuse.zig`); the finish reduce adds
+`sigmoid(gate) * shared` per row. The riders keep MLX's one-row affine8 qmv order (`qmv_fast` for K%256==0 and N%8==0,
+`qmv` otherwise: the 640 -> 2560 down is the second, the N=1 gate logit too), which is what the verify rows kernels give
+every row, so each row is the separate chain's bytes. At two or more rows the shared-expert gate logit (N=1, which
+MLX runs as one qmv per row plus a concat) is one more threadgroup per row of the gate/up launch, and the sigmoid,
+multiply and add tail is the reduce's (`gate[row]`); at one row the router kernel's logit is passed in as before.
+
+- **Launches per MoE layer** (resident, both formats): serial 1 row, 7 (shared gate, up, SwiGLU, down; routed pair,
+  down, reduce) -> 3, 192 fewer per token. Rows 2 to 8 (MTP verify of one request through `moeVerifyRowsSolo`, DFlash2
+  rows): 4 shared + about 2S+1 logit (a slice and a qmv per row, a concat) + 3 routed + 3 tail (sigmoid, multiply, add)
+  -> 3.
+- **Not reached**: expert streaming (`streamedMoeResult` computes the shared expert early on its own), the joined
+  multi-request `moeVerifyRows` (shared projections and gate tail are separate there), the MTP head's MoE
+  (`mtpMoeRows`), 9 to 16 rows and prefill, `--qwen-standin`, shared banks that are not affine8 g64/g128 with K a
+  multiple of 128, a gate/up pair at two rates, a prepared-chain bank (hidden 5120). Each declines before any launch.
+- **Proof** (`qwen4_shared.zig`): bytes equal to the production separate chain (`qmatmulBits` rows path, `fusedSwiGLU`,
+  `moeWithGatedShared` / `moeRagged`), real 2560/640/top-10 geometry, 1 to 8 rows, MCG at n64, n32 and n44/n44/n64, spec1
+  grouped at n32/44/64 (down n48), shared g128 and g64, large and small gains, router logit and rider logit, either
+  part's threadgroups first, three launches a layer; one decline test.
+- **Chain per layer** (`SUSHI_QWEN_FOLD_UBENCH=1`, main test binary, ReleaseFast, GPU lock `qwen-fold`, `taskpolicy -a`,
+  fans auto, M5 Max, median of 21 interleaved rounds of 8 dependent layers over distinct banks, 64 experts, random
+  routes; separate = production shared chain incl. its N=1 logit; uncommitted tree on `a9853b3e`, us):
+
+  | rows | one-bank separate | fused | routed only | grouped separate | fused | routed only |
+  |---|---|---|---|---|---|---|
+  | 1 | 125.3 | 115.4 | 105.3 | 129.9 | 118.8 | 108.9 |
+  | 2 | 176.8 | 146.5 | 132.4 | 227.1 | 164.8 | 130.2 |
+  | 3 | 213.7 | 181.5 | 166.8 | 214.7 | 174.0 | 158.5 |
+  | 4 | 248.5 | 216.0 | 197.5 | 241.6 | 201.4 | 187.7 |
+  | 6 | 308.7 | 283.5 | 256.6 | 305.2 | 270.1 | 251.4 |
+  | 8 | 382.7 | 356.6 | 320.8 | 379.2 | 341.1 | 315.9 |
+
+  Fused / separate: one-bank 0.92 0.83 0.85 0.87 0.92 0.93, grouped 0.91 0.73 0.81 0.83 0.89 0.90. Routed threadgroups
+  first is level with or ahead of shared first. One-row separate cells moved 106 to 150 us across runs on a shared box
+  (the fused / separate ratio stayed 0.90 to 0.95); the one-row ubench separate arm also pays the logit qmv that the live
+  router kernel folds, so the live one-row gain is smaller.
+- Live (d1e22b96, 512 greedy tokens on a 14k-char code prompt, AC, fans max, one A then one B, GPU lock): byte-identical
+  on STQ-2.75bpw and Sushi-4bpw, MTP and `--no-mtp`. MTP round 28.24 -> 28.14 ms (STQ) and 24.29 -> 24.10 ms (4bpw);
+  `--no-mtp` decode 63.2 / 63.4 and 62.3 / 62.0 tok/s: a tie that drops 192 launches a serial token. The
+  `[qwen] shared expert rides the routed launches engaged` log line shows the fold is on.
+
+<a id="verify-rows8"></a>
+## Flash-Next: verify at 2 to 8 rows costs the same per row (4d7f575c to 8044906b)
+
+Decode meter (`SUSHI_DECODE_FWD_UBENCH`, `_S=1..8`, `_KV`), Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw (STQ SPEC1 w15 experts, affine-8 trunk), kv8, M5 Max on AC,
+`taskpolicy -a`, fans max, GPU lock, 180 s idle before each boot, one boot per cell, 16 forwards, lm_head included. A cell is
+good to about +-1.5 ms from 5 rows up (boot to boot), so read the trend. The 4d7f575c row is the inherited baseline, not rerun.
+Ms per forward at 8K context:
+
+| binary | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| 4d7f575c (main + meter) | 17.93 | 21.47 | 23.82 | 27.60 | 32.82 | 35.48 | 39.85 | 44.45 |
+| 466b7ec6 (prepared HC cache 16, dense rows, A8 row-streaming arms) | 17.46 | 20.85 | 23.15 | 25.83 | 28.11 | 31.64 | 36.62 | 40.24 |
+| cce24635 (+ GDN replay, no per-row state capture) | 17.28 | 20.63 | 22.51 | 25.17 | 27.70 | 30.97 | 34.92 | 37.86 |
+| f96a99e9 (+ the 8-row single-verify gate) | 17.75 | 21.15 | 23.04 | 25.60 | 27.63 | 30.80 | 34.46 | 37.30 |
+| 8044906b (+ GDN prework across the threadgroup) | 17.52 | 20.57 | 22.43 | 24.99 | 27.07 | 30.81 | 34.15 | 37.36 |
+
+At 1K context the same binaries read 16.50 / 19.80 / 22.29 / 25.32 / 28.46 / 31.70 / 35.80 / 38.79 (466b7ec6) and
+16.75 / 19.84 / 21.79 / 24.62 / 27.44 / 30.56 / 34.58 / 37.23 (8044906b). Context barely moves a verify; rows do.
+
+- Before: steps of +3.5 / +2.4 / +3.8 / **+5.2** / +2.7 / **+4.4** / +4.6 ms. After (mean of four boots at 1K and 8K, f96a99e9 and
+  8044906b): 17.22 / 20.38 / 22.37 / 25.07 / 27.46 / 30.78 / 34.53 / 37.37, steps +3.2 / +2.0 / +2.7 / +2.4 / +3.3 / +3.8 / +2.8.
+  The 4-to-5 cliff is gone; 6-to-7 and 7-to-8 are still the high steps. Eight rows cost 37.4 ms instead of 44.5 (-16%).
+- What moved it, each exact (output bytes equal serial decode, so no KLD gate):
+  - `verifyFeatureEnabled` capped the prepared HC verifier graph at 6 rows; with the cap at 8 and the prepared cache at 16 entries
+    (widths 2..8, with and without a pending stream) 7 and 8 rows take it.
+  - The router and the shared-expert gate run `mtp_dense_rows` at every width, one row included, so serial decode and a verify row share
+    one arithmetic on any device (it was 96 MLX matmuls and slices per row). M5: the kernel equals MLX's M=1 matmul bit for bit.
+    M1 Max: serial greedy bytes identical to main on Ternary (chat, messages, copy).
+  - `mtp_qmv` ran a second tile from five rows on; the A8 trunk and head take row-streaming arms (s1x4 at 5, p4x8 at 6, s1x4 or
+    p2x8 at 7, p2x8 on the 10240 and 12288 shapes at 8) that keep qmv's per-lane block order and bf16 rounding. 0 mismatches against
+    serial qmv at rows 2..9 in the unit sweep.
+  - GDN verify stored a full f32 state per row (113 MB per row over 36 layers). It now writes the final state, keeps the pre-verify
+    state with the gate inputs, and a partial accept replays the accepted rows with the same recurrence (stored-width rounding per step,
+    so `--qwen-gdn 16` agrees too). -0.2 / -0.6 / -0.7 / -0.4 / -0.7 / -1.7 / -2.4 ms at 2..8 rows (466b7ec6 to cce24635).
+    The S=2 fold keeps its one-row capture.
+  - The verify recurrence computed q, k, v of every row on three simdgroups and the gates on one lane in turn; the work items now spread
+    over all simdgroups (about -0.5 ms at 2..5 rows, within noise above).
+- Stage split at f96a99e9, 8K, one boot per stand-in (`QWEN4_STANDIN`; removal is not additive): the part each block costs at 1 / 4 / 8 rows,
+  MLP 4.9 / 10.3 / 17.4 ms (1.8 per row: the routed experts are bound per slot), GDN 4.9 / 5.0 / 7.2, hyper-connections 2.8 / 2.5 / 4.8,
+  attention 3.1 / 4.3 / 4.7. The routed experts are the remaining slope.
+- Tests: `single-stream verify feature selection` (widths 1..9), the real-pack `single-stream verify optimizations` (prepared graph at
+  2..8), `dense rows ... preserve MLX's bits` (rows 1..8, 9, 16, 32), `qmv8 gs32/64/128 shared rows` (the trunk shapes, arm engaged at 5..7),
+  `gdn_decode.step in gatedDeltaNetProjected` (rollback at every accepted row, f32 and bf16, fused replay against the chain).
+
+Bench on the final tree (`d2a866b4`, binary built 2026-10-22 06:49:59, SHA-256 `648924f9...48e8`), Sushi-2.6bpw, llmprobe 0.6.15
+`--bench-only --rungs 4k,16k,64k,128k --runs 3`, `--kv-quant 8 --prefix-cache-entries 0`, AC, fans max, `taskpolicy -a`, lock and QUIET per arm,
+180 s idle before each arm, arms adjacent. Both logs carry the engagement lines (`[mtp] on (--mtp)` / `DFlash drafter ready` and 56 / 54
+`[spec-stats]` lines). Records: MTP f9393ba6 and DFlash2 adaptive 43d2fe98 from the [DFlash2 table](#dflash2), not rerun. Decode tok/s:
+
+| rung | MTP record | MTP now | DFlash2 adaptive record | DFlash2 adaptive now |
+|---|---|---|---|---|
+| 4k | 92.0 | 93.8 (+2.0%) | 97.9 | 109.4 (+11.7%) |
+| 16k | 88.3 | 92.9 (+5.2%) | 106.0 | 105.0 (-0.9%) |
+| 64k | 79.4 | 83.3 (+4.9%) | 87.3 | 87.0 (-0.3%) |
+| 128k | 71.3 | 74.2 (+4.1%) | 76.0 | 78.0 (+2.6%) |
+| headline | 101.0 | 110.0 (+8.9%) | 96.2 | 104.4 (+8.5%) |
+| novel prose | 81.4 | 86.7 (+6.5%) | 83.4 | 84.8 (+1.7%) |
+| predictable text | 135.3 | 148.8 (+10.0%) | 157.4 | 166.7 (+5.9%) |
+| TTFT ms | 129 | 125 | 166 | 156 |
+
+DFlash2 at 16k and 64k did not move although its verify got cheaper: some requests there are still stopped by the runtime gate
+(`runtime_disabled=true` in their `[spec-stats]`), which prices the round against the serial token.
 
 <a id="dflash2"></a>
 ## Flash-Next DFlash2 (`--drafter`) against MTP

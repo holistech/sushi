@@ -260,6 +260,105 @@ measured on the tree this was ported from.
   20 groups, one row. Its early exit saved nothing (passes over every slot cost the same): a dispatch costs a fixed
   ~10 us in this chain. Host-compacted slot lists still read 1.10 / 1.35 / 4.4.
 
+<a id="dsv41-stq"></a>
+## DeepSeek-V4.1 STQ pack kernels (trunk linears, routed chain)
+
+ReleaseFast, `taskpolicy -a`, M5 Max, NO GPU lock: another job held the GPU. Dependent-chain timings queue behind its
+long kernels (a one-row chain read 2-3 ms instead of ~250 us), so each cell is the best of 40 chains of 4 calls with the
+chain link removed: orderings and ratios hold, absolute microseconds are upper bounds. Re-take the cells on a quiet box before recording any as a baseline.
+Meters: `SUSHI_DSV41_STQ_UBENCH=1` and `SUSHI_DSV41_EXPERT_UBENCH=1` with `SUSHI_UBENCH_STEPS=4 SUSHI_UBENCH_ROUNDS=40`
+(exl3 test binary, `-Dtest-filter=UBENCH`).
+
+Trunk linears, us per call (and GB/s of trellis read), SPEC1 n64; `gemm` is what the pack used before (the sorted GEMM at
+every width), `rows` the multi-row kernel (SIMD at 1 row, NAX from 2), mxfp8 the release's own trunk:
+
+| linear | MB | 1 row: gemm | 1 row: rows | 5 rows: gemm | 5 rows: rows | 1 row: mxfp8 |
+|---|---|---|---|---|---|---|
+| `wq_a` 5120->1280 | 3.3 | 120 | 24 (134) | 168 | 56 | 31 |
+| `wq_b` 1280->32768 | 21.0 | 242 | 104 (201) | 375 | 191 | 265 |
+| `wkv`, compressor `wkv`/`wgate` 5120->512 | 1.3 | 97-114 | 20-23 | 101-113 | 23-30 | 24-26 |
+| `wo_a` 8 x 4096->1024 | 16.8 | 103 | 51 (328) | 129 | 75 | 74 |
+| `wo_b` 8192->5120 | 21.0 | 778 | 85 (247) | 630 | 322 | 660 |
+| shared `w1`/`w3` 5120->2304 | 5.9 | 107 | 25 (239) | 99 | 36 | 38 |
+| shared `w2` 2304->5120 | 5.9 | 69 | 34 (173) | 73 | 41 | 28 |
+| indexer `wq_b` 1280->4096 | 2.6 | 57 | 33 | 68 | 37 | 25 |
+| head 5120->129280, n96 | 496 | 1440 | 940 (528) | 1430 | 1410 (352) | 1276 |
+
+- Rows kernel over GEMM: 1.5-9x at one row, 1-4x at five (the head ties the GEMM there); at 256 rows (prefill) the GEMM stays: 8-40 GB/s, level with
+  mxfp8 and affine-4 on the same rows.
+- One row: SIMD against NAX, same kernel, interleaved: head 940 vs 1342 us, `wq_b` 89 vs 353, `wo_a` 61 vs 113,
+  `wo_b` 82 vs 106, `wkv` 19 vs 30, `wq_a` 52 vs 27 (the one shape NAX won). The head at one row reads at the roofline.
+- Small linears (<= 6 MB) sit at 20-35 us: a fixed per-call floor (two dispatches), not bytes. Twelve to thirteen of them
+  per layer are about half a millisecond of the layer's decode.
+- `wq_a` and `wkv` in one stacked launch against two (`SUSHI_DSV41_STQ_UBENCH=shared`, 8-step chains, best of 40,
+  same conditions, three runs): one row 29.4-38.1 us against 34.1-47.7 (0.80 to 0.88), five rows 35.7-47.7 against
+  43.3-51.3 (0.81 to 1.05).
+- The cells time `linear` on f16 rows. Served on bf16 rows a call stores bf16 directly (no cast dispatch); not re-timed.
+
+Routed chain (`moeDecodeClamped` / `moePrefillClamped`, 5120->2304->5120, top-6 clamped SwiGLU, bf16 rows, 16 route sets
+so the experts are cold), us per call over the picked experts' bytes:
+
+| layout (plan layer) | 1 row | 5 rows | 16 rows | 256 rows (prefill) |
+|---|---|---|---|---|
+| L2 n40:5 n32:17 n26:37 n24:325 | 241-259 (40-59 MB, 165-228 GB/s) | 1027 (193 MB, 188 GB/s) | 3666 (587 MB, 160 GB/s) | 35988 (2.6 GB, 72 GB/s) |
+| L23 five groups with the mixed class | 217-249 (40-48 MB, 183-192 GB/s) | 999 (229 MB, 229 GB/s) | 3663 (681 MB, 186 GB/s) | 40037 (3.0 GB, 74 GB/s) |
+| DSpark stage, 128 x n32, top-3 | 125 (27 MB, 213 GB/s) | 531 (128 MB, 241 GB/s) | 1799 (362 MB, 201 GB/s) | n/a |
+
+- The decode and verify chain runs at 0.3-0.45 of the roofline at every rate mix; cost follows bytes read, not the group
+  count (4 or 5 groups, one mixed class: within noise).
+- The 256-row prefill decodes every expert of the layer once per call (~13.6 G weights), so its time is the decode rate,
+  not the row count: wider spans cost the same per layer until 32 rows per expert, and a streamed layer also reads 2.6 GB
+  from SSD per call.
+
+<a id="simd-rows"></a>
+## SIMD multi-row trunk linears (machines without NAX)
+
+The multi-row kernel's SIMD arm is what an M1 to M4 runs for every verify width, and what `gemmNaxOn() == false` runs on
+any machine. Measured on the M5 Max with the SIMD arm forced (`SUSHI_FORCE_GPU_FAMILY_FALLBACK=1
+SUSHI_EXL3_ROWS_SIMD_UBENCH=1`, exl3 test binary, `-Dtest-filter="exl3 SIMD multi-row timing"`), main d810c50c plus the
+split row loops and `tgrp 2`, GPU lock, QUIET, `taskpolicy -a`. Each call is fed by the previous call's output, before and after
+are interleaved in one process, best of 7 chains of up to 48 cold banks; SPEC1 n64 (head and Qwen head n96), f16 rows.
+Cells are us per projection, fans on auto; no M1 to M4 timing exists yet. Output bytes are identical before and after.
+
+| linear | | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|---|---|---|
+| `wq_a`+`wkv` | before | 20 | 21 | 26 | 29 | 34 | 37 | 40 | 85 |
+| | after | 20 | 20 | 22 | 23 | 24 | 26 | 29 | 30 |
+| | after GB/s | 227 | 223 | 213 | 198 | 188 | 175 | 160 | 151 |
+| `wq_b` | before | 47 | 50 | 79 | 93 | 115 | 131 | 145 | 243 |
+| | after | 47 | 51 | 56 | 64 | 73 | 83 | 93 | 104 |
+| | after GB/s | 446 | 413 | 377 | 329 | 286 | 252 | 225 | 203 |
+| `wo_a` | before | 40 | 43 | 63 | 74 | 90 | 101 | 113 | 209 |
+| | after | 40 | 42 | 45 | 50 | 57 | 64 | 70 | 77 |
+| | after GB/s | 418 | 398 | 369 | 333 | 296 | 263 | 240 | 218 |
+| `wo_b` | before | 49 | 51 | 75 | 88 | 109 | 122 | 136 | 251 |
+| | after | 49 | 51 | 54 | 60 | 67 | 74 | 84 | 92 |
+| | after GB/s | 429 | 412 | 388 | 349 | 314 | 283 | 250 | 227 |
+| shared `w1`+`w3` | before | 32 | 34 | 48 | 55 | 67 | 75 | 82 | 157 |
+| | after | 32 | 33 | 36 | 39 | 43 | 48 | 53 | 58 |
+| | after GB/s | 371 | 353 | 329 | 304 | 272 | 243 | 222 | 205 |
+| shared `w2` | before | 20 | 22 | 30 | 34 | 40 | 44 | 48 | 92 |
+| | after | 20 | 21 | 23 | 24 | 26 | 29 | 32 | 35 |
+| | after GB/s | 294 | 286 | 259 | 241 | 223 | 203 | 185 | 170 |
+| `head` | before | 894 | 922 | 1077 | 1284 | 1630 | 1841 | 2050 | 3490 |
+| | after | 903 | 930 | 955 | 976 | 1029 | 1132 | 1247 | 1380 |
+| | after GB/s | 550 | 534 | 520 | 509 | 482 | 438 | 398 | 360 |
+| Qwen head | before | 880 | 867 | 912 | 1035 | 1330 | 1483 | 1686 | 3075 |
+| | after | 872 | 872 | 873 | 876 | 891 | 915 | 999 | 1091 |
+| | after GB/s | 547 | 547 | 546 | 544 | 535 | 521 | 477 | 437 |
+
+- Weights are read once for all rows, so the ideal is the one-row time at every width. One and two rows sit there
+  (memory bound, 410-450 GB/s on `wq_b`, 550 on the head). From three rows the kernel is ALU bound: the weight decode costs
+  about 23 us on `wq_b` (two to three rows' worth of FMAs) and each row adds about 10 us, an FMA stream at roughly half the
+  M5 Max's peak.
+- Before, a row loop of five or more rows compiled 2-3x slower (the eight-row cell: 243 us on `wq_b`, +100 over seven).
+  After, a k-tile decodes into registers once and the rows run in loops of at most four (`ROWS_LOOP_MAX`).
+- Ablations at 8 rows (`wq_b`, 103 us): skipping the activation prep saves 14 us, so a separate prep dispatch cannot pay;
+  keeping the prepared rows as f32 in threadgroup memory (no half-to-float converts) is 3-16% slower; threadgroups of 4
+  tile pairs match 2 (the policy stays at 256 threads for M1/M2's register-bound thread cap); 1 pair is 10-12% slower.
+- Every row of a SIMD multi-row launch equals the one-row launch bit for bit (k split and sum order do not depend on
+  the row count): a verify row on a machine without NAX equals its serial step.
+
 ## v1.2.0-dev release context ladder
 
 [Version summary and full table](bench/v1.2.0-dev/summary.md), commit `73a9659c38f4818f399bdd2cc32309e348a3077c`, ReleaseFast on Apple M5 Max 128 GB, 2026-10-05. llmprobe 0.6.15, `--bench-only --rungs 2k,4k,8k,16k,32k,64k,128k`, GLM 3 runs and subsequent Qwen/MiMo 2 runs. `taskpolicy -a`, per-model GPU lock, fans max, server stop followed by 60 s idle. Prior release reference inherited without rerun or speedup claim; per-model reports retain scenario samples and probe notes.
@@ -288,6 +387,15 @@ before each server. One binary built from `bb9adb6a`.
 - Qwen 2.6bpw and 4bpw come from the first pass.
 - MiMo 2.3bpw comes from a fresh AC rerun: its first-pass run crossed onto battery, as did GLM's, and battery slowed GLM 8–18%.
 - GLM 2.4bpw comes from the release binary `29107ce9` (SHA `98d1760b`), after the DFlash2 in-place commit fix.
+
+## v1.4.0 release context ladder
+
+[Version summary and per-model reports](bench/v1.4.0/summary.md), 2026-10-27, Apple M5 Max 128 GB. `sushi bench`
+(`./tests/bench.sh`, code and prose arms, one cold prefill in 8k restore windows to 128K, 3 decode samples a rung), AC
+power, `iogpu.wired_limit_mb=125000`, `taskpolicy -a`, per-model GPU lock, fans max and idle under 50 °C before each server.
+Not comparable with the llmprobe ladders below.
+- Qwen STQ 2.75bpw and 4bpw: binary SHA `fcb8ee2f` (source of `846863bd`). GLM: `d361c70b` (SHA `4d25c2d7`); its 128K code
+  samples are loop-stopped at 390 tokens. DeepSeek: `bf21aa5e` (SHA `5027a704`), `--ssd-budget-gb 108`; 80 and 96 in usage.md.
 
 ## v1.3.0 release context ladder
 

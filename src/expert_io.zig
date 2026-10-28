@@ -1,6 +1,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
+const layout = @import("sushi_exl3").group_layout;
 
 pub const align_bytes: usize = std.heap.page_size_max;
 
@@ -161,11 +162,15 @@ pub fn openHinted(path: [:0]const u8, hints: ReadHints) !std.c.fd_t {
     return fd;
 }
 
+/// A trellis span's tile grid: the fill lands it in `layout.tileMajor` order instead of the file's.
+pub const TileShape = struct { it: u32, ot: u32, n: u32 };
+
 pub const FillSpan = struct {
     file: u16,
     offset: u64,
     len: u64,
     dst: [*]u8,
+    tile: ?TileShape = null,
 };
 
 pub const ReadJob = struct {
@@ -223,6 +228,7 @@ pub fn coalesceSpans(allocator: std.mem.Allocator, spans: []const FillSpan, max_
             const next = spans[i];
             if (next.len == 0) return error.InvalidFillSpan;
             if (next.file != file or next.offset != offset + len) break;
+            if (next.tile != null or spans[first].tile != null) break;
             if (len + next.len > max_bytes) break;
             len += next.len;
         }
@@ -236,6 +242,7 @@ fn jobIsDirect(spans: []const FillSpan, job: ReadJob, page: u64) bool {
     var k: usize = 0;
     while (k < job.count) : (k += 1) {
         const s = spans[job.first + k];
+        if (s.tile != null) return false;
         if (s.dst != expect) return false;
         expect = s.dst + @as(usize, @intCast(s.len));
     }
@@ -605,6 +612,12 @@ pub const FillPool = struct {
                 const s1 = plan.spans[job.first + k];
                 const sl: usize = @intCast(s1.len);
                 const take = @min(sl, delivered - written);
+                if (s1.tile) |tile| if (take == sl) {
+                    const bytes = 2 * @as(usize, tile.n);
+                    layout.tileMajor(u8, s1.dst[0..sl], target[head + written ..][0..sl], tile.it, tile.ot, bytes);
+                    written += sl;
+                    continue;
+                };
                 @memcpy(s1.dst[0..take], target[head + written .. head + written + take]);
                 written += sl;
             }
@@ -702,6 +715,9 @@ pub const Lease = struct {
     id: u64,
 };
 
+/// Bytes mapped by live PageSlabs: sushi-owned memory MLX sees through no-copy imports (`/props` owned_bytes).
+pub var slab_bytes: std.atomic.Value(u64) = .init(0);
+
 pub const PageSlab = struct {
     allocator: std.mem.Allocator,
     bytes: []align(align_bytes) u8,
@@ -725,12 +741,14 @@ pub const PageSlab = struct {
             0,
         );
         slab.* = .{ .allocator = allocator, .bytes = @alignCast(mapped) };
+        _ = slab_bytes.fetchAdd(slab.bytes.len, .monotonic);
         return slab;
     }
 
     pub fn destroy(self: *PageSlab) void {
         const allocator = self.allocator;
         self.live.deinit(allocator);
+        _ = slab_bytes.fetchSub(self.bytes.len, .monotonic);
         std.posix.munmap(self.bytes);
         allocator.destroy(self);
     }
@@ -1091,6 +1109,35 @@ test "expert io fill scatters one coalesced read into disjoint destinations" {
     try t.expectEqualSlices(u8, file.bytes[640..768], &right);
 }
 
+test "expert io fill lands a tile span in tile-major order and leaves its neighbour as read" {
+    const t = std.testing;
+    var file = try TestFile.make(t.allocator, "tiles.bin", 4096, 0x77);
+    defer file.deinit(t.allocator);
+    const fd = try file.open(t.allocator);
+    defer _ = std.c.close(fd);
+
+    const it = 3;
+    const ot = 4;
+    const n = 2;
+    var tiled: [it * ot * n * 2]u8 = @splat(0);
+    var plain: [16]u8 = @splat(0);
+    const spans = [_]FillSpan{
+        .{ .file = 0, .offset = 515, .len = tiled.len, .dst = &tiled, .tile = .{ .it = it, .ot = ot, .n = n } },
+        .{ .file = 0, .offset = 515 + tiled.len, .len = plain.len, .dst = &plain },
+    };
+    var plan = try FillPlan.init(t.allocator, &spans, 64 * 1024 * 1024, 1, false);
+    defer plan.deinit();
+    try t.expectEqual(@as(usize, 2), plan.jobs.len);
+    const pool = try FillPool.create(t.allocator, .{ .workers = 1 });
+    defer pool.destroy();
+    try pool.run(&.{fd}, &plan);
+
+    var want: [tiled.len]u8 = undefined;
+    layout.tileMajor(u8, &want, file.bytes[515..][0..tiled.len], it, ot, n * 2);
+    try t.expectEqualSlices(u8, &want, &tiled);
+    try t.expectEqualSlices(u8, file.bytes[515 + tiled.len ..][0..plain.len], &plain);
+}
+
 test "expert io fill attributes a span past eof while other spans complete" {
     const t = std.testing;
     var file = try TestFile.make(t.allocator, "short.bin", 8192, 0xabc);
@@ -1259,6 +1306,12 @@ test "expert io file cache reopens a replaced shard and reuses a stable one" {
 }
 
 pub const Dtype = enum { bf16, f16, u8, u16, u32, f32, f8e4m3, other };
+
+/// One byte per element, moved as opaque bytes: unsigned, signed (packed e2m1 pairs) or e8m0 scales.
+pub fn isByteDtype(name: []const u8) bool {
+    for ([_][]const u8{ "U8", "UINT8", "I8", "F8_E8M0" }) |n| if (std.mem.eql(u8, name, n)) return true;
+    return false;
+}
 
 pub const TensorRegion = struct {
     data_offset: u64,
@@ -1429,7 +1482,7 @@ pub fn tensorRegion(allocator: std.mem.Allocator, fd: std.c.fd_t, key: []const u
         .f16
     else if (std.mem.eql(u8, dtype.string, "U16"))
         .u16
-    else if (std.mem.eql(u8, dtype.string, "U8") or std.mem.eql(u8, dtype.string, "UINT8"))
+    else if (isByteDtype(dtype.string))
         .u8
     else if (std.mem.eql(u8, dtype.string, "U32") or std.mem.eql(u8, dtype.string, "UINT32"))
         .u32
@@ -2020,4 +2073,12 @@ test "parallel reader fills any range, across many chunks and workers and up to 
         defer t.allocator.free(past);
         try t.expectError(error.FillShortRead, reader.fill(fd, past, size - page));
     }
+}
+
+test "a PageSlab counts its mapped bytes while it lives" {
+    const before = slab_bytes.load(.monotonic);
+    const slab = try PageSlab.create(std.testing.allocator, 5000);
+    try std.testing.expectEqual(before + pageRoundUp(5000), slab_bytes.load(.monotonic));
+    slab.destroy();
+    try std.testing.expectEqual(before, slab_bytes.load(.monotonic));
 }

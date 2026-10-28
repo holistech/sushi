@@ -22,7 +22,7 @@
 
 set -u
 
-MODEL_DIR=${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}
+MODEL_DIR=${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}
 PORT=${2:-8097}
 BASE="http://127.0.0.1:$PORT"
 BIN=./zig-out/bin/sushi
@@ -103,6 +103,8 @@ echo "$OUT" | grep -q 'Contents/Resources/codex' || OK=0
 grep -q 'wire_api = "responses"' ~/.sushi/codex/config.toml || OK=0
 grep -q "model_context_window = $ADV_CTX" ~/.sushi/codex/config.toml || OK=0
 grep -q "base_url = \"$BASE/v1\"" ~/.sushi/codex/config.toml || OK=0
+grep -q "^model_instructions_file = \"$HOME/.sushi/codex/model-instructions.md\"" ~/.sushi/codex/config.toml || OK=0
+grep -q 'exec_command' ~/.sushi/codex/model-instructions.md || OK=0
 if [ "$OK" = 1 ]; then
     run_test "codex config targets /v1/responses with the advertised context" PASS
 else

@@ -53,6 +53,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - Decode on this box is dispatch-gap bound: ~860 kernels per Flash-Next token, kernel time ~9.8 of ~18 ms, ~7 us
   per boundary. `MLX_MAX_OPS_PER_BUFFER` and `MLX_METAL_FAST_SYNCH` gave nothing; decode wins come from fewer,
   denser kernels ([perf-baselines](qwen4-perf.md#exl3)).
+- **Two kernels in one launch** (`exl3/fuse.zig`): part A's threadgroups, then part B's, each running its own statements on
+  its own inputs, outputs, template ints and (renamed) codec helpers, so every output has the bytes of its kernel run alone.
+  DeepSeek's shared expert rides the routed decode chain this way, 5 launches a layer fewer
+  ([engine-exl3-experts](engine-exl3-experts.md#dsv41-shared-fused)). Idea from turboexl3's shared expert in its decode
+  launches (MIT); no code is ported. A chained ubench shows the saving only if the two chains do not already overlap there.
 - At one decode row the shared-expert gate's dot runs on the router kernel's idle simdgroups in MLX's own
   `dot_product` order (bit-equal to the matmul; declines at 32 or fewer experts, K % 8 != 0 or K > 16384).
 - A split-K grid too small to fill the GPU (QSA at one decode row: 32 threadgroups) waits on its tile loads. Extra
@@ -130,6 +135,22 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   MiMo, GLM and non-NAX GPUs take the blocked kernel. Not bit-identical to it (dot order); prefill +3.8% at 32K
   ([qwen4-perf](qwen4-perf.md#gdn-pipelined), 9b3369a6, Sushi-4bpw kv8 `--no-mtp`).
 
+### DeepSeek-V4.1 fused gather-attention (`dsv41_attn_fused`)
+
+- One threadgroup per (query row, 16 heads); the row's window keys and picked compressed rows stream through
+  threadgroup memory 16 at a time, shared by the 16 heads (MQA), and eight simdgroups each own 64 of the 512 channels
+  of both products. The softmax is online in f32 and seeded with the sink as a zero-valued key.
+- P reaches the bf16 matrix unit as a high and a low bf16 part (two MMAs), which keeps ~16 bits of it; a single bf16 P
+  would be 2^-9. The error against the CPU f32 `attnCore` is 4e-6 to 1.3e-5 of peak, the GPU `attnCore` 3.5e-4 to 7e-4
+  (its f32 matmul keeps ~11 bits).
+- A matrix's per-lane (row, column) is `fm = (lane / 4 & 4) + (lane / 2) % 4`, `fn = (lane / 4 & 2) * 2 + (lane % 2) * 2`
+  with `thread_elements()`: the online rescale and the output store use it instead of a threadgroup round trip.
+- Release shape (64 heads x 512, window 128, 512 picks), best of 16 interleaved on the M5 Max, `SUSHI_DSV41_ATTN_UBENCH=1`
+  test "dsv41 attention span timing": span 256 core 13-15 ms, f16 `attnWide` 5.9-6.8 ms, fused 2.7-3.3 ms; span 128
+  core 6.3-7.2, wide 2.8-3.2, fused 1.5-1.7; window-only span 256 core 3.6-4.0, wide 2.1, fused 0.7-1.0. Peak bytes beyond
+  the inputs a span: core 897 MB, wide 284 MB, fused 16 MB (the output). Four simdgroups were 15% slower than eight.
+  The box was shared with other Metal compiles, so the fused arm spread up to 2x between runs; core and wide hold.
+
 ## Verify lanes
 
 - `vqmmLaneFor`: split-K M 2–7 / wide tile N≥100K / NAX m16 M 8–16; parity = fp32-dequant per width, never vs
@@ -153,6 +174,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   the stores ([engine-exl3-experts](engine-exl3-experts.md#kernels), 2.6x on the non-NAX GEMM).
 - Cooperative-only matmul2d takes M, N, K in {16, 32}, with at least one of them 32. Larger tiles are the 16x16
   fragments concatenated. A K=32 op runs no faster than two K=16 ops.
+- **A per-row FMA loop over more than four rows compiles 2 to 3x slower** (the accumulators leave registers; M5, the
+  SIMD multi-row projection): split the rows into loops of at most four over the same decoded weights.
 - **Metal caps each compiled kernel's threads per threadgroup by its register use**; MLX throws at a dispatch above it.
   M3 and later grant every kernel 1024, so an M5 never sees it; M1/M2 grant 1024 up to 52 GPRs, down to 384 at 128.
   A group above 384 threads probes and declines (`sushi_gdn_verify_fold`), or its GPRs come from a `metal-tt` G13 build.
@@ -173,6 +196,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 
 - GPU parity = no-worse-than fp32 ground truth, never kernel-vs-kernel; a parity loop asserts FINITENESS before it
   diffs; every shape an eligibility predicate adopts gets its own A/B.
+- A "no further from truth than the composed chain" bar needs an f32 floor: without NAX the composed GEMMs are true f32
+  and the kernel's own accumulation noise exceeds them (CI's GPU and an M1; an M5's TF32 core hides it). A kernel test
+  whose launch geometry a load probes (`probeHc`) runs that probe too.
 - Drive a parity case at the model's REAL activation magnitudes, not synthetic unit-scale inputs, and score it
   against a TRUE f32 oracle (an oracle that mirrors the kernel's own f16 stores cannot see a saturation).
 - A `metal_kernel` config is cached by FULL SHAPE (`ShapeKey`); a per-token-varying TEMPLATE value is a fresh JIT
@@ -198,6 +224,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 
 - Interleave A/B kernels in ONE process (separate runs drift 15%); one-shot per-kernel ubench timings are not
   evidence (codebook-free kernels swung 20-40% between arms from clock ramp).
+- A bench of independent calls lets one-dispatch launches overlap, so it flatters a launch with few threadgroups.
+  Time a decode-shaped kernel's geometry on a chain as well, each call fed by the previous output
+  ([engine-exl3-experts](engine-exl3-experts.md#dense-rows)).
 - Size every probe and config cache for all the arms of an A/B. A full cache re-probes on every call, which added
   ~170 us per call to the dev arms. An ablation that skips a tile's only reader lets the compiler drop the tile's
   stores and their loads.

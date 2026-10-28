@@ -7,6 +7,9 @@ const mlx = @import("mlx_host").mlx;
 pub const format = @import("expert_exl3.zig");
 pub const kernels = @import("expert_exl3_kernels.zig");
 pub const glm_group2 = @import("glm_group2.zig");
+pub const glm_fold = @import("glm_fold.zig");
+pub const qwen_riders = @import("qwen_riders.zig");
+pub const qwen_fold = @import("qwen_fold.zig");
 pub const glm_prefill_grid = @import("glm_prefill_grid.zig");
 pub const codebook_tables = @import("codebook_tables.zig");
 
@@ -17,6 +20,7 @@ pub const group_layout = @import("layout.zig");
 pub const GroupLayout = group_layout.Layout;
 pub const rate_groups = @import("rate_groups.zig");
 pub const Ragged = rate_groups.Ragged;
+pub const linear = @import("linear.zig");
 pub const Bank = struct { gate: Proj, up: Proj, down: Proj };
 
 /// Routed SwiGLU experts over `x` [B, S, D] for the top-k `inds`/`scores` [B, S, K],
@@ -193,7 +197,11 @@ fn windowFromConfig(v: ?std.json.Value) ?format.Window {
 }
 
 pub fn parseExpertQuant(obj: std.json.ObjectMap) !Spec {
-    const block = obj.get("expert_quant") orelse return error.ExpertLayoutUnsupported;
+    return parseQuantBlock(obj.get("expert_quant") orelse return error.ExpertLayoutUnsupported);
+}
+
+/// One `expert_quant`-shaped block (`trunk_quant` too): format, k, codebook, window and the STQ table.
+pub fn parseQuantBlock(block: std.json.Value) !Spec {
     if (block != .object) return error.ExpertLayoutUnsupported;
     const fmt_v = block.object.get("format") orelse return error.ExpertLayoutUnsupported;
     if (fmt_v != .string) return error.ExpertLayoutUnsupported;
@@ -767,6 +775,9 @@ test { _ = glm_group2; }
 
 test {
     _ = rate_groups;
+    _ = linear;
+    _ = @import("dsv41_ubench.zig");
+    _ = @import("dsv41_real.zig");
 }
 
 test {

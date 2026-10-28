@@ -13,7 +13,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [qwen4-arch](qwen4-arch.md
 
 | File | Role |
 |---|---|
-| `src/mtp.zig` | MTP head (in-checkpoint `mtp.*` or sidecar via `resolveMtpSource`) |
+| `src/mtp.zig` | shared MTP machinery: depth bounds, cost profiles, draft rerank (the heads live in `qwen4_forward.zig`, `mimo_mtp.zig`) |
 | `src/mtp_acceptance.zig` | acceptance modes `exact|typical|tokenv3` |
 | `src/mtp_group_planner.zig` / `src/mtp_group_cost.zig` | grouped verify planner |
 | `src/mtp_qmv.zig` | M=1-exact qmv rows |
@@ -32,6 +32,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [qwen4-arch](qwen4-arch.md
 - `--no-mtp` gates the IN-CHECKPOINT head too (`entry.mtp` reads `mtpChoiceFor`, logged `[mtp] on|off (<source>)`);
   an explicit `--mtp`/`--no-mtp` beats `model-settings.json` `mtp`. A streamed Sushi EXL3 Qwen pack keeps the head resident by
   default ([engine-expert-streaming](engine-expert-streaming.md)); other streamed models resolve it off.
+- An MTP-off Qwen load (resident or streamed) never reads the head's `language_model.mtp.*` tensors
+  (`loadWeightsFromOpenDirMode`'s `drop_mtp`), so a head stored as its own shard (`mtp-0.safetensors`, 1.18 GiB on Sushi-STQ-2.75bpw)
+  costs no transient and the bill (`indexedResidentSplit`, `mtp_on`) matches. Nothing turns the head on afterwards: a request's
+  `enable_mtp:true` is ignored without a loaded head, and the launch flag outranks `model-settings.json`. MiMo's heads
+  (`loadMimoHeads`) and DeepSeek's DSpark stages (`dsparkOn`) already load only when MTP is on.
 
 ## MiMo's three heads
 
@@ -43,19 +48,25 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
   correction from ORIGINAL `verify_logits[accepted]`.
 - A block decoder checks its ENTRY token before drafting (`generate.tokenStops`); the token budget is a PRE-COMMIT
   invariant; a committed argmax is a `CommittedArgmax` (only `verifyArgmax` builds one, masking reserved ids).
+- A reasoning budget (or loop-recovery close) keeps MTP on for the answer: the forced closer re-seeds the head
+  (`mtpResumeAfterForced`: qwen4 head reset; MiMo's three heads take the hole like an adaptive serial block) and the slot
+  ramps back through the serial exit. A round before the bound may emit at most the thought room (`ThinkBound.room`):
+  drafts are capped, the last room token runs serial, so the closer lands where serial decode lands it. DSpark and DFlash2
+  still decode the answer plain. Grouped rounds take the same per-slot cap (`plannerRowCap`, `capMtpRoundToThinkBound`; room 1
+  is a plain planner row), and a planner-owned slot rejoins the planner after the close instead of the serial ramp.
 - A think penalty shifts every verify block right after its forward (`thinkShiftRows`, solo, grouped and batched-head
   alike): row j is gated on the verify ids through j, so it reads the logits its serial tick would; drafts stay raw.
 - Scoped file/request logit biases share these prefix-dependent shifts for MTP and prompt lookup; active
   rewards and penalties bypass the target head shortlist. The think-penalty preset retains its original arithmetic.
-- A repeat/presence penalty shifts every verify block right after `thinkShiftRows` (`penaltyShiftRows`, the same
+- A repeat/presence/frequency penalty shifts every verify block right after `thinkShiftRows` (`penaltyShiftRows`, the same
   solo, grouped and batched sites): row j is penalised over the committed ids plus the verify ids through j with
-  the serial tick's own arithmetic (`seen_penalty.apply`), so MTP == serial holds. Drafts stay raw: exact
+  the serial tick's own arithmetic (`seen_penalty.apply` over per-id counts), so MTP == serial holds. Drafts stay raw: exact
   acceptance is valid for any proposal, a penalty only lowers acceptance. A plain batched tick samples no penalty,
   so a penalised slot stays out of the planner's and the crowd's plain ticks and keeps its MTP round.
 - Qwen3.8-Flash-Next's DFlash2 drafter verifies through the same forward, per-position capture and `ssmRollbackFromCapture`
   (GDN, PLE and QSA state), so the invariant above holds for it unchanged; a drafter named with `--drafter` outranks the head (MTP is the default)
   ([qwen4-arch](qwen4-arch.md#dflash2)).
-- logprobs>0, grammar and a forced call disable spec; DFlash and the drafter also refuse a penalty. A request that
+- logprobs>0, grammar and a forced call disable spec (DeepSeek's DSpark drafts under a grammar, [dsv41-arch](dsv41-arch.md#dspark-grammar)); DFlash and the drafter also refuse a penalty. A request that
   asked for MTP and runs without it logs `mtp=disabled (<reason>)`.
 
 ## Cost and acceptance
@@ -67,7 +78,7 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
 - **Off NAX (M1-M4) a qwen4 verify row is ~47% of a forward** (~16 ms of ~34 on an M2 Max; the M5 Max ~26%), spread
   over experts, GDN, HC and attention, so MTP nets ~1.1-1.35x there ([perf-baselines](qwen4-perf.md#m2max-decode)).
 - Acceptance is a PROMPT-TYPE property (code ≫ prose; `--mtp-min-depth n --mtp-max-depth n` + `acc_idx=` on `[mtp-trace]`).
-- **MTP is ON by default for both served models** (owner policy, `server.defaultEnableMtp` `served`): a request
+- **MTP is ON by default for Qwen and MiMo** (GLM keeps its head off and drafts with DFlash2; DeepSeek drafts with DSpark) (owner policy, `server.defaultEnableMtp` `served`): a request
   that omits `enable_mtp` runs the loaded head. `--no-mtp`, `"mtp": false` in `model-settings.json` or
   `enable_mtp:false` turn it off; an SSD-streamed pack loads with the head off (`[mtp] off (streaming; default)`,
   `scheduler.mtpDefaultOffUnderStreaming`) unless it is a Sushi EXL3 Qwen pack, which keeps it. The load-time bill prices the
@@ -151,6 +162,13 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
 - Engagement: `[mtp] prompt-lookup drafts engaged: k=… suffix=…` once, `[spec-stats] … lookup=rounds/drafted/landed`
   and `lookup_table=`. A/B driver: `tests/bench_mtp_lookup.sh`.
 
+## Verify price by rows
+
+A verify row costs about 2.9 ms on Flash-Next STQ-2.75 at every width from 2 to 8, with no step at five or seven rows
+([qwen4-perf](qwen4-perf.md#verify-rows8)). GDN rollback replays the accepted rows from the pre-verify state
+(`SSMCacheEntry.spec_replay`, `ssmRollbackFromCapture`) instead of picking one of R stored states; the S=2 fold and the
+chain/group paths still capture per row. `dflash_policy.ladder()` is that table plus the 4 ms a DFlash2 round pays whatever its width.
+
 ## Round cost table
 
 - **Round cost is MEASURED** per model/width/KV bucket from live single-chunk rounds (`round_cost.zig`;
@@ -198,8 +216,10 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
   decide which draws land where. A seeded byte comparison pins the plan (`SUSHI_MTP_ADAPTIVE=0
   SUSHI_MTP_COST_TABLE=0`, or a pinned depth).
 - Pinned-depth outputs are byte-equal to the pack's own no-MTP greedy (48/48 on two K3 packs).
-- `SUSHI_MTP_DENSE_ROWS=1` stays off by default: one `test_mtp_equivalence.sh` run with it on failed (top-2 gap
-  1.125 nats, a slow loaded run) and seven reruns passed ([perf-baselines](qwen4-perf.md#m2max-decode)).
+- The router and shared-expert gate run the dense-rows kernel at every width, serial decode included, so one arithmetic
+  serves a row whether it decodes alone or verifies beside others on any device
+  ([qwen4-perf](qwen4-perf.md#verify-rows8)). It replaced `SUSHI_MTP_DENSE_ROWS=1`, which one equivalence run failed
+  while it was off by default.
 
 ## Head KV and norms
 
@@ -224,10 +244,7 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
   tok/s vs typical 84.0 / 89.0 and exact 74.3 / 74.6 (2.7-2.9 vs 2.5 vs 2.1 tokens per round). Its emitted-text NLL
   fell below exact (0.603 vs 0.680 nats, paired interval [-0.23, +0.01]; non-argmax tokens 19.2% vs 21.6%): less
   diverse text, not a likelihood loss. Exact + tail stayed inside the NLL noise but decoded 72.8 / 72.2 tok/s.
-- **Norms**: delta-encoded head norms AUTO-FOLD at load (raw-HF heads get the `+1` repair, `mtpNormNeedsRepair` reads
-  the norm's OWN negative fraction, whole-head 5% bar); publish packs FOLDED (the converter folds them).
-  Quant re-solved PER WEIGHT; a sidecar's mode is solved from GEOMETRY (`quantParamsFromGeometry`); dense bf16 head
-  trunks requantize at load (`SUSHI_MTP_HEAD_QUANT_BITS` 4/g64).
+- **Norms**: publish packs carry FOLDED head norms (the converter folds them).
 
 <a id="ple-defer"></a>
 ## The deferred PLE leaf

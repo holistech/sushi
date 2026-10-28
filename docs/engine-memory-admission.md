@@ -16,6 +16,35 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - `currentGpuMemoryCeiling` must see EXTERNAL pressure; under-billing is a Metal OOM, so a bill goes down only where
   the bytes are gone.
 - `--wired-margin-gib` (default 1, integers 1..32) is how far under a raised `iogpu.wired_limit_mb` a plan may reach.
+- **A load whose owned bytes plus 1 GiB pass the lower of `vm.global_user_wire_limit` and `vm.user_wire_limit` logs one
+  `[mem] warning:` with the `sudo sysctl` fix** (`userWireWarning`, read once after the load): the macOS user-wire cap
+  is independent of `iogpu.wired_limit_mb` and default memsize less `vm.global_no_user_wire_amount` (116.82 GB here).
+  Owned bytes are `ownedBytesTotal` (weight regions plus expert slabs); the 1 GiB is the MLX decode pool, the one ledger
+  term outside them. Warning only. The suggested value is the need or the declared wired limit, rounded up to a GB,
+  at most RAM less 12 GB; when even that is short the line says to shrink the pack or `--ssd-budget-gb`.
+  Measured slowdown past it: [dsv41-memory](dsv41-memory.md).
+- **A command buffer fails (`kIOGPUCommandBufferCallbackErrorOutOfMemory`) once MLX's peak passes the wired limit less
+  the GPU memory MLX does not own** (#61). The limit counts AGX "In use system memory", which is system-wide: other
+  processes' Metal allocations (WindowServer, every app with a layer) count against it. Measured on an M1 Max 32 GB,
+  `iogpu.wired_limit_mb=30000` (31.46 GB), Qwen3.8-Flash-Next Ternary, kv8, `--no-mtp`, sushi 1.2.4, 8k-35k prompts,
+  30+ cold prefills: a 0.62 GB floor idle, MLX peaks of 30.57 GB and below passed, 30.85 GB and above failed.
+  - **Non-MLX GPU floor**: under a declared limit the ceiling is the limit less the larger of `--wired-margin-gib` and
+    floor + 512 MiB slack (`wiredUnplannedBytes`). The floor is read once, at startup, before MLX holds a model
+    (`measureGpuFloor`): right after a load it read 0 and 407 MB (weights still being wired), and after an unload it
+    lags high while freed pages unwire.
+  - Above the floor the counter is elastic: 1-op/1-MB command buffers drove it to the limit itself, with 1.85 GB of
+    non-MLX share, and the prefill passed.
+  - Other processes' memory is not the trigger here. A ballast of 1-4 GB touched incompressible RAM was swapped out
+    and the prefill passed at the same speed. With the model resident, `mlock` of even 0.5 GB was refused (EAGAIN).
+- **The bill counts MLX's command-buffer size** (`cadenceInflightBytes`, in `prefillNeededAtChunk` and
+  `prefillTransientReserveAtKv`). MLX keeps each op's inputs alive until its command buffer completes, up to 10 in
+  flight, and commits a buffer once its distinct inputs pass `MLX_MAX_MB_PER_BUFFER`. The prefill terms were fitted
+  at 50 MB, MLX's Max/Ultra default, so the term is (MB per buffer - 50) MiB x 9/8 and 0 at the default.
+  - Measured, same box: 1000 MB lifted MLX's prefill peak by 1.11 / 1.12 / 1.03 GB at 8k / 19k / 35k. 1000 ops at
+    50 MB moved nothing.
+  - At 1000/1000, 19k and the 35k edge failed inside admission, 3/3 and 2/2; the default passed at every length.
+  - Startup logs the cadence MLX resolved from its arch table or the env: `[mem] MLX command buffers: 50 ops / 50 MB
+    (default, applegpu_g13s); prefill bill +0 MB in flight`.
 - The box: M5 Max 128 GB; the default wired limit admits about 120 GB; a resident MiMo EXL3 pack is over 90 GB, so two
   heavy GPU jobs at once risk an OOM for both (and concurrent conversions have died together in a GPU reset).
 
@@ -23,7 +52,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 
 - The preflight's available figure is free RAM CAPPED at Metal's working-set limit (`effectiveAvailableBytes`): a
   lowered `iogpu.wired_limit_mb` binds below free RAM, and a load past it failed warmup, then every request.
-- **`status.getAvailableMemBytes` is the reclaimable page-class sum, never total minus used**: free (less speculative) plus file-backed pages, capped by the RAM outside wired and compressor. Mach's classes overlap (a resident model's wired pages are also in the anonymous set), so subtracting `wired + compressor + internal` charged them twice and read 4.5 GiB where 19 GiB was grantable (`computeAvailableBytes` tests carry the live counters).
+- **`status.getAvailableMemBytes` is the reclaimable page-class sum, never total minus used**: free (less speculative), file-backed and purgeable pages, capped by the RAM outside wired and compressor. Mach's classes overlap (a resident model's wired pages are also in the anonymous set), so subtracting `wired + compressor + internal` charged them twice and read 4.5 GiB where 19 GiB was grantable (`computeAvailableBytes` tests carry the live counters).
+- **The auto-context sizer bills the cache reserve at most half the room** (`ctxCacheShare`: the context is the primary claimant), and `safeContextForBudget` floors any fit under 1024 tokens at 1024; a Flash-Next or DeepSeek bill-derived context is advertised as the bill admits it, with no floor.
 - **The file-backed share is grantable slowly, not at once.**
   - **Slow climb, clean:** MiMo's BF16 KV filled to 550K with no swap while the file cache drained to 3 GiB.
   - **Fast large load, swap:** a 24 GB streamed load beside an idle resident GLM read 32 GiB available, then swapped
@@ -46,6 +76,19 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - **The warmup transient is measured per arch** (`loadWarmupBytes`, [Load warmup](#load-warmup)): Flash-Next 0.125 GiB
   plus 1.125 GiB while MTP is on, MiMo 0.25 GiB, GLM its fixed KDA state, pool rings and first 1024 latent rows plus
   0.375 GiB. A new arch or layout adds its own measured figure here, never a percentage of its weights.
+- **Flash-Next with a DFlash2 drafter bills the drafter as it is resident and as it loads**: `assistantLoadBytes` reads the
+  safetensors headers and bills what the 8-bit gs64 quantize step leaves (0.71 GiB for the shipped drafter, not its 1.12
+  GiB of BF16 file bytes: the codebooks and norms stay dense) plus a load transient, the dense linears the weight map keeps
+  until the load ends (0.89 GiB), which `loadWarmupBytes` adds through `dflash_load_transient_bytes` (stamped with the
+  other drafter terms). Measured on the real drafter: resident 760.8 MB, peak over before 1712.4 MB; the formula is
+  never under either, within 0.04%.
+- **A request bills the MTP head only when it runs MTP** (`requestBillsMtpHead`, the `requestSpecModes` verdict): a
+  DFlash2 request never builds the head's cache, state or QSA ring. `enable_drafter:false` hands the request back to MTP
+  and bills the head. The head weights and coarse lm_head stay billed at load for that hand-back. The load-time and
+  auto-context bills (`mtpHeadDefaultOn`, `sessionBytesPerToken`) drop the head terms when Qwen's default round is DFlash2.
+- **The cold-load gate stamps the drafter's request terms before reading the serving bill** (`coldServingBillBytes`), the
+  same config the load preflight reads after `stampDflashRequestTerms`; unstamped, the gate missed the DFlash2 per-request
+  term (0.48 GB at chunk 4096).
 - Qwen drops disabled native MTP tensors before the transformer binds them. An auto context bills no context term: it
   is pinned after the load from what the weights leave. Their default KV remains affine 8-bit.
 - An explicit launch or model-settings context is checked before loading resident Sushi Qwen and MiMo EXL3 packs.
@@ -60,7 +103,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   carry the same numeric diagnostic; generation error mapping consumes the slot's diagnostic on its connection
   thread so it cannot leak into another request.
 - **A streamed load bills what it holds** (`streamedLoadRequirementBytes`): resident trunk, MTP and vision + the expert
-  cache + the whole-layer fill union + the bounce buffers + the net; `expertCacheFitForLoad` separately proves the
+  cache + the whole-layer fill union + the bounce buffers + the MLX pool's decode cap (DeepSeek, `ModelConfig.expertPoolBytes`, 1 GiB) + the net; `expertCacheFitForLoad` separately proves the
   planned KV against the wired limit. GLM allocates KV row by row per request, so its load bill carries no context
   term; request admission bills it.
 - GLM evicts its hot cache to admit (`admissionEvictsHotCache`), and its context sizer reserves no cache. With the
@@ -75,9 +118,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - **The kernel unwires a freed Metal buffer asynchronously** (~0.5 s for 50 GB): an unload and an eviction-before-load
   wait until most of the freed bytes left the wired set (`waitForUnwire`, bounded at 3 s), or the next preflight reads
   them as taken (45 GB free where 95 GB was a moment later).
-- **A separately loaded MTP sidecar is billed beside the shards** (`mtpSidecarBytes`, at its file size, only when MTP is on and
-  `loadMtp` will read it): in the plain bill and in the Sushi bill, where its coarse rerank copy follows. A head in the checkpoint
-  is already in the shard bill and adds nothing; MiMo and GLM never call `loadMtp`.
+- **An MTP head rides the checkpoint's shards**: the bill adds nothing for it beyond the coarse rerank copy.
 - A ready entry's `bytes_resident` (the registry's resident-memory gate, `/v1/models`) is the weights the preflight
   billed (`residentWeightBytes`): a boot `--model` entry has no discovery `bytes_on_disk`, so it measures the shards.
 - **A resident Sushi Qwen or MiMo cold load reserves its load preflight's own requirement** (`residentColdLoadBillBytes`:
@@ -161,8 +202,8 @@ Other expert layouts of these archs bill the same terms; their warmup is not mea
   drains it before the next, so a larger permit buys no speed and on a small Mac crowds macOS's share of RAM.
 - The ungated hot-cache ask is zero when RAM retention is off, `--prefix-cache-entries 0`, or the model's hot cache
   never loads (`HotPrefixCache.shouldUse`); otherwise it is `--prefix-cache-mem`.
-- A per-request arch (`perRequestPrefillChunk`: qwen4_exp, the ringed mimo_v2, glm5_next) prefills every request
-  from its start width (`prefillStartWidth`: 4096, 2048, 2048; an explicit `--prefill-chunk` sets it instead). Each
+- A per-request arch (`perRequestPrefillChunk`: qwen4_exp, the ringed mimo_v2, glm5_next, deepseek_v41) prefills every
+  request from its start width (`prefillStartWidth`: 4096, 2048, 2048, 2048; an explicit `--prefill-chunk` sets it instead). Each
   chunk boundary steps down a rung, never up again, only where the next chunk's cost no longer fits the live
   headroom beside the KV (`adaptivePrefillWidth`). Admission bills the request's top at the widest rung whose whole
   bill fits (`chooseRequestPrefillChunk`), so a long prompt is never under-billed; the load-time pin is only the
@@ -275,17 +316,15 @@ checkpoints captured) the request peaked 105 MB above a run with the SSD tier of
 The README's 64 GB `--ctx-size` values are checked with the engine's own full-context admission bill
 (`prefillNeededAtChunk` through the per-request ladder) at a 59,000 MB ceiling: a prompt that fills the context, MTP
 on, `--mtp-head-kv-quant`, the 1 GiB hot cache pinned (not evictable). No live boot: the wired limit has only test
-seams (`wired_limit_mb_override`, `static_ceiling_override`), so the bill was computed in a scratch test at `ad5e6be8`.
-The rows below are re-derived for the checkpoint release: the bill at the same width less 13 checkpoints (912 MiB at
-bf16), the largest admitted by the same scratch (2000-token steps, 32000 new tokens) with the SSD tier on. The widths
-are not re-picked.
+seams (`wired_limit_mb_override`, `static_ceiling_override`), so the bill is computed in a scratch test: here at `ed8fe174`,
+`--qwen-gdn 16`, the SSD tier on, the largest admitted in 2000-token steps with 32000 new tokens, and
+available = 59,000 MB less the pack's 49,784,531,962 resident bytes (trunk, vision tower, MTP head and its rerank copy)
+less the hot cache.
 
 | pack, KV | `--ctx-size` | bill (MiB) | width | available (MiB) | weights + bill (GiB) | largest admitted |
 |---|---:|---:|---:|---:|---:|---:|
-| Sushi-2.6bpw, kv8 | 250000 | 10954 | 4096 | 12975 | 54.6 | 516000 |
-| Sushi-2.6bpw, kv4 | 450000 | 11807 | 4096 | 12975 | 55.5 | 862000 |
-| Sushi-3bpw, kv8 | 128000 | 6417 | 2048 | 7463 | 55.6 | 242000 |
-| Sushi-3bpw, kv4 | 248000 | 6075 | 1024 | 7463 | 55.3 | 398000 |
+| Sushi-STQ-2.75bpw, kv8 | 250000 | 9135 | 2048 | 10497 | 55.3 | 392000 |
+| Sushi-STQ-2.75bpw, kv4 | 450000 | 10004 | 2048 | 10497 | 56.1 | 654000 |
 
 The 48 GB recipe is the same check at a 43,000 MB ceiling (probe at `eab60060`, weights 37,552,413,730 bytes):
 
@@ -318,6 +357,15 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
   and the scheduler's `admissionPassArmed` read that one predicate), crediting only
   provably reclaimable bytes; `PrefillDoesNotFit` → 400 by name. A warm share that does not fit is first taken
   over (`checkoutRestored`: its append donates, so the restored rows are not billed twice).
+- **A prompt that does not fit unloads idle resident models before it is refused** (`fitAfterUnloadingIdle`,
+  `Scheduler.unloadLruIdleModel`): least recently used first, re-billed after each, never the request's own model and
+  never one a request holds; the connection thread asks, the inference thread frees.
+- **DeepSeek STQ bills a request's state, not its prefill working set**: the working set comes out of decoder-layer
+  expert pools each prefill forward releases when its need passes the live headroom, refused before anything is released
+  where the pools cannot cover it; its transient cap (`Config.chunkCap`, the pool inside it) is that working set; admission bills that term only past the lendable bytes, plus a decode forward's
+  working set and the decode pool parked in MLX's cache (1 GiB, outside the active bytes admission reads; counted once, in the bill, and taken off the live headroom), and SSD-first its restore points' in-flight bytes ([dsv41-memory](dsv41-memory.md#borrow)).
+- DeepSeek's resident bill (`dsv41_source.sumBytes`) is page-rounded per weight mapping: a tensor from 1 MiB, and a DSpark stage's nine ragged
+  regions each ([dsv41-memory](dsv41-memory.md#owned-weights)).
 - qwen4_exp bills a warm request AFTER its restore, so a disk-restored buffer is live memory at the bill. The SSD
   tier fills buffers the slot owns (`LookupResult.slot_owned`), so its rows are credited like a checkout's: the
   first append grows each layer and its old rows are freed at that layer's eval window, which is all the bill keeps
@@ -351,17 +399,27 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
   clear, both on `reservesKvCapacity`): the request-end clear runs before the slot is freed, so its KV parked there
   (MiMo: 1.6 GiB after a 128k request, 3.2 after 256k) and the next admission read it as spent.
 - MiMo MTP adds a constant per-request and load-time reserve (`mimo_mtp.State.billedBytes`) for all three sliding head KVs, retained hiddens, and catch-up/concatenation buffers; it is zero with MTP off and never scales with context.
-- **A vision encode is billed before it runs** (`towerFitFault`, `server.visionEncodeBill`): the largest block's tower
+- **A vision encode is billed before it runs** (`towerFitFault`, `server.visionEncodeBill`), for the blocks the prefix
+  restore leaves to encode, never the whole history: the largest block's tower
   scratch (`qwen_vision.encodeScratchBytes`, fitted >= 25% over the measured peak) plus every block's float32 pixels
   and three bf16 copies of its soft-token rows (group outputs, video concatenation, request concatenation); past what
   the GPU has left it is a named 400. The tower evaluates per block, so the peak is one block's f32 score sheet
   (heads x N^2) and rows; table in [qwen4-arch](qwen4-arch.md#vision-tower).
-- **A queued vision encode is billed again on the inference thread** (`runVisionEncode`, `vision_encode_available`),
-  right before the tower runs: a prefill's cache growth or an earlier encode's resident output may have taken the
-  headroom since the connection thread's check, and the refusal is that same named 400.
+- **A vision encode is checked on the inference thread** (`runVisionEncode`, `vision_encode_available`), right before
+  the tower runs and after the restore: a prefill's cache growth or an earlier encode's resident output may have taken
+  the headroom, and the refusal is a named 400 (`MediaRefused`).
 - **A streamed `--vision` load bills its tower in the ssd budget and proves its largest image beside it**: the load
   admits `budget + planned KV + largestImageEncodeBytes <= wired limit`; requests are still billed live as above
   ([engine-expert-streaming](engine-expert-streaming.md#vision)).
+- **Qwen's tower is billed as it is held**: the load requantizes the tower's big matrices to affine 8-bit
+  ([qwen4-arch](qwen4-arch.md#vision-tower)), so `indexedResidentSplit` bills 597,327,776 B, not the stored 897,862,112 B,
+  to a resident load and to a streamed `--vision` ledger alike (the rule is `qwen_vision.quantGroupAtLoad` on the shard headers).
+- **DeepSeek-V4.1's tower is billed in that term**: `dsv41_source.visionBytes` sums the pack's `vision.*`, `aligner.*`,
+  `image_*` and each layer's `bias_vl` as the load holds them (the 322 requantized matrices as affine 8-bit g128 codes, `dsv41_vision.quantizedBytes`, the rest bf16 as stored, plus 40 f32 biases of 1,536 bytes on an STQ pack), so the
+  `[expert-stream] ssd budget` line reads `vision 0.50 GB` by default (`0.00` under `--no-vision`, or with `vision: false`);
+  a load without the tower bills 0 and leaves those tensors unread. A request's encode is `dsv41_vision.encodeScratchBytes`
+  (activations of the widest block, the 512-query score sheet and the aligner, a bound for the 9,198 patches a 1024-token
+  span can hold) plus the f32 patches and three copies of the 5120-wide span rows.
 - **A video's block is ONE temporal group**, never the whole video: `forwardVideo` encodes and evaluates each group
   alone, so the bill grows linearly with the group count (the old N^2 over all groups billed 79 GB at 8x46x82).
   Measured peak (pixel upload to evaluated output) = one group's scratch + all pixels + the earlier groups' rows:
@@ -434,6 +492,16 @@ kept one descriptor per shard alive until evaluation, so the 566-shard affine pa
 exceeded macOS's default 256-handle terminal limit despite a successful memory
 preflight. The bounded reader also reports descriptor exhaustion separately from
 missing files. A 300-shard regression runs with a 128-descriptor soft limit.
+
+## Transient cap (billed for DeepSeek-V4.1)
+
+MLX can be capped on the bytes it allocates itself, imported weights left out
+([engine-mlx-gotchas](engine-mlx-gotchas.md#transient-cap)): no flag, off until a DeepSeek phase installs it. Each
+phase installs `active - imported + (its bill + the decode pool)` and the bill IS that cap: `Config.forwardCap` for a
+prefill chunk or a decode and verify forward, `visionEncodeBill` for an image encode
+([dsv41-memory](dsv41-memory.md#transient-caps)). A refused allocation fails the request as `TransientCapExceeded`,
+a named 503. The pool is inside the cap, so a prefill's pool is no separate bill. A request's end lifts it.
+`SUSHI_DSV41_TRANSIENT_PEAK=1` logs the peak per phase, which the caps were sized from.
 
 ## Observing memory
 

@@ -7,6 +7,7 @@ const model_mod = @import("model.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 pub const tokenizer = tokenizer_mod;
 pub const kld = kld_mod;
+pub const bench = bench_mod;
 pub const imatrix = @import("imatrix.zig");
 pub const transformer = transformer_mod;
 const transformer_mod = @import("transformer.zig");
@@ -26,6 +27,7 @@ const model_settings_mod = @import("model_settings.zig");
 const vision_mod = @import("vision.zig");
 const cli_mod = @import("cli.zig");
 const kld_mod = @import("kld.zig");
+const bench_mod = @import("bench.zig");
 const encoder_cli = @import("sushi_encoder").cli;
 const launch_mod = @import("launch.zig");
 pub const log = @import("log.zig");
@@ -125,6 +127,9 @@ fn printUsage(io: std.Io) void {
         \\                      every greedy position), or teacher-force one
         \\                      through a model and report KLD / top-1 / NLL.
         \\                      `sushi kld --help` for options
+        \\  bench               Drive a running server through the release bench
+        \\                      (tests/bench.sh boots it and takes the box rules).
+        \\                      `sushi bench --help` for options
         \\  convert exl3        Convert a Qwen3.8-Flash-Next, MiMo-V2.6-Flash or
         \\                      GLM-5.3-Flash source checkpoint into a Sushi pack
         \\                      (routed experts as EXL3). `sushi convert --help`
@@ -176,8 +181,11 @@ fn printUsage(io: std.Io) void {
         \\                      span (default 0 = off). Request think_penalty > this
         \\                      flag > model-settings.json
         \\  --no-vision         Disable vision encoder (saves memory)
+        \\  --vision-bf16       Keep a bf16 vision tower as stored instead of requantizing
+        \\                      it to affine 8-bit at load (more memory, exact tower)
         \\  --vision            Load the vision tower on an SSD-streamed load too (off by
-        \\                      default there: its weights come out of the expert cache)
+        \\                      default there, except for DeepSeek-V4.1: its weights
+        \\                      come out of the expert cache)
         \\  --no-prevent-sleep  Allow Mac idle sleep during inference and model
         \\                      loads. Display sleep is always allowed.
         \\  --skip-mem-preflight  Bypass the model-load free-RAM pre-flight that
@@ -190,7 +198,8 @@ fn printUsage(io: std.Io) void {
         \\  --no-mtp-lookup     Turn off the prompt-lookup drafts inside MTP
         \\                        rounds and GLM DFlash2 (default: ON).
         \\  --no-mtp            Disable the native MTP head. Qwen and MiMo load it
-        \\                        and run it by default; GLM's stays off.
+        \\                        and run it by default; GLM's stays off. On
+        \\                        DeepSeek-V4.1 it turns DSpark off.
         \\  --mtp               Force the MTP head ON. Qwen and MiMo run it by
         \\                        default, GLM does not; an SSD-streamed pack
         \\                        that cannot stream its head refuses --mtp.
@@ -216,7 +225,10 @@ fn printUsage(io: std.Io) void {
         \\  --mtp-min-depth <n> Fewest tokens an MTP round drafts, 1..8
         \\                        (default 1). Every depth the planner picks
         \\                        stays inside --mtp-min-depth..--mtp-max-depth;
-        \\                        equal values pin one depth.
+        \\                        equal values pin one depth. DeepSeek-V4.1:
+        \\                        DSpark verifies depth + 1 rows (its block
+        \\                        is 5 drafts); a min above 1 never takes a
+        \\                        plain step.
         \\  --mtp-max-depth <n> Most tokens an MTP round drafts, 1..8 (default:
         \\                        adaptive — the EV controller plans depth
         \\                        per round up to 8 on eligible M5 NAX targets,
@@ -252,9 +264,17 @@ fn printUsage(io: std.Io) void {
         \\                      every cache checkpoint (about 54 MB each on
         \\                      Flash-Next) to save memory on smaller machines.
         \\                      No effect on GLM or MiMo, which have no GDN arm.
+        \\  --drop-expert <n>   DeepSeek-V4.1 only: never load or pick the n least-used
+        \\                      routed experts of every layer, ranked by the pack's
+        \\                      expert_usage.json (n a multiple of 8; default 0 =
+        \\                      off). A token's pick moves to its next-best expert;
+        \\                      the memory bill shrinks by the dropped bytes. Answers
+        \\                      change, so score it with `sushi kld compare`.
         \\  --kv-quant <mode>   KV-cache quantization scheme:
         \\                        8, 6 or 4 — affine group quant; default 8 on
-        \\                          every model (GLM refuses 4). 16 (or `off`)
+        \\                          every model but DeepSeek-V4.1, which has no
+        \\                          KV cache and refuses the flag (GLM refuses
+        \\                          4). 16 (or `off`)
         \\                          keeps dense bf16 KV. It outranks a
         \\                          model's model-settings.json `kv_quant`.
         \\                          Per-request override via the `kv_quant`
@@ -271,8 +291,8 @@ fn printUsage(io: std.Io) void {
         \\                        any value (default: 1).
         \\  --prefill-decode-share <s>
         \\                      Target decode wall-time share during another
-        \\                        request's prefill (0..0.9); narrows chunks too.
-        \\                        Default 0.
+        \\                        request's prefill (0..0.9); never narrows
+        \\                        chunks. Default 0.25.
         \\  --prefix-cache-entries <n>
         \\                      Hot prefix cache LRU capacity in entries
         \\                        (default: 32). 0 disables all prefix reuse.
@@ -292,12 +312,14 @@ fn printUsage(io: std.Io) void {
         \\                        across restarts instead of recomputed. 0/off
         \\                        disables.
         \\  --ssm-checkpoint-max <n>
-        \\                      Cap on SSM checkpoints retained per cache entry
-        \\                        (default: 16). The first and the newest
-        \\                        positions are always kept; beyond the cap the
+        \\                      Cap on SSM checkpoint states held in memory per
+        \\                        cache entry (default: 16). The first and the
+        \\                        newest are always kept; beyond the cap the
         \\                        interior is thinned. 0 = unlimited, bounded only
-        \\                        by the prefix cache's byte budget. With an SSD
-        \\                        tier Qwen holds only the newest in RAM.
+        \\                        by the prefix cache's byte budget. It never
+        \\                        thins the restore points on SSD, which keep
+        \\                        every 8192 tokens and each prompt's end
+        \\                        (--prefix-cache-disk sizes them).
         \\  --wired-margin-gib <n>
         \\                      How far under iogpu.wired_limit_mb a plan may
         \\                        reach (default: 1, integers 1..32).
@@ -421,6 +443,7 @@ pub fn main(init: std.process.Init) !void {
     // launch flags. See server.mlxCacheLimitBytes for why MLX's own default
     // (~121 GB on a 128 GB Mac) is no defense.
     server_mod.applyMlxCacheLimit();
+    server_mod.resolveMlxCadence();
     // Resolve lazily-cached env reads on the main thread before other threads exist.
     @import("transformer.zig").warmQsaEnvCaches();
 
@@ -506,6 +529,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, cmd, "kld")) {
             try kld_mod.cmdKld(allocator, io, args[2..]);
             return;
+        } else if (std.mem.eql(u8, cmd, "bench")) {
+            try bench_mod.cmdBench(allocator, io, args[2..]);
+            return;
         } else if (std.mem.eql(u8, cmd, "convert")) {
             try encoder_cli.cmdConvert(allocator, io, args[2..]);
             return;
@@ -513,7 +539,7 @@ pub fn main(init: std.process.Init) !void {
             try update_mod.cmdUpdate(allocator, io, args[2..]);
             return;
         } else {
-            log.err("unknown command '{s}' (expected run, pull, list, launch, kld, convert, update, or serve)\n", .{cmd});
+            log.err("unknown command '{s}' (expected run, pull, list, launch, kld, bench, convert, update, or serve)\n", .{cmd});
             std.process.exit(1);
         }
     }
@@ -615,7 +641,7 @@ pub fn main(init: std.process.Init) !void {
             return;
         } else if (std.mem.eql(u8, args[i], "--model") and i + 1 < args.len) {
             i += 1;
-            model_dir = args[i];
+            model_dir = cli_mod.resolveRelativeDir(allocator, io, args[i]) orelse args[i];
         } else if (std.mem.eql(u8, args[i], "--port") and i + 1 < args.len) {
             i += 1;
             port_flag = flagInt(u16, "--port", args[i], 0);
@@ -688,6 +714,8 @@ pub fn main(init: std.process.Init) !void {
             no_vision = true;
         } else if (std.mem.eql(u8, args[i], "--vision")) {
             vision = true;
+        } else if (std.mem.eql(u8, args[i], "--vision-bf16")) {
+            @import("vision_common.zig").vision_bf16 = true;
         } else if (std.mem.eql(u8, args[i], "--no-prevent-sleep")) {
             sleep_inhibit_mod.setEnabled(false);
         } else if (std.mem.eql(u8, args[i], "--skip-mem-preflight")) {
@@ -907,6 +935,12 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             model_mod.qwen_gdn_f32 = model_mod.parseQwenGdn(args[i]) orelse {
                 log.err("--qwen-gdn: expected 32 or 16; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, args[i], "--drop-expert") and i + 1 < args.len) {
+            i += 1;
+            model_mod.drop_expert = @import("expert_usage.zig").parseCount(args[i]) orelse {
+                log.err("--drop-expert: expected a multiple of 8 routed experts per layer (0 = off); got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
         } else if (std.mem.eql(u8, args[i], "--kv-quant") and i + 1 < args.len) {
@@ -1357,6 +1391,7 @@ pub fn main(init: std.process.Init) !void {
         else blk: {
             var dev = mlx.mlx_device{ .ctx = null };
             _ = mlx.mlx_get_default_device(&dev);
+            defer _ = mlx.mlx_device_free(dev);
             var info = mlx.mlx_device_info_new();
             defer _ = mlx.mlx_device_info_free(info);
             if (mlx.mlx_device_info_get(&info, dev) != 0) break :blk 0;
@@ -1469,7 +1504,7 @@ pub fn main(init: std.process.Init) !void {
         // Honor --kv-quant in offline mode too. The serve path threads this
         // through Slot caches via the scheduler; here we swap the
         // Transformer's own legacy cache to match.
-        const kv_cache = transformer_mod.KvCacheChoice.resolve(config.kv_quant_override, kv_quant_config, kv_quant_explicit);
+        const kv_cache = server_mod.kvCacheForLaunch(config, kv_quant_config, kv_quant_explicit);
         log.info("[kv-cache] {s} ({s})\n", .{ kv_cache.label(), kv_cache.sourceName() });
         const mtp_choice = scheduler_mod.mtpChoiceFor(enable_mtp, mtp_explicit, config);
         log.info("[mtp] {s} ({s})\n", .{ mtp_choice.label(), mtp_choice.sourceName() });
@@ -1493,25 +1528,6 @@ pub fn main(init: std.process.Init) !void {
             xfm.compileGdnGate();
         }
         log.info("Model ready.\n", .{});
-
-        // Qwen native MTP head — auto-load when the model ships one (sidecar
-        // file or in-checkpoint tensors in the trunk shards).
-        var mtp_head: ?mtp_mod.MtpModel = null;
-        defer if (mtp_head) |*h| h.deinit();
-        if (mtp_choice.on and mtp_mod.hasMtpHead(io, allocator, model_dir)) {
-            // A failed load (e.g. a sidecar layout we can't bind yet) only
-            // disables the head — mirrors the serve path's graceful degrade.
-            if (mtp_mod.loadMtp(io, allocator, xfm.s, model_dir)) |loaded| {
-                mtp_head = loaded;
-                mtp_head.?.bind(&xfm) catch |err| {
-                    log.warn("[mtp] sidecar incompatible with target ({any}) — disabled\n", .{err});
-                    mtp_head.?.deinit();
-                    mtp_head = null;
-                };
-            } else |err| {
-                log.warn("[mtp] failed to load sidecar ({any}) — disabled\n", .{err});
-            }
-        }
 
         const user_prompt = prompt orelse "What is 2+2? Answer in one sentence.";
         const messages = [_]chat_mod.Message{
@@ -1568,10 +1584,7 @@ pub fn main(init: std.process.Init) !void {
             try stdout_w.print("Generation: {d} tokens, {d:.3} tokens-per-sec\n", .{ completion_tokens, decode_tps });
         } else {
             // Non-streaming: generate all tokens then print
-            const result = if (mtp_head) |*h|
-                try generate_mod.generateMtp(io, allocator, &xfm, h, tok, prompt_ids, max_tokens, sampling, eos_slice, 0, depth_bounds.active.max, null)
-            else
-                try generate_mod.generate(io, allocator, &xfm, tok, prompt_ids, max_tokens, sampling, eos_slice, 0, 0);
+            const result = try generate_mod.generate(io, allocator, &xfm, tok, prompt_ids, max_tokens, sampling, eos_slice, 0, 0);
             defer allocator.free(result.text);
             defer allocator.free(result.token_ids);
 
@@ -1598,6 +1611,7 @@ fn autoResidentMemBytes(explicit: bool, val: u64) u64 {
     if (explicit) return val;
     var dev = mlx.mlx_device{ .ctx = null };
     _ = mlx.mlx_get_default_device(&dev);
+    defer _ = mlx.mlx_device_free(dev);
     var info = mlx.mlx_device_info_new();
     defer _ = mlx.mlx_device_info_free(info);
     if (mlx.mlx_device_info_get(&info, dev) != 0) return 0;

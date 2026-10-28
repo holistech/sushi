@@ -21,6 +21,7 @@ test {
     _ = @import("imatrix.zig");
     _ = @import("hidden_capture.zig");
     _ = @import("expert_quant.zig");
+    _ = @import("expert_usage.zig");
     _ = @import("log.zig");
     _ = @import("version.zig");
     _ = @import("chat.zig");
@@ -37,6 +38,7 @@ test {
     _ = @import("vision_common.zig");
     _ = @import("mimo_vision.zig");
     _ = @import("glm5_vision.zig");
+    _ = @import("dsv41_vision.zig");
     _ = @import("mrope.zig");
     _ = @import("regex.zig");
     _ = @import("json_schema.zig");
@@ -48,7 +50,11 @@ test {
     _ = @import("think_penalty.zig");
     _ = @import("kv_quant.zig");
     _ = @import("model_settings.zig");
+    _ = @import("spec_cost_gate.zig");
+    _ = @import("dspark_rows.zig");
+    _ = @import("row_grammar.zig");
     _ = @import("dflash.zig");
+    _ = @import("dflash_policy.zig");
     _ = @import("dflash_conv.zig");
     _ = @import("dflash_qmv.zig");
     _ = @import("mtp.zig");
@@ -56,10 +62,12 @@ test {
     _ = @import("mimo_mtp.zig");
     _ = @import("mtp_dense_rows.zig");
     _ = @import("round_cost.zig");
+    _ = @import("spec_cost_gate.zig");
     _ = @import("mtp_group_planner.zig");
     _ = @import("mtp_depth_bounds.zig");
     _ = @import("qwen4_exp.zig");
     _ = @import("tokenizer.zig");
+    _ = @import("tokenizer_deepseek.zig");
     _ = @import("tokenize_cache.zig");
     _ = @import("prefix_cache.zig");
     _ = @import("restore_dump.zig");
@@ -72,6 +80,17 @@ test {
     _ = @import("kv_disk_writer.zig");
     _ = @import("model_discovery.zig");
     _ = @import("mimo_source.zig");
+    _ = @import("dsv41_config.zig");
+    _ = @import("dsv41_qat.zig");
+    _ = @import("dsv41_engram.zig");
+    _ = @import("dsv41_embed.zig");
+    _ = @import("dsv41_source.zig");
+    _ = @import("dsv41_owned.zig");
+    _ = @import("dsv41_model.zig");
+    _ = @import("dsv41_stream.zig");
+    _ = @import("dsv41_borrow.zig");
+    _ = @import("dsv41_prefix.zig");
+    _ = @import("dsv41_kernels.zig");
     _ = @import("glm5_next.zig");
     _ = @import("glm5_model.zig");
     _ = @import("glm5_trunk_cov.zig");
@@ -84,6 +103,7 @@ test {
     _ = @import("glm5_router.zig");
     _ = @import("glm5_activation.zig");
     _ = @import("glm5_shared.zig");
+    _ = @import("qwen4_shared.zig");
     _ = @import("glm5_kda_project.zig");
     _ = @import("glm5_dflash_tree.zig");
     _ = @import("glm5_dflash_topk.zig");
@@ -112,6 +132,8 @@ test {
     _ = @import("model_registry.zig");
     _ = @import("scheduler.zig");
     _ = @import("kld.zig");
+    _ = @import("bench.zig");
+    _ = @import("gpu_clock.zig");
     _ = @import("cli.zig");
     _ = @import("repl_tools.zig");
     _ = @import("repl_input.zig");

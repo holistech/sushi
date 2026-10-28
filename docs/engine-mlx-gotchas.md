@@ -12,13 +12,35 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
 Sushi follows mlx-serve's MLX0.32.3 pin `64ea011c` and mlx-c `56b2d39`.
 The C wrapper patch supplies the new optional global-scale argument in its
 C++ `gather_qmm` call; the C ABI stays unchanged. The build stamp includes
-both source revisions and the patch hash. `tests/test_mlx_staged_nax.sh`
+both source revisions and the hash of every patch. `tests/test_mlx_staged_nax.sh`
 checks those fields against the source, along with NAX symbols and min-OS.
 An older staged library can load successfully while retaining a sorted-row
 overflow bug above32K; library presence alone does not qualify the runtime.
 Sorted `gather_qmm` requires ascending expert IDs in that bank's own ID space.
 After slab remapping, sort each reference arm separately and invert its output
 permutation before comparing bytes; grouping by the other arm's IDs is invalid.
+
+<a id="transient-cap"></a>
+## The transient cap patch
+
+`patches/mlx-transient-cap.patch` (mlx) and `patches/mlxc-transient-cap.patch` (mlx-c C ABI) are applied by
+`build-mlx.sh`; the stamp's `patch=` hashes all three patches. Stock `MetalAllocator` counts an imported (no-copy)
+buffer in `active_memory_`, `malloc` never refuses and `set_memory_limit` only throttles eval, so nothing could bound
+what MLX allocates itself (graph intermediates, custom-kernel outputs, the freed-buffer pool).
+- `external_memory_` is the imported bytes (`make_buffer` adds, `release` subtracts); transient = active - external.
+- `mlx_set_transient_limit` (0 = off, the default): a new buffer (not a pool hit) whose transient + pool + size passes
+  it first trims the pool by the excess, then throws `std::runtime_error` starting `[mlx-transient-cap]`.
+- `mlx_get_transient_peak` / `mlx_reset_transient_peak`: high-water of transient; a reset restarts it at the current level.
+- The throw is an ordinary MLX exception: mlx-c turns it into the latch, `mlx.checkError` raises
+  `error.TransientCapExceeded` (a 503 naming the cap, not the memory 503) and `settledErrorName` consumes it. After a
+  refusal drain the stream (`mlx_synchronize`) and clear the latch before the next op; the failed array stays valid and
+  evaluates once there is room.
+- A primitive allocates its outputs in `eval_gpu`/`eval_cpu` on the evaluating thread inside `eval_impl`, whose catch
+  flushes the open streams before it rethrows, so the throw unwinds.
+- The limit is absolute and the peak is too, so a phase installs `active - external + its bill` at its start
+  (`dsv41_borrow`, [dsv41-memory](dsv41-memory.md#transient-caps)); a cap is judged against a peak less the state it started from.
+- `SUSHI_DSV41_TRANSIENT_PEAK=1` logs `[transient-peak]` per DeepSeek phase (decode, DSpark draft/verify, prefill chunk,
+  vision encode). Guards: the `transient cap` tests in `mlx.zig`.
 
 ## The one MLX thread
 
@@ -32,6 +54,9 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
   latched error never 200s; streaming shares `mapGenerationError`.
 - A swallowed failure must DROP the latch it raised (`dropLatchedErrorUnless(had_error)`, passing the
   `errorPending()` read BEFORE the op). Guard: `tests/test_mlx_error_recovery.sh`.
+- **A failure caught as `error.MlxError` leaves the latch SET**: the next request's first `checkError` consumed it and
+  failed at once as `OutOfMemory`. Name it with `mlx.settledErrorName(err)` where it is caught: that consumes the latch
+  and reports a Metal out-of-memory behind it as one.
 - A client-supplied PATH is proven on OUR side of the mlx boundary (stat → 400; an MLX error there latches).
 - In the unit-test binary a failing test's MLX error stays latched for the next test: a decode tick consumes it and
   errors its slot. A test that runs a tick asserts `!mlx.errorPending()` first.
@@ -48,6 +73,12 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
 - **MLX binds a `metal_kernel` input of fewer than 8 elements in the `constant` address space**: a kernel source never
   declares `const device T*` from an input (`auto p = in + off`); the FP8 tile kernel's scales did, and a tiny linear
   failed to build at 9..128 rows. Guard: the fp8_block small-scales test.
+- **Every template arg value is its own Metal library, compiled on the inference thread at first eval (tens of ms)**:
+  MLX keys a `metal_kernel` library by name, source, template args, each input's dtype and binding (scalar, `constant`
+  under 8 elements, device) and output dtypes. A row count, pick count, split count or context width never rides a
+  template arg: read it from `threads_per_grid`, an input's `_shape`, or a small input buffer. DeepSeek's index top-k
+  width and packed-KV row counts did, and decode below 512 tokens of context compiled a library every token (the
+  "slow state"). `SUSHI_KERNEL_BUILD_LOG=1` logs each new key; guard: the `dsv41 kernels:` zero-new-library tests.
 
 ## Laziness and barriers
 
@@ -117,3 +148,6 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
 - The cased `llama3` grammar needs `\p{Lu}` in the Split regex: contractions plus `\p{N}{1,3}` is also GLM's plain
   Llama-3 pattern, which is the gpt2 path with `.letters` word rules and 3-digit groups. The BPE `ignore_merges` flag
   (GLM sets it) is honoured in `bpeMerge`. The parity script covers GLM, Qwen and MiMo on code and tool-call text.
+- DeepSeek's `Scope.out` handle belongs to the caller: a `block` result chained through a loop in a scope must be
+  adopted with `sc.keep` or it leaks every iteration (the DSpark draft leaked its stage outputs per round). Guard: the
+  `DSpark requests leave the MLX active memory flat` test in `generate.zig`.
