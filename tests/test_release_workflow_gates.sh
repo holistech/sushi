@@ -1,4 +1,5 @@
 #!/bin/bash
+# sushi-test: tier=hermetic
 # Static guard for .github/workflows/release.yml event gating.
 #
 # The release workflow doubles as (1) the tag/dispatch RELEASE pipeline and
@@ -9,6 +10,9 @@
 # Hermetic — parses the YAML, no network, no runners.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+# Exit 3 is run.sh's SKIP: the parse needs PyYAML, which a stock python3 lacks.
+python3 -c 'import yaml' 2> /dev/null || { echo "SKIP: needs PyYAML (python3 -m pip install pyyaml)"; exit 3; }
 
 python3 - <<'EOF'
 import os, re, sys, yaml
@@ -131,9 +135,9 @@ def sh(script, *args):
     return r.returncode, r.stdout.strip()
 
 zon = re.search(r'\.version\s*=\s*"([^"]*)"', open("build.zig.zon").read())
-# Between releases the version may carry `-dev`; release.sh and release.yml refuse it until the release step drops it.
-check(zon is not None and sh('is_semver "$1"', re.sub(r"-dev$", "", zon.group(1)))[0] == 0,
-      "build.zig.zon's version is MAJOR.MINOR.PATCH, or that plus -dev")
+# Between releases the version may carry `-dev` or `-devN`; release.sh and release.yml refuse it until the release step drops it.
+check(zon is not None and sh('is_semver "$1"', re.sub(r"-dev[0-9]*$", "", zon.group(1)))[0] == 0,
+      "build.zig.zon's version is MAJOR.MINOR.PATCH, or that plus -dev or -devN")
 
 with tempfile.TemporaryDirectory() as d:
     def release_version(heading, zon_version):
@@ -163,6 +167,11 @@ for tag, ok in (("1.0.0", True), ("1.0.0-pre-release.2", True), ("26.9.1", False
 # and for months they did not: the packaging path shipped the binary alone.
 for f in ("LICENSE-APACHE-2.0", "NOTICE"):
     check(f in wf_text, f"release.yml packages {f} into the CLI tarball")
+# ── sushibar ships beside sushi: copied, signed with the same identity (so the notarized zip covers it), verified.
+_pkg = str(steps.get("Package CLI binary", {}).get("run", ""))
+check(any(l.startswith("cp ") and "sushibar" in l for l in _pkg.splitlines()), "release.yml packages sushibar into the CLI tarball")
+check('--sign "$SIGNING_IDENTITY" "$STAGING/sushibar"' in _pkg, "release.yml signs sushibar like sushi")
+check('--verbose=2 "$STAGING/sushibar"' in _pkg, "release.yml verifies sushibar's signature")
 # ── A host that pins a release as its guest engine checks the tarball's sha256
 # and reads guest.json from inside it; both must ship with every release.
 package_run = str(steps.get("Package CLI binary", {}).get("run", ""))

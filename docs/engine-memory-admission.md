@@ -67,7 +67,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - **A declared `iogpu.wired_limit_mb` lifts the resident Sushi preflight's available figure to the same floor request admission reads** (`effectiveSushiAvailableBytes`: wired limit less `--wired-margin-gib`, less resident buffers, still under the working set). Free RAM alone read file cache and other apps' pages as gone and refused a 32 GB box whose declared limit admitted the load.
 - Preflight refusals → `InsufficientMemory` → 503 + entry reset to `.unloaded`. A refusal quotes the number it
   COMPARED (`loadRequirementBytes`) and the flag that would admit (`--wired-margin-gib`, `--skip-mem-preflight`,
-  `iogpu.wired_limit_mb`).
+  `iogpu.wired_limit_mb`). The client-facing preflight message also names the Settings switch "Skip the memory check
+  before loading", the twin of `--skip-mem-preflight` (`server.skip_mem_preflight`, read per load, flag > file > off).
 - **One bill, `loadRequirementBytes`**: the weights the loader bills (enabled tensors only: MTP head, vision tower,
   DFlash2 assistant and its runtime cache) + the larger of the arch's measured warmup transient plus a fixed 1 GiB net
   and the requested context's admission bill (the warmup ends before any request allocates). No proportional term,
@@ -114,11 +115,16 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   ([engine-prefix-cache](glm5-prefix-cache.md#glm)).
 - `modelDiskBytes` bills the shards the INDEX names; an index that names NO shard on disk is STALE (every shard
   loads, one warning). Every size sum stats THROUGH symlinks (HF-cache models).
-- Load-time bills run INSIDE `Scheduler.init` ([qwen4-qsa-long-context](qwen4-qsa-long-context.md)).
+- Load-time bills run in the load on the inference thread; the preflight's run before `Scheduler.init` returns, so a refusal ends a `--model` boot before it serves ([qwen4-qsa-long-context](qwen4-qsa-long-context.md), [server-lifecycle](server-lifecycle.md#startup)).
 - **The kernel unwires a freed Metal buffer asynchronously** (~0.5 s for 50 GB): an unload and an eviction-before-load
   wait until most of the freed bytes left the wired set (`waitForUnwire`, bounded at 3 s), or the next preflight reads
   them as taken (45 GB free where 95 GB was a moment later).
 - **An MTP head rides the checkpoint's shards**: the bill adds nothing for it beyond the coarse rerank copy.
+- **A Flash-Next trellis trunk is billed as stored**: `qwenResidentWeightBytes` sums the shard headers, so a trellis
+  projection's `trellis`, `suh` and `svh` replace the affine triple's bytes; stacked banks are held once (the stored
+  ones leave the weight map). A trellis lm_head (`ResidentSplit.stq_head`) builds no coarse rerank copy, so that term
+  leaves the Sushi bill; drafts read the head whole. A chunk past eight rows runs the sorted GEMM, whose prepared input
+  and f32 inner sum are transients of the prefill peak: not yet measured against the prefill bill.
 - A ready entry's `bytes_resident` (the registry's resident-memory gate, `/v1/models`) is the weights the preflight
   billed (`residentWeightBytes`): a boot `--model` entry has no discovery `bytes_on_disk`, so it measures the shards.
 - **A resident Sushi Qwen or MiMo cold load reserves its load preflight's own requirement** (`residentColdLoadBillBytes`:
@@ -264,7 +270,7 @@ envelope, the 512 MiB floor), and grows with the prompt: 330 MiB at 59k, 600 at 
 ### Checkpoints in the bill
 
 A Qwen request's GDN checkpoints are stored on the SSD tier once their file lands, so the bill counts the states the
-request holds, not the ones it captures (`server.ssmResidentCap`, `transformer.SSM_RESIDENT_MAX`):
+request holds, not the ones it captures (`server.ssmResidentCap`, `ssm_cache.SSM_RESIDENT_MAX`):
 
 | storage | held per request | why |
 |---|---:|---|
@@ -340,6 +346,8 @@ with the tier up the request holds 3 checkpoints ([above](#bill-checkpoints)). B
 24425 and 1080 more (the probe at `eab60060`, reproduced at 4b919abb). Its max-context column is the largest multiple of 8192 tokens whose
 weights + 512-rung bill + 256 MiB spare fits each wired limit, capped at 1M (kv8 and kv4); the 48 and 64 GB rows run at
 `--qwen-gdn 16`, the 96 and 128 GB rows at the f32 default.
+The Sushi-STQ-2.75bpw row (pack revision 2.0) is the 1.5.1 bill over its booted `active_bytes` (48,219,896,252); the
+other rows predate that bill and on today's code would read slightly more context (revision 1.0: 432k / 720k at 64 GB).
 
 The ladder widens the chunk until the bill nearly fills what is available, so the spare in a row is small by
 construction; "largest admitted" (2000-token steps) is where even the 512 rung stops fitting. The ceiling assumes
@@ -350,7 +358,7 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
 - One `[admission] needed=… available=… reclaimable=… width=… verdict=…` line per decision.
 - An explicit `--prefill-chunk N` caps the per-request ladder, never pins it: N if it fits, else the widest rung
   below N that fits, down to 512; refused only when that floor does not fit. `requestPrefillPick` is the one rule for
-  the bill and the scheduler, `generate.requestPrefillChunk` the width both run; the hot-cache clamp and a streamed
+  the bill and the scheduler, `prefill_plan.requestPrefillChunk` the width both run; the hot-cache clamp and a streamed
   load prove that floor (`perRequestFloorWidth`).
 - A long prefill evicts the hot cache on the INFERENCE thread to be admitted (`evictLruToAdmit`) on every arch where
   `admissionEvictsHotCache` holds (qwen4_exp and the ringed mimo_v2; the connection thread's `creditedAdmissionBill`
@@ -399,7 +407,7 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
   clear, both on `reservesKvCapacity`): the request-end clear runs before the slot is freed, so its KV parked there
   (MiMo: 1.6 GiB after a 128k request, 3.2 after 256k) and the next admission read it as spent.
 - MiMo MTP adds a constant per-request and load-time reserve (`mimo_mtp.State.billedBytes`) for all three sliding head KVs, retained hiddens, and catch-up/concatenation buffers; it is zero with MTP off and never scales with context.
-- **A vision encode is billed before it runs** (`towerFitFault`, `server.visionEncodeBill`), for the blocks the prefix
+- **A vision encode is billed before it runs** (`towerFitFault`, `request_media.visionEncodeBill`), for the blocks the prefix
   restore leaves to encode, never the whole history: the largest block's tower
   scratch (`qwen_vision.encodeScratchBytes`, fitted >= 25% over the measured peak) plus every block's float32 pixels
   and three bf16 copies of its soft-token rows (group outputs, video concatenation, request concatenation); past what

@@ -4,6 +4,7 @@ const build_options = @import("build_options");
 pub const mlx = @import("mlx.zig");
 pub const io_util = @import("io_util.zig");
 const model_mod = @import("model.zig");
+const effort_mod = @import("effort.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 pub const tokenizer = tokenizer_mod;
 pub const kld = kld_mod;
@@ -22,20 +23,24 @@ const dflash_mod = @import("dflash.zig");
 const chat_mod = @import("chat.zig");
 const server_mod = @import("server.zig");
 const scheduler_mod = @import("scheduler.zig");
+const model_load = @import("model_load.zig");
 const expert_stream_mod = @import("expert_stream.zig");
 const model_settings_mod = @import("model_settings.zig");
 const vision_mod = @import("vision.zig");
 const cli_mod = @import("cli.zig");
 const kld_mod = @import("kld.zig");
+const pack_cmds = @import("dsv41/commands.zig");
 const bench_mod = @import("bench.zig");
 const encoder_cli = @import("sushi_encoder").cli;
 const launch_mod = @import("launch.zig");
 pub const log = @import("log.zig");
 const metrics_mod = @import("metrics.zig");
+const metrics_history = @import("metrics_history.zig");
 const sleep_inhibit_mod = @import("sleep_inhibit.zig");
 const version_mod = @import("version.zig");
 const parent_watch = @import("parent_watch.zig");
 const update_mod = @import("update.zig");
+const sampler = @import("sampler.zig");
 const chip_mod = @import("chip.zig");
 
 pub const VERSION: []const u8 = build_options.version;
@@ -80,7 +85,7 @@ var prompt_client: ?*PromptClient = null;
 
 fn printUsage(io: std.Io) void {
     var stdout_buf: [4096]u8 = undefined;
-    var stdout_w = std.Io.File.stdout().writer(io, &stdout_buf);
+    var stdout_w = std.Io.File.stdout().writerStreaming(io, &stdout_buf);
     stdout_w.interface.writeAll(
         \\sushi — MLX inference server for Apple Silicon
         \\
@@ -120,20 +125,35 @@ fn printUsage(io: std.Io) void {
         \\  serve               Start the server over ~/.sushi/models
         \\                      (every pulled model loads on demand by name)
         \\  launch <agent>      Configure + launch a coding agent CLI against the
-        \\                      local server (claude, pi, omp, opencode, codex,
-        \\                      hermes, aider, zcode, grok). `sushi launch <agent> -h`
+        \\                      local server (claude, pi, omp, opencode, dsh,
+        \\                      codex, hermes, aider, zcode, grok). `sushi launch <agent> -h`
         \\                      for options
         \\  kld capture|compare Write a teacher fixture (full-vocab logits at
         \\                      every greedy position), or teacher-force one
         \\                      through a model and report KLD / top-1 / NLL.
         \\                      `sushi kld --help` for options
-        \\  bench               Drive a running server through the release bench
-        \\                      (tests/bench.sh boots it and takes the box rules).
+        \\  bench               Bench a model in this process (--model <dir>), or
+        \\                      drive a running server (--url; tests/bench.sh boots
+        \\                      it and takes the box rules).
         \\                      `sushi bench --help` for options
         \\  convert exl3        Convert a Qwen3.8-Flash-Next, MiMo-V2.6-Flash or
         \\                      GLM-5.3-Flash source checkpoint into a Sushi pack
         \\                      (routed experts as EXL3). `sushi convert --help`
         \\                      for options
+        \\  repack <pack>       Rewrite an STQ pack in place into the
+        \\                      pair-major layout. A shard is replaced only after
+        \\                      its rewrite reads back equal; a cut-off run
+        \\                      resumes when repeated. Stop any server using the
+        \\                      pack first. Never downloads. Options:
+        \\                      --pack-revision <id>  stamp the pack with a
+        \\                        revision (config.json and every shard header)
+        \\                      --shards <name-or-glob>  stamp only these shards
+        \\                        (repeatable; a pattern matching nothing is
+        \\                        refused)
+        \\                      --unstamped <shard>  leave this shard without a
+        \\                        stamp (repeatable; a symlinked shard needs it)
+        \\                      --check  read only: every shard not unstamped
+        \\                        carries the config's revision
         \\  update              Replace this install with the newest release,
         \\                      after checking its SHA-256, its signature and
         \\                      that it runs; the old one stays as
@@ -146,7 +166,8 @@ fn printUsage(io: std.Io) void {
         \\  --serve             Start HTTP server mode
         \\  --host <ip>         Bind address (default: 127.0.0.1 — this Mac only;
         \\                      0.0.0.0 opens it to the local network)
-        \\  --port <n>          Bind port (default: 12345)
+        \\  --port <n>          Bind port (default: 12345, or `server.port` in
+        \\                        ~/.sushi/model-settings.json)
         \\  --ctx-size <n>      Maximum context length (default: model max)
         \\  --config-overrides <json>   JSON object deep-merged into EVERY
         \\                      model's config.json this process loads or
@@ -171,7 +192,6 @@ fn printUsage(io: std.Io) void {
         \\  --timeout <n>       Stall timeout in seconds: abort a request after n seconds
         \\                      WITHOUT producing a token (default: 300, 0=none). A request
         \\                      that keeps generating never times out, however long it runs.
-        \\  --reasoning-budget <n>  Max thinking tokens per request (default: unlimited)
         \\  --preserve-thinking on|off  Templates that read `preserve_thinking` (Qwen3.8)
         \\                      keep every turn's thinking (on, the template default)
         \\                      or only the latest user turn's (off). Request
@@ -336,6 +356,13 @@ fn printUsage(io: std.Io) void {
         \\                        TOTAL resident target of <n> GiB; the expert
         \\                        cache is what is left after the trunk, the
         \\                        prefill union and the fill buffers.
+        \\  --ssd-prefetch <n>  Streamed-expert prefetch read cap (default: 0, off).
+        \\                        The share, in percent (0..100), of this Mac's SSD
+        \\                        read rate (measured at load) that the expert
+        \\                        reads of a streamed load may use, the reads a
+        \\                        route waits for and the prefetch's together.
+        \\                        0 = no prefetch; 65 is the tuned cap on a fast
+        \\                        SSD; lower it to leave the SSD to other programs.
         \\  --model-dir <dir>   Directory of MLX models to discover at startup.
         \\                        Discovered siblings appear in /v1/models and
         \\                        can be loaded on-demand via /v1/load-model
@@ -357,8 +384,9 @@ fn printUsage(io: std.Io) void {
         \\  --gpu-warm-secs <n> Keep the GPU awake for this many seconds after
         \\                        the last request, so the next one starts
         \\                        without a wake-up delay (default: 60, 0 = off).
-        \\  --metrics           Enable Prometheus metrics at GET /metrics (opt-in;
-        \\                        zero cost when off). Also GET /metrics.json.
+        \\  --no-metrics        Turn off the metrics at GET /metrics and /metrics.json
+        \\                        (on by default; POST /metrics/enable turns them back
+        \\                        on). --metrics is accepted and does nothing.
         \\  --no-tool-autocorrect
         \\                      Disable tool-call ARGUMENT auto-correct — the
         \\                        coercion of parsed args to the tool schema's
@@ -393,6 +421,21 @@ fn printUsage(io: std.Io) void {
     stdout_w.interface.flush() catch {};
 }
 
+/// False for the commands and flags that never touch MLX, so they do not wake Metal.
+fn commandUsesGpu(proc_args: std.process.Args) bool {
+    var it = std.process.Args.Iterator.init(proc_args);
+    _ = it.next();
+    var first = true;
+    while (it.next()) |a| {
+        if (first and (std.mem.eql(u8, a, "pull") or std.mem.eql(u8, a, "list") or std.mem.eql(u8, a, "launch") or
+            std.mem.eql(u8, a, "repack") or std.mem.eql(u8, a, "update"))) return false;
+        first = false;
+        if (std.mem.eql(u8, a, "--version") or std.mem.eql(u8, a, "--guest-manifest") or
+            std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) return false;
+    }
+    return true;
+}
+
 /// Command-buffer limits for the M1 Max and M1 Ultra, unless the environment sets them. MLX
 /// commits a buffer after 50 ops or 50 MB on both dies (`device.cpp`, arch suffixes `s`/`d`),
 /// about 75 commits per Flash-Next decode forward. Measured 2026-10-17, Flash-Next
@@ -416,34 +459,37 @@ fn applyM1CommandBufferDefaults() void {
 /// On the M1 Ultra: the dequant+GEMM prefill route from 1024 rows instead of 2048 and in f16, the
 /// QSA prefill mask arm up to 4096 keys, the row-major 8-key QSA gather kernel, the parallel mmap
 /// walk for the PLE prefill gather, and row-major K in the prefill attention kernel (measurements
-/// at `transformer.prefill_dq_gemm_min_m`, `prefill_dq_gemm_f16`, `qsa_prefill_mask_max_kv`,
-/// `qsa_gather_rows`, `qwen4_exp.ple_wide_walk` and `attn_pd_krow`). Other chips are unmeasured
-/// and keep the defaults.
+/// at `verify_moe.prefill_dq_gemm_min_m`, `prefill_dq_gemm_f16`, `qwen4_qsa_gather.qsa_prefill_mask_max_kv`,
+/// `qsa_gather_rows`, `qwen4_exp.ple_wide_walk` and `attn_kernels.attn_pd_krow`). Other chips are
+/// unmeasured and keep the defaults.
 fn applyM1PrefillDefaults() void {
     if (!std.mem.eql(u8, chip_mod.chipBrand(), "Apple M1 Ultra")) return;
-    @import("transformer.zig").prefill_dq_gemm_min_m = 1024;
-    @import("transformer.zig").prefill_dq_gemm_f16 = true;
-    @import("transformer.zig").qsa_prefill_mask_max_kv = 4096;
-    @import("transformer.zig").qsa_gather_rows = true;
-    @import("qwen4_exp.zig").ple_wide_walk = true;
-    @import("transformer.zig").attn_pd_krow = true;
+    @import("verify_moe.zig").prefill_dq_gemm_min_m = 1024;
+    @import("verify_moe.zig").prefill_dq_gemm_f16 = true;
+    @import("qwen4/qwen4_qsa_gather.zig").qsa_prefill_mask_max_kv = 4096;
+    @import("qwen4/qwen4_qsa_gather.zig").qsa_gather_rows = true;
+    @import("qwen4/qwen4_exp.zig").ple_wide_walk = true;
+    @import("attn_kernels.zig").attn_pd_krow = true;
 }
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
+    metrics_history.process.markStarted(io, io_util.nowMs(io));
 
     // Before any MLX call: the Metal device reads its command-buffer limits once, on creation.
     applyM1CommandBufferDefaults();
     applyM1PrefillDefaults();
 
     // Bound MLX's reclaimable buffer pool before anything can allocate. ONCE,
-    // above every subcommand branch — a per-serve-path call is how
+    // above every GPU subcommand branch — a per-serve-path call is how
     // `runHeadlessServe` (the mode the app always launches) silently ate the
     // launch flags. See server.mlxCacheLimitBytes for why MLX's own default
     // (~121 GB on a 128 GB Mac) is no defense.
-    server_mod.applyMlxCacheLimit();
-    server_mod.resolveMlxCadence();
+    if (commandUsesGpu(init.minimal.args)) {
+        server_mod.applyMlxCacheLimit();
+        server_mod.resolveMlxCadence();
+    }
     // Resolve lazily-cached env reads on the main thread before other threads exist.
     @import("transformer.zig").warmQsaEnvCaches();
 
@@ -461,7 +507,7 @@ pub fn main(init: std.process.Init) !void {
     while (args_iter.next()) |arg| {
         try args_list.append(allocator, try allocator.dupe(u8, arg));
     }
-    const args = args_list.items;
+    var args: []const []const u8 = args_list.items;
     // Runs after every other defer: an update asked for by /v1/update or the REPL replaces this process only once
     // the server has shut down the way a SIGTERM exit does.
     defer update_mod.relaunchIfRequested(allocator, io, args);
@@ -478,6 +524,8 @@ pub fn main(init: std.process.Init) !void {
     var run_model_dir: ?[]u8 = null;
     defer if (run_model_dir) |d| allocator.free(d);
     var use_default_models_root = false;
+    var bench_run: ?*bench_mod.InProcess = null;
+    defer if (bench_run) |r| r.finish();
     var repl_after_serve = false;
     var run_opts: cli_mod.ReplOptions = .{};
     if (args.len >= 2 and args[1].len > 0 and args[1][0] != '-') {
@@ -530,16 +578,27 @@ pub fn main(init: std.process.Init) !void {
             try kld_mod.cmdKld(allocator, io, args[2..]);
             return;
         } else if (std.mem.eql(u8, cmd, "bench")) {
-            try bench_mod.cmdBench(allocator, io, args[2..]);
-            return;
+            switch (try bench_mod.start(allocator, io, args[2..])) {
+                .done => return,
+                .in_process => |run| {
+                    bench_run = run;
+                    bench_mod.setCurrent(run);
+                    // The serve parser below reads the flags the bench left, as `sushi serve --model` does.
+                    args = try run.argv(args[0]);
+                    arg_start = 1;
+                },
+            }
         } else if (std.mem.eql(u8, cmd, "convert")) {
             try encoder_cli.cmdConvert(allocator, io, args[2..]);
+            return;
+        } else if (std.mem.eql(u8, cmd, "repack")) {
+            try pack_cmds.repack.cmdRepack(allocator, io, args[2..]);
             return;
         } else if (std.mem.eql(u8, cmd, "update")) {
             try update_mod.cmdUpdate(allocator, io, args[2..]);
             return;
         } else {
-            log.err("unknown command '{s}' (expected run, pull, list, launch, kld, bench, convert, update, or serve)\n", .{cmd});
+            log.err("unknown command '{s}' (expected run, pull, list, launch, kld, bench, convert, repack, update, or serve)\n", .{cmd});
             std.process.exit(1);
         }
     }
@@ -557,6 +616,7 @@ pub fn main(init: std.process.Init) !void {
     var log_file_arg: ?[]const u8 = null;
     var parent_pid: ?std.posix.pid_t = null;
     var no_update_check = false;
+    var skip_mem_preflight = false;
     var serve_mode = false;
     var serve_explicit = false;
     var stream_mode = false;
@@ -573,10 +633,9 @@ pub fn main(init: std.process.Init) !void {
     var top_k_flag: ?u32 = null;
     var ctx_size: u32 = 0; // 0 = use model default
     var timeout: u32 = 300; // seconds, 0 = no timeout
-    var reasoning_budget: i32 = -1; // -1 = unlimited
     var no_vision = false;
     var vision = false;
-    var drafter_dir: ?[]const u8 = null; // Path to Gemma 4 assistant drafter checkpoint
+    var drafter_dir: ?[]const u8 = null; // Path to a DFlash2 assistant checkpoint
     var no_drafter = false; // --no-drafter: never load one, merged-in ones included
     var enable_mtp = true; // Qwen native MTP head (auto when sidecar present; --no-mtp to disable)
     // --mtp: force the head ON where requests do not default to it: an SSD-streamed
@@ -590,13 +649,13 @@ pub fn main(init: std.process.Init) !void {
     var kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.engine_default;
     var kv_quant_explicit = false;
     // Plan 05 Phase D: multi-model caps. Defaults aim for "comfortable on
-    // 32–64 GB systems running Gemma 4 E4B-class models". Override via the
+    // 32–64 GB systems running small models". Override via the
     // CLI flags below; the Swift app exposes them under Advanced settings.
     var max_resident_models: u32 = 3;
     var max_resident_mem: u64 = 0; // 0 = auto (80% of wired limit at startup)
     var max_resident_mem_explicit: bool = false;
     var idle_evict_secs: ?u32 = null;
-    var metrics_enabled = false;
+    var metrics_enabled = true;
     var log_level_explicit = false;
     var decode_share_flag: ?[]const u8 = null;
     var i: usize = arg_start;
@@ -616,7 +675,7 @@ pub fn main(init: std.process.Init) !void {
                 .nax = transformer_mod.naxStatus(),
             };
             var ver_buf: [512]u8 = undefined;
-            var ver_w = std.Io.File.stdout().writer(io, &ver_buf);
+            var ver_w = std.Io.File.stdout().writerStreaming(io, &ver_buf);
             version_mod.writeReport(&ver_w.interface, info) catch {};
             ver_w.interface.flush() catch {};
             return;
@@ -625,7 +684,7 @@ pub fn main(init: std.process.Init) !void {
             defer _ = mlx.mlx_string_free(mlx_ver);
             try mlx.check(mlx.mlx_version(&mlx_ver));
             var out_buf: [1024]u8 = undefined;
-            var out_w = std.Io.File.stdout().writer(io, &out_buf);
+            var out_w = std.Io.File.stdout().writerStreaming(io, &out_buf);
             try version_mod.writeGuestManifest(&out_w.interface, allocator, .{
                 .version = VERSION,
                 .commit = build_options.git_sha,
@@ -719,7 +778,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--no-prevent-sleep")) {
             sleep_inhibit_mod.setEnabled(false);
         } else if (std.mem.eql(u8, args[i], "--skip-mem-preflight")) {
-            scheduler_mod.skip_mem_preflight = true;
+            skip_mem_preflight = true;
         } else if (std.mem.eql(u8, args[i], "--no-tool-autocorrect")) {
             server_mod.g_tool_autocorrect = false;
         } else if (cli_mod.isNoMtpLookupFlag(args[i])) {
@@ -729,6 +788,8 @@ pub fn main(init: std.process.Init) !void {
             drafter_dir = args[i];
         } else if (std.mem.eql(u8, args[i], "--metrics")) {
             metrics_enabled = true;
+        } else if (std.mem.eql(u8, args[i], "--no-metrics")) {
+            metrics_enabled = false;
         } else if (std.mem.eql(u8, args[i], "--api-key") and i + 1 < args.len) {
             i += 1;
             // Borrowed from argv (lives for the process). Empty ⇒ leave open.
@@ -794,9 +855,6 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--max-mtp-ctx") and i + 1 < args.len) {
             i += 1;
             generate_mod.max_mtp_ctx = flagInt(u32, "--max-mtp-ctx", args[i], 0);
-        } else if (std.mem.eql(u8, args[i], "--reasoning-budget") and i + 1 < args.len) {
-            i += 1;
-            reasoning_budget = flagInt(i32, "--reasoning-budget", args[i], -1);
         } else if (std.mem.eql(u8, args[i], "--log-level") and i + 1 < args.len) {
             i += 1;
             const level = log.Level.fromString(args[i]) orelse {
@@ -939,7 +997,7 @@ pub fn main(init: std.process.Init) !void {
             };
         } else if (std.mem.eql(u8, args[i], "--drop-expert") and i + 1 < args.len) {
             i += 1;
-            model_mod.drop_expert = @import("expert_usage.zig").parseCount(args[i]) orelse {
+            model_mod.drop_expert = pack_cmds.expert_usage.parseCount(args[i]) orelse {
                 log.err("--drop-expert: expected a multiple of 8 routed experts per layer (0 = off); got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
@@ -954,6 +1012,12 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             ssd_budget_bytes = server_mod.parseSsdBudgetGb(args[i]) catch {
                 log.err("--ssd-budget-gb: expected an integer in 1..512; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, args[i], "--ssd-prefetch") and i + 1 < args.len) {
+            i += 1;
+            model_mod.ssd_prefetch = model_mod.parseSsdPrefetch(args[i]) orelse {
+                log.err("--ssd-prefetch: expected an integer in 0..100; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
         } else {
@@ -973,6 +1037,10 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
+    if (bench_run != null and (host_flag != null or port_flag != null or prompt != null)) {
+        log.err("sushi bench --model: --host, --port and --prompt do not apply, it starts no server\n", .{});
+        std.process.exit(1);
+    }
     if (tool_flag_given and run_model_dir == null) {
         log.err("--tool: only valid with `sushi run <model>`\n", .{});
         std.process.exit(1);
@@ -986,7 +1054,10 @@ pub fn main(init: std.process.Init) !void {
         log.err("--prompt/-p cannot be combined with serve, --serve, --host, --port, or --tool on; it uses a private local listener and exits after one reply.\n", .{});
         return error.PromptModeConflict;
     }
-    const bind = server_mod.resolveBind(host_flag, if (prompt != null) @as(u16, 0) else port_flag);
+    const bind = if (prompt != null or bench_run != null)
+        server_mod.resolveBind(host_flag, 0, server_mod.default_port)
+    else
+        server_mod.resolveBind(host_flag, port_flag, model_settings_mod.defaultPort(allocator, io));
     const host = bind.host;
     const port = bind.port;
 
@@ -1006,6 +1077,18 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     generate_mod.mtp_acceptance_explicit = mtp_typical_raw != null or mtp_tokenv3_raw != null;
+    var acceptance_flag_buf: [128]u8 = undefined;
+    pinLaunchFlags(.{
+        .mtp_acceptance_flag = model_settings_mod.acceptanceFlagText(&acceptance_flag_buf, mtp_typical_raw, mtp_tokenv3_raw),
+        .ctx_size = ctx_size,
+        .kv_quant = if (kv_quant_explicit) kv_quant_config.wireName() else null,
+        .mtp = if (mtp_explicit) enable_mtp else null,
+        .vision = if (vision) true else if (no_vision) false else null,
+        .models_dir = models_root,
+        .no_update_check = no_update_check,
+        .skip_mem_preflight = skip_mem_preflight,
+        .port = port_flag,
+    });
     if (dflash_mod.drafter_min_depth) |lo| if (dflash_mod.drafter_max_depth) |hi| if (lo > hi) {
         log.err("--drafter-min-depth {d} is above --drafter-max-depth {d}\n", .{ lo, hi });
         std.process.exit(1);
@@ -1033,7 +1116,8 @@ pub fn main(init: std.process.Init) !void {
         serve_mode = true;
         repl_after_serve = false;
     }
-    model_mod.think_effort_flag = if (run_opts.think == .effort) run_opts.think.effort else null;
+    effort_mod.think_effort_flag = if (run_opts.think == .effort) run_opts.think.effort else null;
+    model_settings_mod.loadEffortTables(allocator, io);
     const prompt_body = if (prompt) |text| try cli_mod.buildPromptBody(allocator, text, run_opts.think, .{ .max_tokens = max_tokens, .temperature = temperature, .top_p = top_p_flag orelse 1.0, .top_k = top_k_flag orelse 0 }) else null;
     defer if (prompt_body) |body| allocator.free(body);
     var prompt_state: PromptClient = .{ .allocator = allocator, .io = io, .body = prompt_body orelse "", .stream = stream_mode };
@@ -1049,7 +1133,28 @@ pub fn main(init: std.process.Init) !void {
     })) {
         const home = std.mem.span(std.c.getenv("HOME") orelse "/tmp");
         default_models_root_storage = try cli_mod.modelsRootPath(allocator, home);
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var file = model_settings_mod.load(allocator, io, model_settings_mod.defaultPath(&path_buf));
+        defer file.deinit();
+        if (model_settings_mod.server(&file).models_dir) |dir| {
+            if (std.Io.Dir.openDirAbsolute(io, dir, .{})) |d| {
+                d.close(io);
+                allocator.free(default_models_root_storage.?);
+                default_models_root_storage = try allocator.dupe(u8, dir);
+            } else |_| log.warn("[model-settings] server.models_dir {s} cannot be opened, using the default models directory\n", .{dir});
+        }
         models_root = default_models_root_storage;
+    }
+    {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var file = model_settings_mod.load(allocator, io, model_settings_mod.defaultPath(&path_buf));
+        defer file.deinit();
+        if (!server_mod.prefix_cache_disk_explicit) if (model_settings_mod.server(&file).prefix_cache_disk_gb) |gb| {
+            server_mod.prefix_cache_disk_bytes = @as(u64, gb) << 30;
+            server_mod.prefix_cache_disk_explicit = true;
+            server_mod.prefix_cache_disk_from_file = true;
+            log.info("[model-settings] server.prefix_cache_disk_gb {d} sets the SSD prefix cache budget\n", .{gb});
+        };
     }
 
     // `sushi run` on a TTY quiets logs to warn (unless --log-level was
@@ -1065,6 +1170,10 @@ pub fn main(init: std.process.Init) !void {
     // NOTE: opened AFTER `--log-level` is parsed (so the level gates what
     // reaches disk) and BEFORE model discovery/loading (so weight-load and
     // auto-context lines land in the file).
+    if (bench_run) |r| {
+        try r.prepare();
+        if (log_file_arg == null) log_file_arg = try r.logPath();
+    }
     if (serve_mode or repl_after_serve) {
         var log_path_buf: [1024]u8 = undefined;
         const chosen: ?[]const u8 = if (log_file_arg) |a|
@@ -1082,7 +1191,16 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     defer log.closeFile();
-    if (serve_mode and prompt == null) update_mod.startDailyCheck(io, no_update_check);
+    {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var file = model_settings_mod.load(allocator, io, model_settings_mod.defaultPath(&path_buf));
+        defer file.deinit();
+        const srv = model_settings_mod.server(&file);
+        scheduler_mod.setSkipMemPreflight(model_settings_mod.skipMemPreflight(skip_mem_preflight, srv.skip_mem_preflight).value);
+        const serving = serve_mode and prompt == null and bench_run == null;
+        if (serving) update_mod.startDailyCheck(io, no_update_check, srv.update_check);
+        cli_mod.configurePackUpdates(io, serving and !no_update_check, model_settings_mod.autoCheck(no_update_check, srv.pack_update_check).value);
+    }
 
     if (parent_pid) |pid| {
         parent_watch.start(pid) catch |err| {
@@ -1134,7 +1252,7 @@ pub fn main(init: std.process.Init) !void {
     }
     // In serve mode, check if the port is already in use before loading the model
     // (model loading takes seconds — fail fast instead of wasting time)
-    if (serve_mode) {
+    if (serve_mode and bench_run == null) {
         server_mod.ensurePortFree(io, host, port) catch |err| {
             var msg_buf: [512]u8 = undefined;
             if (server_mod.startupRefusal(err, host, port, &msg_buf)) |msg| {
@@ -1158,18 +1276,9 @@ pub fn main(init: std.process.Init) !void {
         if (t) |thread| thread.detach();
     }
 
-    // Observability: allocate the metrics core once (when --metrics is on) and
-    // publish it via the server-global `g_metrics`. Declared here — above every
-    // serve-dispatch path (headless and the primary MLX
-    // path) — so `server_mod.serve()` spawns the gauge sampler + routes /metrics
-    // regardless of engine, and each LoadParams builder reads it back into the
-    // scheduler's per-request sink via `.metrics = server_mod.g_metrics`. The
-    // instance lives on this stack frame for the whole process lifetime; the
-    // defer clears the global so an early serve() failure can't leave it
-    // dangling. Off (the default) → null: a single per-request branch, no cost.
-    var metrics_instance: ?metrics_mod.Metrics = if (metrics_enabled) metrics_mod.Metrics.init() else null;
-    if (metrics_instance) |*m| server_mod.g_metrics = m;
-    defer server_mod.g_metrics = null;
+    // Observability: the process-wide core is on before serving; `--no-metrics` keeps it off
+    // until POST /metrics/enable. Every LoadParams builder reads it back as the scheduler's initial sink.
+    if (metrics_enabled) _ = metrics_mod.process.enable();
 
     // An unsupported file format is refused by name before any config.json read.
     if (isGgufPath(io, model_dir)) {
@@ -1186,7 +1295,6 @@ pub fn main(init: std.process.Init) !void {
     const launch_serve = LaunchServe{
         .ctx_size = ctx_size,
         .timeout = timeout,
-        .reasoning_budget = reasoning_budget,
         .max_tokens = serve_default_max_tokens,
         .temperature = if (temp_explicit) temperature else null,
         .top_p = top_p_flag,
@@ -1265,19 +1373,18 @@ pub fn main(init: std.process.Init) !void {
     };
     config_storage.* = try model_mod.parseConfig(io, allocator, model_dir);
     const config = config_storage;
-    scheduler_mod.applyModelSettings(config, model_settings_mod.overrideFor(allocator, io, model_dir));
-    if (model_mod.think_effort_flag) |e| if (model_mod.effortArms(config.model_type)) |arms| {
-        var choices: [std.enums.values(model_mod.Effort).len]model_mod.Effort = undefined;
-        for (arms, 0..) |arm, ai| choices[ai] = arm.effort;
-        if (model_mod.armForWord(arms, @tagName(e)) == null) {
+    model_load.applyModelSettings(config, model_settings_mod.overrideFor(allocator, io, model_dir));
+    if (effort_mod.think_effort_flag) |e| if (effort_mod.servedArms(config.model_type)) |served| {
+        var choices: [std.enums.values(effort_mod.Effort).len]effort_mod.Effort = undefined;
+        if (effort_mod.resolve(served.slice(), e)) |pick| {
+            if (pick.rerouted_from) |from| log.info("[effort] " ++ effort_mod.effort_reroute_notice ++ "\n", .{ config.model_type, @tagName(from), @tagName(pick.arm.effort) });
+        } else {
             var w = std.Io.Writer.Allocating.init(allocator);
             defer w.deinit();
-            try cli_mod.writeEffortRefusal(&w.writer, @tagName(e), config.model_type, choices[0..arms.len]);
+            try cli_mod.writeEffortRefusal(&w.writer, @tagName(e), config.model_type, effort_mod.listedWords(served.slice(), &choices));
             log.err("--think: {s}\n", .{w.written()});
             std.process.exit(1);
-        } else if (model_mod.selectEffortPick(choices[0..arms.len], e)) |pick| if (pick.rerouted_from) |from| {
-            log.info("[effort] " ++ model_mod.effort_reroute_notice ++ "\n", .{ config.model_type, @tagName(from), @tagName(pick.effort) });
-        };
+        }
     };
     if (config.glm_fp8_trunk) {
         log.info("Model: {s} ({d} layers, {d}-dim, raw FP8 E4M3FN block128 trunk)\n", .{ config.model_type, config.num_hidden_layers, config.hidden_size });
@@ -1444,7 +1551,7 @@ pub fn main(init: std.process.Init) !void {
             chat_config_owned_by_registry = true;
         };
 
-        const params = scheduler_mod.LoadParams{
+        const params = model_load.LoadParams{
             .registry = registry,
             .entry = entry,
             .config = config,
@@ -1472,13 +1579,15 @@ pub fn main(init: std.process.Init) !void {
             .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity, server_mod.prefix_cache_ram_enabled, server_mod.prefix_cache_disk_bytes),
             .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
             .tokenize_cache_entries = server_mod.tokenize_cache_entries,
-            .metrics = server_mod.g_metrics,
+            .metrics = metrics_mod.current(),
         };
         var serve_cfg = launch_serve.serverConfig();
         serve_cfg.on_ready = if (prompt != null) PromptClient.ready else null;
+        serve_cfg.embedded_client = if (bench_run != null) bench_mod.embeddedClient else null;
         serve_cfg.default_force_mtp = force_mtp;
         try server_mod.serve(io, allocator, params, config, host, port, serve_cfg);
         if (prompt_state.err) |err| return err;
+        if (bench_run) |r| if (r.err) |err| return err;
     } else {
         // ── Offline single-prompt mode. mlx ops run on this thread, no
         //    scheduler. The same load path as pre-A1.
@@ -1497,7 +1606,8 @@ pub fn main(init: std.process.Init) !void {
         xfm.round_cost.layout = round_cost_mod.layoutFor(config);
 
         // Reserved-token suppression, same derivation as the serve path.
-        generate_mod.installSuppressMask(&xfm, tok, chat_config.chat_template, config.eosTokenSlice());
+        config.mergeTokenizerStops(tok);
+        sampler.installSuppressMask(&xfm, tok, chat_config.chat_template, config.eosTokenSlice());
         generate_mod.installThinkMarkers(&xfm, tok);
         try generate_mod.installLogitBias(io, &xfm, tok);
 
@@ -1506,7 +1616,7 @@ pub fn main(init: std.process.Init) !void {
         // Transformer's own legacy cache to match.
         const kv_cache = server_mod.kvCacheForLaunch(config, kv_quant_config, kv_quant_explicit);
         log.info("[kv-cache] {s} ({s})\n", .{ kv_cache.label(), kv_cache.sourceName() });
-        const mtp_choice = scheduler_mod.mtpChoiceFor(enable_mtp, mtp_explicit, config);
+        const mtp_choice = model_load.mtpChoiceFor(enable_mtp, mtp_explicit, config);
         log.info("[mtp] {s} ({s})\n", .{ mtp_choice.label(), mtp_choice.sourceName() });
         if (kv_cache.config.scheme != .off) {
             try xfm.cache.reinit(config.num_hidden_layers, kv_cache.config);
@@ -1541,10 +1651,10 @@ pub fn main(init: std.process.Init) !void {
         _ = mlx.mlx_reset_peak_memory();
 
         const eos_slice = config.eosTokenSlice();
-        const sampling = generate_mod.SamplingParams{ .temperature = temperature };
+        const sampling = sampler.SamplingParams{ .temperature = temperature };
 
         var stdout_buf: [16 * 1024]u8 = undefined;
-        var stdout_w_state = std.Io.File.stdout().writer(io, &stdout_buf);
+        var stdout_w_state = std.Io.File.stdout().writerStreaming(io, &stdout_buf);
         const stdout_w = &stdout_w_state.interface;
         defer stdout_w.flush() catch {};
 
@@ -1565,7 +1675,7 @@ pub fn main(init: std.process.Init) !void {
             var completion_tokens: u32 = 0;
             while (try gen.next(allocator)) |token_id| {
                 const ids = [_]u32{token_id};
-                const piece = try tok.decode(allocator, &ids, completion_tokens == 0);
+                const piece = try tok.decode(allocator, &ids);
                 defer allocator.free(piece);
                 if (piece.len > 0) {
                     try stdout_w.writeAll(piece);
@@ -1625,7 +1735,6 @@ fn autoResidentMemBytes(explicit: bool, val: u64) u64 {
 const LaunchServe = struct {
     ctx_size: u32,
     timeout: u32,
-    reasoning_budget: i32,
     max_tokens: u32,
     temperature: ?f32,
     top_p: ?f32,
@@ -1635,7 +1744,6 @@ const LaunchServe = struct {
         return .{
             .max_context_size = self.ctx_size,
             .request_timeout_sec = self.timeout,
-            .default_reasoning_budget = self.reasoning_budget,
             .default_max_tokens = self.max_tokens,
             .default_temperature = self.temperature,
             .default_top_p = self.top_p,
@@ -1670,8 +1778,8 @@ fn runHeadlessServe(
     log.info("sushi {s} (headless — models load on demand)\n", .{VERSION});
     log.info("[args] serve: {s}:{d}\n", .{ host, port });
 
-    var stub = try scheduler_mod.headlessStubCpuState(allocator);
-    defer scheduler_mod.freeCpuState(allocator, &stub);
+    var stub = try model_load.headlessStubCpuState(allocator);
+    defer model_load.freeCpuState(allocator, &stub);
 
     const effective_max_resident_mem = autoResidentMemBytes(max_resident_mem_explicit, max_resident_mem);
     if (effective_max_resident_mem > 0) {
@@ -1719,7 +1827,7 @@ fn runHeadlessServe(
         break :blk &placeholder;
     };
 
-    const params = scheduler_mod.LoadParams{
+    const params = model_load.LoadParams{
         .registry = registry,
         .entry = carrier,
         .config = stub.config,
@@ -1748,14 +1856,13 @@ fn runHeadlessServe(
         .prefix_cache_ram_enabled = server_mod.prefix_cache_ram_enabled,
         .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
         .prefix_cache_mem_resolver = server_mod.prefixCacheMemForLoad,
-        .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
         .prefix_cache_disk_resolver = server_mod.prefixCacheDiskForLoad,
         .ssd_budget_bytes = ssd_budget_bytes,
         .expert_cache_fit_resolver = server_mod.expertCacheFitForLoad,
-        .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity, server_mod.prefix_cache_ram_enabled, server_mod.prefix_cache_disk_bytes),
+        .ssm_checkpoint_stride = server_mod.ssm_checkpoint_stride,
         .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
-        .metrics = server_mod.g_metrics,
+        .metrics = metrics_mod.current(),
     };
 
     var serve_cfg = launch_serve.serverConfig();
@@ -1779,6 +1886,33 @@ fn configOverridesJsonValid(raw: []const u8) bool {
 }
 
 /// A flag's whole-number value, or a named error and exit: a bad value never falls back to a default.
+/// Records which launch flags were given, so the settings API shows their keys locked: a flag outranks the file.
+fn pinLaunchFlags(given: struct { mtp_acceptance_flag: ?[]const u8, ctx_size: u32, kv_quant: ?[]const u8, mtp: ?bool, vision: ?bool, models_dir: ?[]const u8, no_update_check: bool, skip_mem_preflight: bool = false, port: ?u16 = null }) void {
+    const locks = &model_settings_mod.launch_locks;
+    if (given.ctx_size > 0) locks.modelMut("ctx_size").pin("{d}", .{given.ctx_size});
+    if (given.kv_quant) |q| locks.modelMut("kv_quant").pin("{s}", .{q});
+    if (given.mtp) |m| locks.modelMut("mtp").pin("{s}", .{if (m) "on" else "off"});
+    if (given.mtp_acceptance_flag) |f| locks.modelMut("mtp_acceptance").pin("{s}", .{f});
+    if (generate_mod.mtp_greedy_tail_explicit) locks.modelMut("mtp_greedy_tail").pin("--mtp-greedy-tail", .{});
+    if (ssd_budget_bytes != 0) locks.modelMut("ssd_budget_gb").pin("{d}", .{ssd_budget_bytes >> 30});
+    if (model_mod.ssd_prefetch) |p| locks.modelMut("ssd_prefetch").pin("{d}", .{p});
+    if (model_settings_mod.preserve_thinking_flag) |p| locks.modelMut("preserve_thinking").pin("{s}", .{if (p) "on" else "off"});
+    if (model_settings_mod.think_penalty_flag) |l| locks.modelMut("think_penalty").pin("{d}", .{l});
+    if (serve_default_max_tokens > 0) locks.modelMut("max_tokens").pin("{d}", .{serve_default_max_tokens});
+    if (given.vision) |v| locks.modelMut("vision").pin("{s}", .{if (v) "on" else "off"});
+    if (server_mod.prefix_cache_disk_explicit) {
+        var size_buf: [32]u8 = undefined;
+        locks.prefix_cache_disk_gb.pin("{s}", .{model_settings_mod.sizeText(&size_buf, server_mod.prefix_cache_disk_bytes)});
+    }
+    if (given.models_dir) |d| locks.models_dir.pin("{s}", .{d});
+    if (given.port) |p| locks.port.pin("{d}", .{p});
+    if (given.skip_mem_preflight) locks.skip_mem_preflight.pin("--skip-mem-preflight", .{});
+    if (given.no_update_check) {
+        locks.update_check.pin("--no-update-check", .{});
+        locks.pack_update_check.pin("--no-update-check", .{});
+    }
+}
+
 fn flagInt(comptime T: type, flag: []const u8, text: []const u8, min: T) T {
     return cli_mod.parseFlagInt(T, text, min) orelse {
         log.err("{s}: expected a whole number of at least {d}; got '{s}'\n", .{ flag, min, text });
@@ -1818,7 +1952,6 @@ test "both boot modes build their server defaults from the same launch flags" {
     const launch = LaunchServe{
         .ctx_size = 32768,
         .timeout = 77,
-        .reasoning_budget = 512,
         .max_tokens = 4096,
         .temperature = 0.3,
         .top_p = 0.8,
@@ -1838,4 +1971,36 @@ test "both boot modes build their server defaults from the same launch flags" {
     const none = unset.serverConfig();
     try std.testing.expectEqual(@as(?f32, null), none.default_temperature);
     try std.testing.expectEqual(@as(?u32, null), none.default_top_k);
+}
+
+test "launch flags: --port pins server.port as typed, and no flag leaves it free" {
+    const saved = model_settings_mod.launch_locks;
+    defer model_settings_mod.launch_locks = saved;
+    model_settings_mod.launch_locks = .{};
+    pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
+    try std.testing.expect(!model_settings_mod.launch_locks.port.set);
+    pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false, .port = 8080 });
+    try std.testing.expectEqualStrings("8080", model_settings_mod.launch_locks.port.text());
+}
+
+test "launch flags: --no-update-check pins both automatic update checks, and no flag pins neither" {
+    const saved = model_settings_mod.launch_locks;
+    defer model_settings_mod.launch_locks = saved;
+    model_settings_mod.launch_locks = .{};
+    pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
+    try std.testing.expect(!model_settings_mod.launch_locks.update_check.set);
+    try std.testing.expect(!model_settings_mod.launch_locks.pack_update_check.set);
+    pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = true });
+    try std.testing.expectEqualStrings("--no-update-check", model_settings_mod.launch_locks.update_check.text());
+    try std.testing.expectEqualStrings("--no-update-check", model_settings_mod.launch_locks.pack_update_check.text());
+}
+
+test "launch flags: --skip-mem-preflight pins server.skip_mem_preflight, and no flag leaves it free" {
+    const saved = model_settings_mod.launch_locks;
+    defer model_settings_mod.launch_locks = saved;
+    model_settings_mod.launch_locks = .{};
+    pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
+    try std.testing.expect(!model_settings_mod.launch_locks.skip_mem_preflight.set);
+    pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false, .skip_mem_preflight = true });
+    try std.testing.expectEqualStrings("--skip-mem-preflight", model_settings_mod.launch_locks.skip_mem_preflight.text());
 }

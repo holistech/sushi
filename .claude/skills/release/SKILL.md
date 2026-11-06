@@ -6,16 +6,28 @@ description: sushi pre-release validation checklist, SemVer versioning, release 
 ## Pre-release validation
 
 On the Apple M5 Max 128 GB, on the FINAL release tree, with a fresh `zig build -Doptimize=ReleaseFast`. Run the steps
-directly, one at a time: no driver script, no pause/resume bookkeeping. A failed step goes to the owner before anything
-else. Model loads take the GPU lock; step 2 waits for a quiet box (no builds, no AirDrop or other transfers).
+directly: no driver script, no pause/resume bookkeeping. A failed step goes to the owner before anything else. Model
+loads take the GPU lock; step 2 waits for a quiet box (no builds, no AirDrop or other transfers).
+
+Order (owner, 2026-10-31):
+0. Read `docs/private/future.md` (main checkout) and tell the owner, before anything runs, every entry this release
+   gates or is due with it (e.g. a pack upload that waits for the published release), and what each still needs.
+1. Step 1, then the version bump (Release steps 1 and 2 below), committed and pushed.
+2. Two tracks start together and should finish about together:
+   - remote: `./release.sh` (`release.yml` builds, tests and leaves the DRAFT);
+   - local: steps 2, 3 and 4.
+3. Both green: publish the draft (Release step 3).
+4. Any issue on either track: fix it on main and push. Delete the failed draft and its tag
+   (`gh release delete v<ver> --cleanup-tag --yes`), then rerun `./release.sh`. Rerun only the local steps the fix can
+   reach.
 
 | # | Step | Command | Pass |
 |---|---|---|---|
 | 1 | Suite + binary | `zig build test -Doptimize=ReleaseFast`; `zig build -Doptimize=ReleaseFast`; `sushi --version` | 0 fail; names `build.zig.zon`'s version |
 | 2 | **Perf gate** | `tests/bench.sh --version <ver> <pack>` (below) on Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw, Sushi-4bpw, GLM-5.3-Flash-Sushi-2.4bpw and DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | each model within noise of its previous `docs/bench/` report, speculative mode engaged; commit `docs/bench/v<ver>/`, append this release's `benchmarks.md` column |
 | 3 | **KLD gate** | `sushi kld compare` 16x512 to first EOS on Qwen Sushi-STQ-2.75bpw and the DeepSeek STQ pack | within ~1% of its row in `docs/quality-kld.md` |
-| 4 | Live | `test_format_matrix.sh`, `test_smoke_matrix.sh`, plus the live test of each area the release changed (step 2's bench covers the rest) | all pass |
-| 5 | CI | none to dispatch: `release.yml` runs the full suite on the macOS 26.2 runner before it packages, and a failed test leaves no draft. To check a tree without cutting: `gh workflow run release.yml -f dry_run=true` | green (the macOS 26.2 build gate) |
+| 4 | Live | `test_format_matrix.sh`, `test_smoke_matrix.sh` on the `qwen4`, `glm5` and `dsv41` passes, plus the live test of each area the release changed (step 2's bench covers the rest) | all pass |
+| 5 | CI | `./release.sh` beside steps 2-4 (never `ci.yml`): `release.yml` runs the full suite on the macOS 26.2 runner before it packages, and a failed test leaves no draft | green, a DRAFT exists |
 | 6 | Packs | each HF pack repo holds the shards, `ngram_table.bin` and its model card | card numbers match `docs/quality-kld.md` |
 | 7 | Cross-engine (only before a public claim) | start each engine yourself, `npx -y llmprobe@latest <host:port> -m <id> --bench-only` by hand | recorded in `~/.sushi/runs/bench-<tag>/`, engine named beside every win |
 
@@ -25,6 +37,7 @@ else. Model loads take the GPU lock; step 2 waits for a quiet box (no builds, no
 - **The perf gate times on AC power only.** Check `pmset -g batt` right before each model's run and log the power
   source beside it. A run that touched battery is discarded and rerun on AC: battery cost GLM 8–18% decode on 2026-10-11.
   - All other GPU work keeps the battery-above-30% rule.
+- **MiMo-V2.6-Flash is unsupported from 1.5.1:** it still loads, but no gate, bench or tuning step runs on it.
 - **The perf gate is four models: Qwen STQ 2.75bpw, Qwen MCG 4bpw, GLM MCG 2.4bpw, DeepSeek STQ 1.75bpw.** It is ONE
   `tests/bench.sh --version <ver> <pack> [-- <serve flags>]` run per model whose output IS the published
   `docs/bench/v<ver>/` report (`summary.md` plus one `<model>.md` per run; protocol in
@@ -61,16 +74,15 @@ workflow signs with a Developer ID and notarizes only when the `APPLE_*` repo se
 **Release**:
 1. Set `build.zig.zon`'s `.version` to the next version and rename the top `## Unreleased` entry to
    `## v<version> — Headline` (check `gh release list --limit 1` first — never reuse an existing tag)
-2. Dont commit or push
-3. After the owner (or `./release.sh`) cuts it, the Release workflow leaves a DRAFT. Check its tarball against the
+2. Commit the version bump with the CHANGELOG heading, push it, and run `./release.sh` beside the local gates (Order
+   above).
+3. The Release workflow leaves a DRAFT. Once the local gates are green too, check its tarball against the
    `.sha256` and run its `sushi --version`, then publish it. Right after publishing, run `scripts/bump-tap.sh`: it
    triggers `beamivalice/homebrew-tap`'s bump with this machine's `gh` login (no repo-secret token) and fails unless
    `Formula/sushi.rb` names the new tag. The tap's hourly schedule is the fallback.
-4. Once the GitHub release is published, bump mlx-serve's Sushi pin to the release commit
-   ([mlx-serve-integration](../../../docs/mlx-serve-integration.md#handing-a-new-engine-to-mlx-serve)): make the
-   commit reachable from the submodule url (`ddalcu/sushi`, branch `exl3-module`), then in the mlx-serve checkout
-   `git -C lib/sushi fetch && git -C lib/sushi checkout v<version>`, commit `lib/sushi`, run mlx-serve's tests and open
-   the PR from `beamivalice/mlx-serve`. Update the doc's "Recommended pin" to the release commit.
+4. mlx-serve pins no Sushi release: it vendors a copy of `src/exl3`
+   ([mlx-serve-integration](../../../docs/mlx-serve-integration.md#how-mlx-serve-consumes-the-module)), so a release
+   needs no step there. A re-vendor is its own task, taken only when the owner asks.
 
 ### CHANGELOG style
 

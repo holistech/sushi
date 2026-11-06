@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# sushi-test: tier=host
 . "$(dirname "$0")/private_cache.sh"
 # `--model-dir` is REPEATABLE, and every folder it names is actually served.
 #
@@ -10,6 +11,7 @@
 #
 # FULLY HERMETIC: the "models" are empty dirs holding a config.json. Nothing is
 # ever loaded — this pins DISCOVERY and the arg loop, which is where the bug was.
+# It also pins the headless listing: stubs with loaded:false and bytes_on_disk.
 #
 # Usage: ./tests/test_multi_model_dir.sh [port]
 set -uo pipefail
@@ -22,12 +24,13 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/sushi-roots.XXXXXX")"
 SRV=""
 trap 'rm -rf "$TMP"; [ -n "$SRV" ] && kill "$SRV" 2>/dev/null' EXIT
 
-mk() { mkdir -p "$TMP/$1"; printf '{"model_type":"%s"}' "$2" > "$TMP/$1/config.json"; }
-mk a/org/alpha  qwen3
-mk a/org/shared qwen3
-mk b/org/beta   llama
-mk b/org/shared mistral     # same id as a/org/shared — first root must win
-mk c/org/gamma  gemma3
+# Served architectures only (any other model_type is refused at discovery); a stub weight file gives each its bytes_on_disk.
+mk() { mkdir -p "$TMP/$1"; printf '{"model_type":"%s"}' "$2" > "$TMP/$1/config.json"; head -c 4096 /dev/zero > "$TMP/$1/model.safetensors"; }
+mk a/org/alpha  qwen4_exp
+mk a/org/shared qwen4_exp
+mk b/org/beta   mimo_v2
+mk b/org/shared glm5_next   # same id as a/org/shared — first root must win
+mk c/org/gamma  deepseek_v41
 rc=0
 
 boot() { # boot <logfile> <dir...>
@@ -56,6 +59,15 @@ if [ "$GOT" = "$WANT" ]; then
 else
   echo "FAIL: expected [$WANT], got [$GOT]"; rc=1
 fi
+# Headless (no --model): nothing is loaded, every discovered folder is a stub that loads on demand, and each stub
+# carries its size on disk. (The loaded row and the --model + --model-dir shape need a real load: test_cold_load.sh.)
+ROWS="$(curl -s "http://127.0.0.1:$PORT/v1/models" | python3 -c \
+  "import sys,json
+d=json.load(sys.stdin)['data']
+print(sum(1 for m in d if m.get('loaded')), sum(1 for m in d if not m.get('loaded')), sum(1 for m in d if (m.get('meta',{}).get('bytes_on_disk') or 0) > 0))")"
+[ "$ROWS" = "0 4 4" ] \
+  && echo "PASS: headless boot loads nothing; four stubs, each with bytes_on_disk" \
+  || { echo "FAIL: loaded/stubs/with-bytes was [$ROWS], wanted [0 4 4]"; rc=1; }
 # The surviving `org/shared` must be the FIRST root's copy — the app orders the
 # download destination first precisely so its copy is the live one. The two
 # copies declare different architectures, so the served entry names which folder
@@ -64,9 +76,9 @@ ARCH=$(curl -s "http://127.0.0.1:$PORT/v1/models" | python3 -c \
   "import sys,json
 d=[m for m in json.load(sys.stdin)['data'] if m['id']=='org/shared']
 print(d[0].get('meta',{}).get('architecture','') if d else '')")
-[ "$ARCH" = "qwen3" ] \
+[ "$ARCH" = "qwen4_exp" ] \
   && echo "PASS: a duplicate id resolves to the FIRST folder (arch $ARCH)" \
-  || { echo "FAIL: duplicate resolved to arch '$ARCH', wanted the first folder's qwen3"; rc=1; }
+  || { echo "FAIL: duplicate resolved to arch '$ARCH', wanted the first folder's qwen4_exp"; rc=1; }
 grep -q "already found in an earlier --model-dir" "$TMP/multi.log" \
   && echo "PASS: the skipped duplicate is logged" \
   || { echo "FAIL: nothing logged about the skipped duplicate"; rc=1; }
@@ -90,6 +102,25 @@ GOT="$(ids)"
 grep -q "scan failed" "$TMP/missing.log" \
   && echo "PASS: the skipped folder is named in the log" \
   || { echo "FAIL: nothing logged about the unreachable folder"; rc=1; }
+stop
+
+# ── [3b] The repo's test fixtures and dot folders are not models to list below a root, but a root NAMED at
+# test-fixtures lists what is inside it.
+mk d/org/real     qwen4_exp
+mk d/test-fixtures/tiny qwen4_exp
+mk d/org/test-fixtures  qwen4_exp
+mk d/.hidden/h    qwen4_exp
+boot "$TMP/fixtures.log" "$TMP/d" || exit 1
+GOT="$(ids)"
+[ "$GOT" = "org/real" ] \
+  && echo "PASS: test-fixtures and dot folders below a root are not listed ($GOT)" \
+  || { echo "FAIL: below a root got [$GOT], wanted [org/real]"; rc=1; }
+stop
+boot "$TMP/fixtures-root.log" "$TMP/d/test-fixtures" || exit 1
+GOT="$(ids)"
+[ "$GOT" = "tiny" ] \
+  && echo "PASS: a --model-dir named at test-fixtures lists what is inside ($GOT)" \
+  || { echo "FAIL: named test-fixtures root got [$GOT], wanted [tiny]"; rc=1; }
 stop
 
 # ── [4] Past the cap the server REFUSES rather than silently dropping folders —

@@ -13,6 +13,8 @@
 const std = @import("std");
 const log = @import("log.zig");
 const model_mod = @import("model.zig");
+const model_settings = @import("model_settings.zig");
+const effort_mod = @import("effort.zig");
 
 pub const Budget = struct { context: u64, output: u64 };
 
@@ -48,7 +50,7 @@ pub const Entry = struct {
 /// pi's thinking levels, in its own order.
 const pi_levels = [_][]const u8{ "off", "minimal", "low", "medium", "high", "xhigh" };
 /// The server's effort vocabulary, in order; `on` ranks below every graded word.
-const server_efforts = @typeInfo(model_mod.Effort).@"enum".field_names;
+const server_efforts = @typeInfo(effort_mod.Effort).@"enum".field_names;
 
 fn listed(words: []const []const u8, w: []const u8) bool {
     for (words) |x| if (std.mem.eql(u8, x, w)) return true;
@@ -95,6 +97,7 @@ pub const AgentKind = enum {
     pi,
     omp,
     opencode,
+    dsh,
     codex,
     hermes,
     aider,
@@ -110,7 +113,7 @@ pub const AgentKind = enum {
         return null;
     }
 
-    pub const names = "claude, pi, omp, opencode, codex, hermes, aider, zcode, grok";
+    pub const names = "claude, pi, omp, opencode, dsh, codex, hermes, aider, zcode, grok";
 };
 
 pub const zcodeConfigJson = @import("zcode_launch.zig").configJson;
@@ -253,6 +256,76 @@ fn writeOmpThinking(allocator: std.mem.Allocator, out: *std.ArrayList(u8), accep
         n += 1;
     };
     try out.appendSlice(allocator, "}\n");
+}
+
+/// The npm scope of dsh and its plugins.
+const dsh_scope = "@deepseek-ai/dsh";
+
+/// `dsh` (Harness) patch layer for `dsh --patch`: the sushi provider with every
+/// chat-capable model, and the default model. The user's own `cordis.patch.yml` is never touched.
+pub fn dshPatchYaml(allocator: std.mem.Allocator, base_url: []const u8, model: []const u8, api_key: []const u8, entries: []const Entry) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.print(allocator,
+        \\# written by sushi: the sushi provider for dsh.
+        \\# Regenerated at each launch and passed with `dsh --patch`; your own patch layer is untouched.
+        \\- id: agent-default-model
+        \\  name: "{s}-agent-default-model"
+        \\  config:
+        \\    provider: sushi
+        \\    model: "{f}"
+        \\- id: llm-pi-ai
+        \\  name: "{s}-llm-pi-ai"
+        \\  config:
+        \\    providers:
+        \\      sushi:
+        \\        displayName: sushi
+        \\        api: openai-completions
+        \\        baseURL: "{f}/v1"
+        \\        headers:
+        \\          Authorization: "Bearer {f}"
+        \\        compat:
+        \\          supportsDeveloperRole: false
+        \\          supportsReasoningEffort: true
+        \\          maxTokensField: max_tokens
+        \\
+    , .{ dsh_scope, esc(model), dsh_scope, esc(base_url), esc(api_key) });
+    for (entries) |e| if (std.mem.eql(u8, e.id, model)) {
+        if (e.default_effort) |w| if (dshLevel(w)) |lvl| try out.print(allocator, "        reasoning: {s}\n", .{lvl});
+    };
+    try out.appendSlice(allocator, "        models:\n");
+    for (entries) |e| {
+        try out.print(allocator,
+            \\          - id: "{f}"
+            \\            name: "{f} (sushi)"
+            \\            contextWindow: {d}
+            \\            maxTokens: {d}
+            \\            input: [{s}]
+            \\
+        , .{ esc(e.id), esc(e.id), e.budget.context, dshMaxTokens(e.budget), if (e.vision) "text, image" else "text" });
+        var n: usize = 0;
+        for (e.efforts orelse &.{}) |w| if (dshLevel(w)) |lvl| {
+            if (n == 0) try out.appendSlice(allocator, "            reasoningEfforts:\n");
+            try out.print(allocator, "              \"{s}\": \"{s}\"\n", .{ lvl, w });
+            n += 1;
+        };
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// dsh's thinking level for a server effort word: itself, or high for `on` (an on/off model).
+fn dshLevel(word: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, word, "on")) return "high";
+    for ([_][]const u8{ "off", "minimal", "low", "medium", "high", "xhigh", "max" }) |lvl| {
+        if (std.mem.eql(u8, word, lvl)) return lvl;
+    }
+    return null;
+}
+
+/// The row's output cap for dsh: half the window, up to the 256000 the largest model omits `max_tokens` at.
+/// `/v1/models` carries no output limit of its own.
+pub fn dshMaxTokens(budget: Budget) u64 {
+    return @min(256000, @max(1024, budget.context / 2));
 }
 
 /// opencode config — carried inline via OPENCODE_CONFIG_CONTENT (merges over
@@ -643,6 +716,16 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
             try out.append(allocator, '\n');
             return out.toOwnedSlice(allocator);
         },
+        .dsh => {
+            // The user's dsh when installed, else the published npx package; `--profile web` is the
+            // interactive default and the layer rides after it, past the user's own patch layer.
+            try out.print(allocator,
+                \\if command -v dsh >/dev/null 2>&1; then sushi_dsh=(dsh)
+                \\elif command -v npx >/dev/null 2>&1; then sushi_dsh=(npx --yes {s})
+                \\else echo "dsh is not installed: install Node.js, then npx {s} web" >&2; exit 127; fi
+                \\"${{sushi_dsh[@]}}" --profile web --patch "$HOME/.sushi/dsh/patch.yml"
+            , .{ dsh_scope, dsh_scope });
+        },
         .grok => {
             try out.appendSlice(allocator,
                 \\export GROK_HOME="$HOME/.sushi/grok"
@@ -831,6 +914,11 @@ fn writeAgentFile(allocator: std.mem.Allocator, io: std.Io, subdir: []const u8, 
 fn writeConfigs(allocator: std.mem.Allocator, io: std.Io, kind: AgentKind, base_url: []const u8, model: []const u8, budget: Budget, entries: []const Entry) !void {
     switch (kind) {
         .claude, .opencode => {},
+        .dsh => {
+            const yml = try dshPatchYaml(allocator, base_url, model, "sushi", entries);
+            defer allocator.free(yml);
+            try writeAgentFile(allocator, io, "dsh", "patch.yml", yml);
+        },
         .grok => {
             const toml = try grokConfigToml(allocator, base_url, model, budget, entries);
             defer allocator.free(toml);
@@ -889,7 +977,8 @@ const LaunchArgs = struct {
     kind: AgentKind,
     model: ?[]const u8 = null,
     url: ?[]const u8 = null,
-    port: u16 = 12345,
+    /// null: the settings file's `server.port`, else 12345.
+    port: ?u16 = null,
     print_only: bool = false,
     think: ?[]const u8 = null,
     persist: bool = false,
@@ -945,7 +1034,8 @@ fn printLaunchUsage() void {
         \\options:
         \\  --model <id>   Serve this model (default: the server's default model)
         \\  --url <base>   Server base URL (default: http://127.0.0.1:<port>)
-        \\  --port <n>     Server port for the default URL (default: 12345)
+        \\  --port <n>     Server port for the default URL (default: 12345, or
+        \\                 `server.port` in ~/.sushi/model-settings.json)
         \\  --think <word> OpenCode only: explicitly request a server-advertised
         \\                 reasoning effort (including off when supported)
         \\  --persist      OpenCode only: back up and merge into the user config
@@ -969,7 +1059,7 @@ pub fn cmdLaunch(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     };
 
     var url_buf: [64]u8 = undefined;
-    const base_url = parsed.url orelse std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}", .{parsed.port}) catch unreachable;
+    const base_url = parsed.url orelse std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}", .{parsed.port orelse model_settings.defaultPort(allocator, io)}) catch unreachable;
 
     if (!serverUp(allocator, io, base_url)) {
         log.err("no sushi server at {s}.\n", .{base_url});
@@ -1065,7 +1155,7 @@ pub fn cmdLaunch(allocator: std.mem.Allocator, io: std.Io, args: []const []const
 
     if (parsed.print_only) {
         var stdout_buf: [8192]u8 = undefined;
-        var stdout_w = std.Io.File.stdout().writer(io, &stdout_buf);
+        var stdout_w = std.Io.File.stdout().writerStreaming(io, &stdout_buf);
         stdout_w.interface.writeAll(script) catch {};
         stdout_w.interface.flush() catch {};
         return;
@@ -1162,11 +1252,20 @@ test "pi models.json and opencode config parse as JSON and stay single-quote-fre
     }
 }
 
+fn listedCount(comptime model_type: []const u8) usize {
+    var n: usize = 0;
+    for (effort_mod.effortArms(model_type).?) |a| n += @intFromBool(effort_mod.isListed(a));
+    return n;
+}
+
 /// A served arch's `/v1/models` `reasoning_efforts`, read from the engine's own table.
-fn advertised(comptime model_type: []const u8) [model_mod.effortArms(model_type).?.len][]const u8 {
-    const arms = comptime model_mod.effortArms(model_type).?;
-    var words: [arms.len][]const u8 = undefined;
-    for (arms, 0..) |a, i| words[i] = @tagName(a.effort);
+fn advertised(comptime model_type: []const u8) [listedCount(model_type)][]const u8 {
+    var words: [listedCount(model_type)][]const u8 = undefined;
+    var i: usize = 0;
+    for (effort_mod.effortArms(model_type).?) |a| if (effort_mod.isListed(a)) {
+        words[i] = @tagName(a.effort);
+        i += 1;
+    };
     return words;
 }
 const qwen4_efforts = advertised("qwen4_exp");
@@ -1330,8 +1429,9 @@ test "launch args: the removed --no-start is a usage error" {
     try t.expectError(error.Usage, parseLaunchArgs(&.{ "codex", "--no-start" }));
 }
 
-test "launch args: the default port is sushi's own, clear of mlx-serve's 11234" {
-    try t.expectEqual(@as(u16, 12345), (try parseLaunchArgs(&.{"opencode"})).port);
+test "launch args: no --port leaves the port to the settings file's server.port, which falls back to sushi's own 12345" {
+    try t.expectEqual(@as(?u16, null), (try parseLaunchArgs(&.{"opencode"})).port);
+    try t.expectEqual(@as(?u16, 8080), (try parseLaunchArgs(&.{ "opencode", "--port", "8080" })).port);
 }
 
 test "script assembly: extras are shell-quoted onto the invocation line" {
@@ -1482,60 +1582,69 @@ test "opencode script: optional --standalone follows the subcommand, the model r
     try t.expect(std.mem.indexOf(u8, flag, "\n\"$sushi_opencode_bin\" \"${sushi_opencode_flags[@]}\" '--continue'\n") != null);
 }
 
-/// Runs the opencode launch script under `zsh -f` with fake `opencode`s, each spec `dir|--version output|--help
-/// output`, on PATH in the order given. Returns what the chosen fake logged.
-fn runOpencodeFakes(extras: []const []const u8, specs: []const []const u8, exit_code: u8) ![]u8 {
-    const script = try scriptFor(t.allocator, .opencode, "http://x:1", "m1", FALLBACK_BUDGET, "{}", extras);
-    defer t.allocator.free(script);
-    const setup =
-        \\d=$(mktemp -d); trap 'rm -rf $d' EXIT
-        \\pdirs=()
-        \\for spec in "$@"; do
-        \\  f=("${(@s:|:)spec}")
-        \\  mkdir $d/$f[1]; pdirs+=($d/$f[1])
-        \\  print -r -- "#!/bin/sh
-        \\case \$1 in --version) echo '$f[2]';; --help) echo '$f[3]';; *) echo \"picked $f[1] \$*\" >> $d/log;; esac" > $d/$f[1]/opencode
-        \\  chmod +x $d/$f[1]/opencode
-        \\done
-        \\PATH="${(j.:.)pdirs}:/usr/bin:/bin"
+const OpencodeCase = struct {
+    extras: []const []const u8 = &.{},
+    specs: []const []const u8,
+    exit_code: u8 = 0,
+    logged: []const u8 = "",
+};
+
+/// Runs every case's opencode launch script in ONE `zsh -f`, each in a subshell with fake `opencode`s on PATH in
+/// the order of its specs (`dir|--version output|--help output`), and checks what the chosen fake logged and the exit code.
+fn expectOpencodeFakes(cases: []const OpencodeCase) !void {
+    var full = std.ArrayList(u8).empty;
+    defer full.deinit(t.allocator);
+    var expected = std.ArrayList(u8).empty;
+    defer expected.deinit(t.allocator);
+    // macOS scans each new executable on its first run; hard links to one fake share that scan.
+    try full.appendSlice(t.allocator,
+        \\d0=$(mktemp -d); trap 'rm -rf $d0' EXIT
+        \\print -r -- '#!/bin/sh
+        \\d=${0%/*}
+        \\case $1 in --version) cat $d/ver;; --help) cat $d/help;; *) echo "picked ${d##*/} $*" >> ${d%/*}/log;; esac' > $d0/fake
+        \\chmod +x $d0/fake
         \\
-    ;
-    const full = try std.mem.concat(t.allocator, u8, &.{ setup, script, "\ncat $d/log\n" });
-    defer t.allocator.free(full);
-    var argv = std.ArrayList([]const u8).empty;
-    defer argv.deinit(t.allocator);
-    try argv.appendSlice(t.allocator, &.{ "/bin/zsh", "-f", "-c", full, "sushi-test" });
-    try argv.appendSlice(t.allocator, specs);
-    const r = try std.process.run(t.allocator, t.io, .{ .argv = argv.items });
+    );
+    for (cases, 0..) |c, i| {
+        const script = try scriptFor(t.allocator, .opencode, "http://x:1", "m1", FALLBACK_BUDGET, "{}", c.extras);
+        defer t.allocator.free(script);
+        try full.print(t.allocator, "(d=$d0/{d}; mkdir $d; set --", .{i});
+        for (c.specs) |spec| try full.print(t.allocator, " '{s}'", .{spec});
+        try full.appendSlice(t.allocator,
+            \\
+            \\pdirs=()
+            \\for spec in "$@"; do
+            \\  f=("${(@s:|:)spec}")
+            \\  mkdir $d/$f[1]; pdirs+=($d/$f[1])
+            \\  ln $d0/fake $d/$f[1]/opencode
+            \\  print -r -- $f[2] > $d/$f[1]/ver; print -r -- $f[3] > $d/$f[1]/help
+            \\done
+            \\PATH="${(j.:.)pdirs}:/usr/bin:/bin"
+            \\
+        );
+        try full.appendSlice(t.allocator, script);
+        try full.appendSlice(t.allocator, "\ncat $d/log\n)\nprint -r -- \"=== $?\"\n");
+        try expected.print(t.allocator, "{s}=== {d}\n", .{ c.logged, c.exit_code });
+    }
+    const r = try std.process.run(t.allocator, t.io, .{ .argv = &.{ "/bin/zsh", "-f", "-c", full.items } });
     defer t.allocator.free(r.stderr);
-    errdefer t.allocator.free(r.stdout);
-    try t.expectEqual(exit_code, r.term.exited);
-    return r.stdout;
+    defer t.allocator.free(r.stdout);
+    try t.expectEqualStrings(expected.items, r.stdout);
 }
 
-test "opencode script: the newest opencode on PATH launches, whichever comes first" {
+test "opencode script: the newest opencode on PATH launches whichever comes first, and none exits 127" {
     const old = "old|1.4.2|usage: opencode [options]";
     const new = "new|opencode v2.0.18|usage: opencode --standalone";
-    for ([_][2][]const u8{ .{ old, new }, .{ new, old } }) |order| {
-        const out = try runOpencodeFakes(&.{ "run", "hi" }, &order, 0);
-        defer t.allocator.free(out);
-        try t.expectEqualStrings("picked new run --standalone hi\n", out);
-    }
-    // Versions compare by number, not by text: 10.0.0 outranks 9.9.9.
-    const out = try runOpencodeFakes(&.{}, &.{ "nine|9.9.9|", "ten|10.0.0|" }, 0);
-    defer t.allocator.free(out);
-    try t.expectEqualStrings("picked ten \n", out);
-}
-
-test "opencode script: an unreadable version still launches when it is the only opencode, and none exits 127" {
-    const only = try runOpencodeFakes(&.{}, &.{"odd|not a version|"}, 0);
-    defer t.allocator.free(only);
-    try t.expectEqualStrings("picked odd \n", only);
-    const ranked = try runOpencodeFakes(&.{}, &.{ "odd|not a version|", "old|1.4.2|" }, 0);
-    defer t.allocator.free(ranked);
-    try t.expectEqualStrings("picked old \n", ranked);
-    const none = try runOpencodeFakes(&.{}, &.{}, 127);
-    defer t.allocator.free(none);
+    try expectOpencodeFakes(&.{
+        .{ .extras = &.{ "run", "hi" }, .specs = &.{ old, new }, .logged = "picked new run --standalone hi\n" },
+        .{ .extras = &.{ "run", "hi" }, .specs = &.{ new, old }, .logged = "picked new run --standalone hi\n" },
+        // Versions compare by number, not by text: 10.0.0 outranks 9.9.9.
+        .{ .specs = &.{ "nine|9.9.9|", "ten|10.0.0|" }, .logged = "picked ten \n" },
+        // An unreadable version still launches when it is the only opencode, and loses to a readable one.
+        .{ .specs = &.{"odd|not a version|"}, .logged = "picked odd \n" },
+        .{ .specs = &.{ "odd|not a version|", "old|1.4.2|" }, .logged = "picked old \n" },
+        .{ .specs = &.{}, .exit_code = 127 },
+    });
 }
 
 test "grok names" {
@@ -1714,4 +1823,93 @@ test "opencode persist flag is explicit and agent scoped" {
     try t.expect((try parseLaunchArgs(&.{ "opencode", "--persist", "--think", "xhigh" })).persist);
     try t.expect(!(try parseLaunchArgs(&.{"opencode"})).persist);
     try t.expectError(error.Usage, parseLaunchArgs(&.{ "pi", "--persist" }));
+}
+
+const dsh_rows = [_]Entry{
+    .{
+        .id = "big-1m",
+        .budget = budgetForContext(1048576),
+        .vision = true,
+        .loaded = true,
+        .efforts = &.{ "off", "low", "high", "max" },
+        .default_effort = "high",
+    },
+    .{ .id = "plain", .budget = budgetForContext(24576), .vision = false, .loaded = false },
+};
+
+test "dsh patch: default model, provider wiring and the key header" {
+    const yml = try dshPatchYaml(t.allocator, "http://127.0.0.1:12345", "big-1m", "sushi", &dsh_rows);
+    defer t.allocator.free(yml);
+    for ([_][]const u8{
+        "- id: agent-default-model\n  name: \"@deepseek-ai/dsh-agent-default-model\"\n  config:\n    provider: sushi\n    model: \"big-1m\"\n",
+        "- id: llm-pi-ai\n  name: \"@deepseek-ai/dsh-llm-pi-ai\"\n",
+        "        api: openai-completions\n        baseURL: \"http://127.0.0.1:12345/v1\"\n",
+        "        headers:\n          Authorization: \"Bearer sushi\"\n",
+        "          supportsDeveloperRole: false\n          supportsReasoningEffort: true\n          maxTokensField: max_tokens\n",
+        "        reasoning: high\n",
+    }) |want| try t.expect(std.mem.indexOf(u8, yml, want) != null);
+    try t.expect(std.mem.indexOf(u8, yml, "ui-settings-general") == null);
+}
+
+test "dsh patch: each row keeps its own window, output cap, input and efforts" {
+    const yml = try dshPatchYaml(t.allocator, "http://h:1", "big-1m", "sushi", &dsh_rows);
+    defer t.allocator.free(yml);
+    const ds = "          - id: \"big-1m\"\n            name: \"big-1m (sushi)\"\n" ++
+        "            contextWindow: 1048576\n            maxTokens: 256000\n            input: [text, image]\n" ++
+        "            reasoningEfforts:\n              \"off\": \"off\"\n              \"low\": \"low\"\n" ++
+        "              \"high\": \"high\"\n              \"max\": \"max\"\n";
+    try t.expect(std.mem.indexOf(u8, yml, ds) != null);
+    const plain = "          - id: \"plain\"\n            name: \"plain (sushi)\"\n" ++
+        "            contextWindow: 24576\n            maxTokens: 12288\n            input: [text]\n";
+    try t.expect(std.mem.indexOf(u8, yml, plain) != null);
+    try t.expectEqual(@as(?usize, null), std.mem.indexOf(u8, yml[std.mem.indexOf(u8, yml, plain).?..], "reasoningEfforts"));
+}
+
+test "dsh patch: an on/off row maps on to high, a server-only word is dropped" {
+    const rows = [_]Entry{.{ .id = "m", .budget = FALLBACK_BUDGET, .vision = false, .loaded = true, .efforts = &.{ "off", "on", "bogus" }, .default_effort = "on" }};
+    const yml = try dshPatchYaml(t.allocator, "http://h:1", "m", "sushi", &rows);
+    defer t.allocator.free(yml);
+    try t.expect(std.mem.indexOf(u8, yml, "              \"off\": \"off\"\n              \"high\": \"on\"\n") != null);
+    try t.expect(std.mem.indexOf(u8, yml, "bogus") == null);
+    try t.expect(std.mem.indexOf(u8, yml, "        reasoning: high\n") != null);
+}
+
+test "dsh patch: a row without efforts declares none and sets no default level" {
+    const rows = [_]Entry{.{ .id = "m", .budget = FALLBACK_BUDGET, .vision = false, .loaded = true }};
+    const yml = try dshPatchYaml(t.allocator, "http://h:1", "m", "sushi", &rows);
+    defer t.allocator.free(yml);
+    try t.expect(std.mem.indexOf(u8, yml, "reasoning") == null);
+}
+
+test "dsh patch: ids, url and key are escaped as YAML double-quoted data" {
+    const id = "a\"b\\c'd\ne";
+    const rows = [_]Entry{.{ .id = id, .budget = FALLBACK_BUDGET, .vision = false, .loaded = true }};
+    const yml = try dshPatchYaml(t.allocator, "http://h\"x:1", id, "k\"ey", &rows);
+    defer t.allocator.free(yml);
+    try t.expect(std.mem.indexOf(u8, yml, "model: \"a\\\"b\\\\c'd\\ne\"\n") != null);
+    try t.expect(std.mem.indexOf(u8, yml, "- id: \"a\\\"b\\\\c'd\\ne\"\n") != null);
+    try t.expect(std.mem.indexOf(u8, yml, "baseURL: \"http://h\\\"x:1/v1\"\n") != null);
+    try t.expect(std.mem.indexOf(u8, yml, "Authorization: \"Bearer k\\\"ey\"\n") != null);
+}
+
+test "dsh output cap: half the window up to 256000, never below 1024" {
+    try t.expectEqual(@as(u64, 256000), dshMaxTokens(budgetForContext(1048576)));
+    try t.expectEqual(@as(u64, 131072), dshMaxTokens(budgetForContext(262144)));
+    try t.expectEqual(@as(u64, 1024), dshMaxTokens(budgetForContext(1500)));
+    try t.expectEqual(@as(u64, 16384), dshMaxTokens(budgetForContext(0)));
+}
+
+test "dsh script: the user's dsh when installed, else npx, with the generated layer after --patch" {
+    const script = try scriptFor(t.allocator, .dsh, "http://x:1", "m1", FALLBACK_BUDGET, null, &.{ "--no-open", "a b" });
+    defer t.allocator.free(script);
+    try t.expect(std.mem.indexOf(u8, script, "--profile web --patch \"$HOME/.sushi/dsh/patch.yml\" '--no-open' 'a b'\n") != null);
+    try t.expect(std.mem.indexOf(u8, script, "command -v dsh") != null);
+    try t.expect(std.mem.indexOf(u8, script, "npx --yes " ++ dsh_scope) != null);
+    try t.expect(std.mem.indexOf(u8, script, "exit 127") != null);
+}
+
+test "launch args: dsh is a named agent and takes no opencode-only flag" {
+    try t.expectEqual(AgentKind.dsh, AgentKind.fromName("dsh").?);
+    try t.expect(std.mem.indexOf(u8, AgentKind.names, "dsh") != null);
+    try t.expectError(error.Usage, parseLaunchArgs(&.{ "dsh", "--think", "high" }));
 }

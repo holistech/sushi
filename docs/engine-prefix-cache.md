@@ -2,7 +2,7 @@
 
 How prompt-prefix KV reuse works: the hot RAM cache, hybrid (GDN/QSA) restore points, the SSD tier and SSD-first
 mode, checkouts and donations, spec state riding the cache, and GLM's native state. Read this before touching `src/prefix_cache.zig`,
-`src/kv_disk_cache.zig` or `src/kv_disk_writer.zig`.
+`src/kv_disk_cache.zig`, `src/disk_placement.zig` or `src/kv_disk_writer.zig`.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-kv-cache.md),
 [engine-memory-admission](engine-memory-admission.md), [engine-mtp](engine-mtp.md),
@@ -13,11 +13,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 | File | Role |
 |---|---|
 | `src/prefix_cache.zig` | Hot prefix cache (`--prefix-cache-entries`, `--prefix-cache-mem`) |
-| `src/kv_disk_cache.zig` | SSD tier (`--prefix-cache-disk`), its default budget (`resolveDiskBudget`) and startup/usage lines |
+| `src/kv_disk_cache.zig` | SSD tier (`--prefix-cache-disk`) |
+| `src/disk_placement.zig` | The SSD tier's default budget (`resolveDiskBudget`), cache roots and model fingerprint, and the startup/usage lines |
 | `src/kv_disk_writer.zig` | SSD-first mode's background writer thread |
+| `src/disk_write_stats.zig` | Cumulative write bytes by file kind, per tier and per process ([write counters](#write-counters)) |
 | `src/restore_dump.zig` | Prefix-cache restore diagnostics (`tests/diff_restore_dump.py`) |
-| `src/glm5_prefix.zig` | GLM restore points: KDA checkpoints, MLA rows, their SSD layout ([GLM](glm5-prefix-cache.md#glm)) |
-| `src/dsv41_prefix.zig` | DeepSeek-V4.1 restore points: the whole request state as one checkpoint, both tiers ([DeepSeek](dsv41-arch.md#prefix-cache)) |
+| `src/glm5/glm5_prefix.zig` | GLM restore points and the `HotPrefixCache` arms and tests that serve them: KDA checkpoints, MLA rows, their SSD layout ([GLM](glm5-prefix-cache.md#glm)) |
+| `src/dsv41/dsv41_prefix.zig` | DeepSeek-V4.1 restore points and the `HotPrefixCache` arms and tests that serve them: the whole request state as one checkpoint, both tiers ([DeepSeek](dsv41-arch.md#prefix-cache)) |
 
 ## Basics
 
@@ -36,21 +38,29 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   in BOTH directions: placeholder ids are ordinary vocabulary entries, so a TEXT prompt can match a media record's
   tokens past its first image row while the rows there are that record's pixels — a text request is held to the
   record's pre-media text, never given its image rows.
+- **A commit reuses a record only under its own media key** (`DiskTier.commitShares`, the rule with no chain): it is
+  superseded by, extends or tops up a record only where that record's rows are its rows, an equal key or text wholly
+  below both sides' first media row; a chunk-share donor lends only whole chunks below that bound. Two same-size images
+  render the same placeholder ids, so a token-only match let image B's commit extend image A's record and restore A's
+  state. A turn that appends a second image gets a fresh record (donor chunks below the first image), not an extend.
 - **A record claims only the media blocks its rows cover** (`truncatedMediaKey`): a write-through chunk or a cancelled
   prefill that stops between two blocks claims the chain up to the last block inside it. Key 0 means no media row at
   all, which is what lets a text prompt share a record whole. Overclaiming is safe (an equal key is clamped by
   `kv_len`, a different one falls to the pre-media text) but costs the reuse of the blocks the record does hold.
 - **The media key is a PERSISTED format.** It is `mediaChain`'s Wyhash over each block's preprocessed pixels, grid and
-  position (`server.zig`), stored as hex because a u64 key runs past JSON's i64. Changing what it hashes without
+  position (`request_media.zig`), stored as hex because a u64 key runs past JSON's i64. Changing what it hashes without
   changing the hash would make a stale record match a prompt it does not describe; a changed hash only costs misses.
   The tier fingerprint (model dir + `config.json`) covers the tower's weights, and `ImageData.pixels` is already
-  post-preprocessing, so a preprocessing change rolls the key by itself.
+  post-preprocessing, so a preprocessing change rolls the key by itself. The tower's storage is in the key's seed
+  (`--vision-bf16` or the requantized affine-8 tower give other rows for the same pixels); text records stay shared.
 - **A restore is not bit-identical on a HYBRID** (≤ 0.047 nats; the chunking class ~0.3 nats top-5 for QSA state) ⇒
   byte-stable greedy needs `--prefix-cache-entries 0`. A hybrid cache hit moves the top logprob ~0.2 nats, so any
   scorer boots with the cache off.
 - Every request logs one `[prefix] reused N of M prompt tokens from RAM|SSD|nothing, prefilling K; lookup and restore X ms` line (`[dsv41-prefix]` on DeepSeek); `prompt_ms` includes that time and `sushi bench` takes it out.
 - The always-on SSM snapshot sits 30 tokens BEFORE prompt end; a restored tail inside that window forwards as ONE
-  span (`ssmSnapshotBackoff`). Guard: `tests/test_hybrid_reuse_equivalence.sh`.
+  span (`prefill_plan.ssmSnapshotBackoff`). Guard: `tests/test_prefix_reuse.sh`.
+- A speculative Qwen turn also leaves a point right behind its reply ([decode-end points](#decode-end-points)), so the
+  next turn re-prefills none of it; a serial finish keeps only the prompt-end point.
 - **A ringed (sliding-window) entry restores at its end or at one of its ring checkpoints**
   (`KVCache.ringCheckpoint`, `Entry.ring_cps`, up to `RING_CHECKPOINT_MAX` = 8): each ringed layer's
   window + 30 rows at a position (down to the window when the ring holds no more, as one restored off a checkpoint
@@ -88,10 +98,23 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   past the store. The manifest lists the segments' bytes (`grown`, v11, which an older reader drops); a scan keeps the
   contiguous valid segments and drops each point that leans on a lost one. Segment bytes ride the entry's bill
   (`nonChunkBytes`, `bytesFreedByRemoving`, `billChunksOnce`) and the pre-write estimate (`entryBytesAt`).
+- **A new entry inherits row segments from the entry holding the most** (`segmentDonor`, `linkInheritedSegments`, SSD-first
+  or a writer; not the chunk donor, which may be a later turn that crossed no grid point and holds none): the segments
+  whose whole span lies inside the prefix donor and heir share, which a point of the commit leans on,
+  are hard-linked (rows are append-only, so the bytes are the heir's own), and the heir writes the rest. The first
+  `inherited_grown` of its `grown` list (the manifest's `grown.inherited`) are billed by the donor, like
+  `inherited_chunks`; the filesystem is the refcount (`nlink`), so evicting either entry frees only the last link and a
+  scan bills an inode once. `entryBytesAt` still assumes none is shared. A turn that drops its predecessor's thinking
+  rewrote all of a 500k-token conversation's ~440 MB of rows into every new entry; it now writes the rows past the
+  divergence. Only a segment whose span ends at or before `DiskTier.rows_base` is linked (DeepSeek sets it to the request's
+  restore or rollback point, `Live.base`): a span holding rows the heir recomputed is written fresh, so a restore of the
+  heir is its live state's bytes.
 - **DeepSeek rolls its live state back before any stored restore** (`HotPrefixCache.rollbackLiveDsv41`,
   `dsv41_prefix.Live`; [dsv41-arch](dsv41-arch.md#prefix-cache)): the slot's last request keeps the fixed arrays of its
   deepest 8 points in RAM, and a prompt sharing its history rolls the model's state back to the deepest one it reaches
   unless a stored point reaches further. Valid only while `Model.state_epoch` is unchanged and a request finished over it.
+  Its off-grid points (prompt end, thought) are not written through; `flushLiveDsv41` writes them when the state is about to
+  be lost (handover, unload, 300 s idle, shutdown). A crash restores from the last grid point.
 - **With both tiers on, a flushed ringed entry keeps only its newest two ring checkpoints in RAM**
   (`RING_CHECKPOINT_RAM_KEEP`, `releaseRingCpsToDisk` at the end of every `flushPendingDisk`): each older one the SSD
   tier holds a ring file for (`DiskTier.ringPointsHeld`: an unpoisoned entry whose tokens agree through the point) leaves
@@ -141,6 +164,20 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   capacity, or a ring checkpoint whose rows become its ring (`trimmedCopy`'s `ring_cp`). Its ringed layers are a
   constant, not a per-token price: priced per token, every MiMo target fell below the ring and every entry declined.
 - A decline carries its `TrimDecline` reason; a RAM-budget decline spills to SSD (`spillDeclinedToDisk`).
+- **A byte-budget eviction trims an idle victim before it evicts it** (`reclaimFromLru`, `trimVictim`; `retainNewEntry`,
+  a replacement that outgrows the cap, and `setBudget`). The LRU victim is cut to its last restore point whose bill leaves the room needed
+  (`victimTrimLen`: rows at the entry's own row price plus the checkpoints at or below it, none shed or added), as a REAL
+  copy (`trimmedCopy`, `truncateCheckpoints`, shared with the incoming candidate's trim), so the dropped rows free their
+  buffers and `kv_bytes` is re-billed from the new storage. Spec payloads go, and the QSA history is sliced onto the
+  last kept checkpoint. One `[hot-cache] trimmed idle entry (...): N -> M tokens, freed X MB` line per trim.
+  - **Evicted whole instead** (the eviction line carries `; not trimmed: <reason>`): no restore point fits, the point
+    is under `MIN_TRIMMED_VICTIM_TOKENS` (512: a restore under it saves about a quarter second of prefill, Qwen STQ 2.75bpw at ~1,900 tokens/s, and the
+    remnant would still hold an entry slot), the room needed is the entry's whole bill, the entry is ringed or holds state the trim
+    does not bill (GLM's MLA rows), a QSA arch's newest checkpoint holds no bank, or a copy fails. A checked-out entry is never a victim.
+  - The count cap and `evictLruToAdmit` (a live prefill's GPU room, judged on freed live bytes) still evict whole. The
+    SSD tier has no such trim: a record is a directory of chunks, hard-linked inherited chunks, a QSA history file
+    sized to the full prefix and sidecars, so a cut needs the history rewritten and the freed bytes depend on link
+    counts. Its one-entry cut to a restore point is `budgetTarget`.
 
 ## Budget
 
@@ -173,24 +210,24 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   every served model; `--prefix-cache-mem <n>` turns it on and `--prefix-cache-mem 0` (or `off`) keeps it off. Launch flag > default; `model-settings.json` has no prefix-cache key. With RAM off every model runs
   SSD-first (`prefix_cache.ssdFirstActive`: a disk tier and RAM off).
 - **The SSD tier is on and sized per model at load** (`server.prefixCacheDiskForLoad` through
-  `LoadParams.prefix_cache_disk_resolver`, the pure `kv_disk_cache.resolveDiskBudget`):
+  `LoadParams.prefix_cache_disk_resolver`, the pure `disk_placement.resolveDiskBudget`):
   `min(entries x context x bytes_per_token + 2 GB, 20 GB, free disk - 4 GB)`. **Sizes are binary: 1 GB = 1 GiB and 1 KB = 1 KiB**, as
   `--prefix-cache-disk 20GB` is read; every `GB` and `KB` in the lines, the logs and the page is that unit.
   - entries = `--prefix-cache-entries`; context = the model's PINNED served context (`diskContextForLoad` runs the
     idempotent `pinAutoContext`), so the line, `/props` and `/v1/models` name one number; free disk =
-    `kv_disk_cache.volumeSpaceNear` of the cache dir (`SUSHI_PREFIX_CACHE_DIR` or `~/.sushi/kv-cache`).
+    `disk_placement.volumeSpaceNear` of the cache dir (`SUSHI_PREFIX_CACHE_DIR` or `~/.sushi/kv-cache`).
   - bytes_per_token = `server.diskBytesPerToken`, from the SERIALIZED geometry: KV rows at the served width, the one
     pooled QSA history an entry writes, the MTP head's KV and history where the head is on, and a recurrent state's
     share of the point kept on every 8192 tokens (`ssmCheckpointBytes / POINT_GRID`). The QSA score bank is
     execution state and never counts, so no QSA switch moves it. DFlash2's window and MiMo's ring files are fixed per
     entry, not per token; the 2 GB slack is all the formula leaves them.
-  - **The tier's own bytes on disk count as free** (`kv_disk_cache.tierBytes` is added to the volume's free space at
+  - **The tier's own bytes on disk count as free** (`disk_placement.tierBytes` is added to the volume's free space at
     resolution, as `refreshDiskBudget` adds `total_bytes` live), and `DiskTier.operator_cap` is only the flag or the
     formula / 20 GB cap, never a free-space number; else a restart on a full volume evicts what the last boot stored.
   - A result of zero or less turns the tier off and one line says why. `--prefix-cache-disk <n>` is the budget as
     given (an operator's cap: the tier still stores no more than the volume leaves) and `0`/`off` disables;
     `--prefix-cache-entries 0` disables both tiers.
-  - It is a budget, not a preallocation, and ONE reserve governs it: free space less 4 GB (`kv_disk_cache.freeDiskRoom`,
+  - It is a budget, not a preallocation, and ONE reserve governs it: free space less 4 GB (`disk_placement.freeDiskRoom`,
     `DISK_FREE_RESERVE`) at resolution, before every store (`refreshDiskBudget`) and in the report. A budget under 1 GB
     still stores.
   - **The tier comes up before anything is sized for it.** `doLoadOnInferenceThread` resolves and attaches it first; a
@@ -203,7 +240,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   `free disk - 4 GB` or `the flag`), and `Allocating 2.0 GB RAM for the prefix cache (--prefix-cache-mem)` only when RAM
   retention is on.
 - **Each finished turn logs `[disk-cache] usage <used> / <budget> GB, <n> entries`** from the FINISHING model's own
-  tier (`scheduler.logDiskUsage`), and `/props settings.prefix_cache` carries that model's `disk_bytes` (the budget),
+  tier (`slot_outcome.logDiskUsage`), and `/props settings.prefix_cache` carries that model's `disk_bytes` (the budget),
   `disk_used_bytes` and `disk_entries` ([server-http-apis](server-http-apis.md)). `publishDiskStats` writes them onto each
   `LoadedModel.disk_stats` (a sequence-locked snapshot, so the four numbers come from one publish) after every commit,
   load and unload; `/props?model=A` reads A's, whatever model loaded last.
@@ -243,7 +280,7 @@ Qwen prefill chunks write through continuously in SSD-only mode (no env turns it
 prefill writes through too and frees each checkpoint's RAM copy once it is staged ([GLM](glm5-prefix-cache.md#glm)). Hybrid SSM checkpoints, MiMo ring
 restore points and GLM state ([GLM](glm5-prefix-cache.md#glm)) survive restart. Image-bearing entries persist whole, keyed by their media
 chain, so a text -> image -> text conversation restores past its images after a restart (issue #47;
-`tests/test_media_prefix_persist.sh` runs that on all three archs). RAM+SSD is the opt-in
+`tests/test_prefix_cache_restart.sh` runs that on every arch). RAM+SSD is the opt-in
 `--prefix-cache-mem` arrangement. `SUSHI_PREFIX_CACHE_DIR` can select an absolute cache directory; unset, the root stays
 `~/.sushi/kv-cache`. Live tests use a separate root without changing home settings.
 
@@ -256,18 +293,83 @@ Prefill saves only the grid and the prompt end, so a tool loop on Qwen (MTP) or 
 reply every turn. A thinking request with tools now takes one more point mid-decode, DeepSeek's
 ([dsv41-arch](dsv41-arch.md#prefix-cache)) on a recurrent state.
 
-- **The closer is what every turn shares** (`replay` tests in `chat.zig`, pack tokenizer and real template): Qwen re-renders
+- **The closer is what every turn shares** (`replay` tests in `tool_calls.zig`, pack tokenizer and real template): Qwen re-renders
   `<think>\n` + trimmed thought + `\n</think>\n\n`, GLM `<think>` + thought + `</think>`, and both repeat the whole reply. A thought
-  starting in whitespace or ending in any the template does not write is re-rendered (`generate.thoughtEdgesSurvive`) and
+  starting in whitespace or ending in any the template does not write is re-rendered (`mtp_plan.thoughtEdgesSurvive`) and
   its point dropped; a client must send `reasoning_content` back as delivered.
 - **Armed** by `scheduler.armThoughtPoint` for thinking + tools, a prompt of 512 tokens or more ending in `<think>`, and a
-  speculative round; a thought under 512 tokens takes none, and serial decode (state one token ahead) none either.
-- **The round carrying the closer ends on it** (`generate.thoughtRound`): Qwen's verified round accepts only through the
-  closer and the next accepted draft is pending (`cutMtpRound`), so the stream is the whole round's byte for byte; GLM's
+  speculative round; a thought under 512 tokens takes none, and serial decode (state one token ahead) none either. On
+  Qwen a [decode-end point](#decode-end-points) supersedes it.
+- **On Qwen the point needs no grid**: the trunk's QSA leftover is stored at any position. The head's is marked only
+  where its history stands exactly at the point; without a mark a restore that clamps the head below its ring starts
+  it blind (`MtpHeadQsaRingGap`), never wrong, and every path to a commit truncates the head below a stale mark.
+- **The round carrying the closer ends on it** (`mtp_plan.thoughtRound`): Qwen's verified round accepts only through the
+  closer and the next accepted draft is pending (`mtp_plan.cutMtpRound`), so the stream is the whole round's byte for byte; GLM's
   budget is cut to the pool position at or below the closer, and a closer in the round's first rows can leave none.
 - **The state is the newest checkpoint, held from the closer to the commit and billed to a request that takes one** (`WarmPrefix.thought`, `server.qwenThoughtPointBytes`,
   `glmThoughtPointBytes`: 58.8 or 110 MB, 147.6 MB). Both tiers treat it as any checkpoint under the cap of 160; an
   over-budget conversation drops its oldest points first, so the newest stays.
+
+<a id="decode-end-points"></a>
+### Decode-end points: the reply's own end
+
+Turn 2 of a conversation is turn 1 + its reply + a follow-up, and the Qwen template renders the reply back token for
+token (`qwen4 replay` in `tool_calls.zig`). The prompt-end point left every reply to be re-prefilled (issue #83:
+restores at the previous prompt less 31).
+
+- **Taken at a natural finish of an MTP request** (`scheduler.takeDecodeEndPoint`, armed by `armDecodeEndPoint` for
+  Qwen with the head on and checkpoints on): the request's stop token is an end-of-turn id, not a length cut, a stop
+  string or a cancel (`not-eos`).
+- **The point sits before the end token**, at prompt + generated: MTP never forwards the token it leaves pending, and
+  the next prompt repeats `<|im_end|>` there. A round that accepts an end-of-turn draft is cut before it
+  (`mtpStopPrefix`, as a planner round is), so the state stands exactly at the committed tokens.
+- **Serial decode takes none** (`serial-finish`, `mtp_plan.endPointStands`): its trunk forwards the token it samples
+  before it commits it, two past the reply at EOS. The guard is the position the last MTP round left
+  (`Generator.spec_round_end`) against the committed length and the trunk; no per-token check. A switch to serial
+  with the end token already pending stops before the serial block forwards it, and takes the point.
+- **The state is handed over, not copied** (`ssm_cache.handOverSsmCheckpoint`): each live array is re-materialized with
+  its handle dropped, so MLX donates a tight buffer, and a view of a verify capture gets a tight copy that lets the
+  parent go. The slot decodes no further, so nothing is billed during decode; the entry bills the point's real bytes.
+- **It supersedes the thought point**, which is dropped: a thinking request with tools stores no more states than
+  before. A request with no thought stores one more (58.8 MB at `--qwen-gdn 16`), under the hot-cache byte budget
+  and the checkpoint cap like any point.
+- **The edges must come back as generated** (`mtp_plan.replyEdgesSurvive`, plus `thoughtEdgesSurvive` on a thought):
+  the template trims the thought and the answer and writes `\n</think>\n\n` between them, so a reply that starts or
+  ends in whitespace takes none (`edges`) and keeps its thought point.
+- **The MTP head reaches the point**: the finish applies the round's pending history and appends the row that reads
+  the token AT the point when the stop token is `<|im_end|>`, so a restore adopts the head whole
+  (`[qwen4] MTP head restored`). Another stop leaves it one row short and the head starts blind, never the trunk.
+- **The SSD tier carries it unchanged**: the point is the record's newest checkpoint, so `highestSsmPosAtOrBelow`
+  restores at it after the RAM entry is gone, head included.
+- **Measured** (Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw-v2.0, kv8, MTP on, greedy; this change against main
+  29f2c2bd; eight two-turn conversations, four with tool calls and four with a thought; turn 2 rendered by the pack's
+  template and scored over 16 greedy tokens with top-20 logprobs up to the first argmax split; one boot per arm,
+  `taskpolicy -a`, GPU lock per boot, QUIET; 2026-11-05). KL of turn 2's next-token distribution from a cold prefill:
+
+  | arm | restores at | first token, mean / max | every compared token, mean | top-1 |
+  |---|---|---|---|---|
+  | main, RAM | prompt - 31 | 0.0485 / 0.179 nats | 0.0100 | 102/104 |
+  | decode-end, RAM | the reply's end | 0.0479 / 0.216 nats | 0.0101 | 104/106 |
+
+  The SSD-only arm restored at the reply's end with the RAM arm's exact KL on the seven turns over the tier's 512-token
+  floor. The two restores drift from cold alike; the per-turn differences between them are of the same size as each one's
+  distance from cold. Turn 2 prefilled 2,662 fewer tokens over the eight turns (the reply plus the 31-token backoff,
+  333 a turn); on the six turns not first after a boot it took 245 ms less prompt time on average (single runs).
+- **Measured on the eight-category fixture's prompts** (same binaries and settings; turn 1 the fixture's own prompt ids
+  to EOS, at most 4096 tokens, as 512 cut every reply; turn 2 adds "Summarize the above in two sentences.", wikitext a
+  paragraph break). End points were taken on 12 of 16 turns (3 hit the cap, 1 raw text ended in whitespace). KL from
+  cold, first token / every compared token: main 0.0284 / 0.0071, decode-end 0.0286 / 0.0072, decode-end against
+  main 0.0034 / 0.0019; the only top-1 splits are exact first-token ties in story, which main splits too. Turn 2
+  prefilled 16,154 fewer tokens (29,909 -> 13,755): code 2,650, math 3,814, reasoning 4,021, design 2,043, story
+  2,246, stem 1,380, wikitext and multilingual 0.
+- **A reply the model tokenized off the tokenizer's own split is not repeated**: the next prompt re-tokenizes the
+  rendered text, so a Thai or Devanagari reply diverges a few tokens in and restores at the prompt end
+  (`lost N: no-point`), as before; its end point is stored and never used.
+- Diagnostics: `[prefix] decode-end restore point at N` or `[prefix] no decode-end restore point: <why>` at the
+  commit; a RAM restore logs `lost L: <why>` (the entry's own reason, or `no-point` when the prompt diverges inside the
+  entry), an SSD one `matched M, lost L`. Guards: `qwen4 decode-end point` (qwen4_generate_test.zig, pack),
+  `handOverSsmCheckpoint` (ssm_cache.zig), `endPointStands`/`replyEdgesSurvive` (mtp_plan.zig),
+  `tests/qwen4/test_qwen4_decode_end_point.sh` (RAM-only and SSD-only).
 
 <a id="checkpoints-on-ssd"></a>
 ### Qwen's GDN checkpoints live on the SSD
@@ -281,10 +383,10 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
   at f32). Below `MIN_PERSIST_TOKENS` nothing is written, so nothing is released. A failed write is released too: not a
   restore point, and the entry is poisoned at the next commit (`harvestWriteFailures`).
 - **Restore points sit on an 8192-token grid and at each prompt's end, to 1M tokens, on every arch** (Qwen: the
-  checkpoint stride is `effectiveSsmCheckpointStride(256, prefill chunk)`, 8192 unless `--prefill-chunk` is wider, which
+  checkpoint stride is `prefill_plan.effectiveSsmCheckpointStride(256, prefill chunk)`, 8192 unless `--prefill-chunk` is wider, which
   coarsens the grid; GLM: `glm_capture_stride`, [glm5-prefix-cache](glm5-prefix-cache.md); DeepSeek: `row_span`). The SSD
   tier keeps 160 per entry (`SSM_DISK_MAX_PER_ENTRY`), so no count thins a conversation below 1M tokens.
-  `--ssm-checkpoint-max` (16) caps only the states held in memory (`generate.thinHeldCheckpoints` skips released ones);
+  `--ssm-checkpoint-max` (16) caps only the states held in memory (`prefill_plan.thinHeldCheckpoints` skips released ones);
   it never thins what a write-through has put on disk.
 - **One conversation over the SSD budget drops its oldest points first.** Other conversations go whole, least recently
   used first (`gcToBudget`). When one entry alone outgrows the tier, `DiskTier.pointBudget` prices the rows plus the
@@ -296,10 +398,10 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
   bytes it held (`released_bytes`). A restore at any position reads its file.
 - **A request the write-through cannot serve** (a span under one disk chunk) releases nothing, so its list is thinned
   to two (`scheduler.qwenCheckpointCap`) and it holds three states while one is captured. The thinning is
-  span-preserving whatever the prompt carries (`generate.checkpointDropIndex`): a media record persists whole, so
+  span-preserving whatever the prompt carries (`prefill_plan.checkpointDropIndex`): a media record persists whole, so
   there is no boundary to protect, and protecting one dropped every checkpoint ABOVE the image — exactly the state
   the next image-bearing turn restores from. The byte-budget trim never lands on a released checkpoint.
-  `transformer.SSM_RESIDENT_MAX` is the number the admission bill counts
+  `ssm_cache.SSM_RESIDENT_MAX` is the number the admission bill counts
   ([engine-memory-admission](engine-memory-admission.md#bill-checkpoints)).
 - **A RAM tier keeps its entry's newest two** (`keepNewestCheckpoints`, on commit, merge and inheritance), after the
   byte-budget trim, and only where the commit's SSD record carries the rest: a checkpoint past the record's text prefix
@@ -309,11 +411,29 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
 - Guards: `Qwen SSD-only: a prefill holds at most two checkpoint states...` and `with an SSD tier the RAM entry keeps only
   its newest two checkpoints` (prefix_cache.zig), `an SSD tier bounds the checkpoints a Qwen prefill holds` (server.zig).
 
+<a id="admin"></a>
+## Listing and clearing from the admin API
+
+- `src/prefix_cache_admin.zig` lists the cache root's namespaces and clears them
+  ([server-http-apis](server-http-apis.md#ssd-prefix-cache-and-settings-v1prefix-cache-v1settings)). A model's clear is a job on
+  the scheduler's `prefix_clear_queue`, run by the inference thread between ticks (`runClear` → `HotPrefixCache.clearDisk`):
+  the tier has one owner, so nothing races the index, and the writer is fenced (`Writer.fence(null)`) before
+  `DiskTier.invalidateAll` deletes the entries, which keeps the queue, `total_bytes` and the files consistent and the tier writable.
+  A model with a request holding it (`refcount > 0`) is refused, not queued. The tier's namespace is published beside its
+  numbers (`DiskStats.namespace`, the fingerprint directory as a number), which is how the listing names the owner without
+  touching the tier from a connection thread. The stale delete takes each root's `.lock` like `sweepBase`, so a root another
+  process owns is skipped. A new `prefix_cache_disk_gb` runs the same way (`set_cap`: `operator_cap` then `refreshDiskBudget`).
+- The cache volume (`disk_placement.cacheVolume`, on the connection thread): the cache root resolved through symlinks,
+  its free and total bytes and its mount's name. A `SUSHI_PREFIX_CACHE_DIR` that does not exist is unavailable (null
+  name and space), never its parent's volume; the default root, made on first write, reports the volume it will land
+  on. The page warns below 10% free and near the 4 GiB reserve. It reports the destination; it does not stop a write
+  after the volume goes away.
+
 <a id="one-tier-per-root"></a>
 ## One live tier per root
 
 - **A root has one live tier** (`DiskTier.root_lock`: an flock on `<root>/.lock` from `init` to `deinit`; the file is
-  never unlinked). Two processes on one pack (`sushi run X` beside `sushi serve X`) used to share the root, both
+  never unlinked). Two processes on one pack (`sushi run X` beside `sushi serve --model X`) used to share the root, both
   numbered entries from `e1`, and one restored the other's KV for its own prompt with an HTTP 200.
 - **A second tier keeps a private root** `<root>/p<pid>-<n>` and logs one `[disk-cache] ... private SSD tier` line. It
   reuses its own turns, never the shared root's entries, has its own budget, and is removed at `deinit`. A crashed
@@ -371,6 +491,9 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
   an earlier piece keeps what the entry had. Each piece used to rewrite it synchronously.
 - **Nothing is fsynced.** A file lands as `tmp` + `rename` and the manifest last, so a crash of the process leaves
   whole entries; a power loss can leave a manifest naming bytes the disk never kept. A failed restore cold-prefills.
+- **`tokens.bin` is append-only**: an extension writes only its new tail, at the old record's end (a whole record when the file is shorter than the old count). The
+  manifest, which lands last, names the count; `scan` drops a record SHORTER than it and reads the first `tokens` of a longer one, so a kill between the append and
+  the manifest keeps the entry at the old count instead of losing it, and a torn append only leaves bytes past the count that the next extension overwrites.
 - **GLM hands the SSD tier the request's own rows** (`MlaRows.shareLive`, `HotPrefixCache.glmDiskLen`): every row
   through the newest checkpoint that fits the tier's budget, never copied. The share holds the request's buffers
   from its commit to the flush, when nothing writes them. The RAM tier copies only what its budget keeps.
@@ -415,6 +538,62 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
   - The default RAM tier (6.3 GB) plus SSD, this change: turn 1 whole on disk after the response (1,771 MB, 139 ms,
     0 ms waiting), where it used to persist one synchronous 512 MB piece per turn; 0.28 / 0.32 / 0.29 s from RAM;
     each later turn hard-links 145 chunks and writes one. After a restart 0.87 s, 148,902 restored from SSD in 524 ms.
+
+<a id="write-counters"></a>
+## Write counters
+
+Cumulative bytes the SSD tier wrote to the filesystem, by file kind (`src/disk_write_stats.zig`): one `Stats` per tier
+(`/props` per model) chained into the process total (`/metrics`, `/metrics.json`; [server-http-apis](server-http-apis.md)).
+They count what the filesystem accepted, never what was submitted, and run from process start whatever turns `--metrics` on.
+
+| kind | counts | written by |
+|---|---|---|
+| `kv` | `c*.safetensors` KV chunks | `writeChunkFile` |
+| `ssm` | `s*.safetensors` restore points and `g*.safetensors` row segments (every arch's restore point, GLM's and DeepSeek's included) | `writePoint`, `writeGrownSegment` |
+| `qsa` | `qsa.safetensors` history | `writeQsaHistoryFile` (`persistQsaHistory`) |
+| `spec` | `spec.safetensors` draft state | `writeSpecSidecar` |
+| `ring` | `r*.safetensors` ring restore points | `writeRingFile` |
+| `meta` | `meta.json` manifests and `tokens.bin` records | `writeMeta`, the token record in `appendCommitWithSpecBounded` |
+
+- **Every safetensors file goes through `DiskTier.saveNamed(..., kind, ...)`**, which takes the kind: staged through the
+  writer thread (`kv_disk_writer.zig` counts at the landing, per part of a file staged in parts) or written synchronously
+  (counted at the return, the file's size). `meta.json` and `tokens.bin` are the only other writers. A new file kind is a
+  new `Kind` variant and a column here, never a filename test.
+- **A rewrite counts its full bytes again**: the partial tail chunk of an extended entry, a longer `qsa.safetensors`
+  history, a replaced `spec.safetensors` and every `meta.json` rewrite (including the LRU re-index after a restore).
+  A hard-linked chunk or QSA history (`linkInheritedChunks`, `linkInheritedQsa`) is not a write, and a commit
+  that finds its prefix already stored writes nothing.
+- **`failed` is apart from `written`**: a blob the writer could not write (a failed `open`/`write`/`rename`), dropped for
+  a broken multi-part file or a stale epoch, discarded by a fence (the entry was deleted before it landed), or refused
+  at `submit`; a synchronous write that raised counts its tensor payload. A part that landed before its file broke stays
+  in `written`, since the filesystem took it. These are filesystem bytes, not NAND wear.
+- `/props settings.prefix_cache.disk_written_bytes` is the tier's own total, so a model that unloads takes its figure with
+  it while the process counters keep it.
+- Guards: `disk_write_stats.zig` (accounting and both renderings), `kv_disk_writer.zig` (`landed bytes count under their
+  kind`, `a failed, dropped or fenced blob`, `a file staged in parts`), `DiskTier write counters:` in `kv_disk_cache.zig`
+  and `qwen4_disk_qsa.zig`, `both feeds carry the SSD prefix cache write counters` in `metrics.zig`.
+
+## Tier counters
+
+Beside the write counters, `src/cache_stats.zig` keeps process-wide relaxed atomics for the two tiers, rendered by
+`/metrics` and `/metrics.json` ([server-http-apis](server-http-apis.md#speculative-and-tier-counters)); they run from
+process start whatever turns `--metrics` on.
+
+- **Hits by tier** (`sushi:prefix_cache_tier_hits_total{tier}`): one per request whose lookup restored tokens, counted in
+  the scheduler where the `[prefix] reused ... from <tier>` line is built. `hot` is the RAM tier or the live state a
+  request keeps by move; `ssd` only when `last_restored_disk_id` is set and the live state did not serve it
+  (`HotPrefixCache.lastRestoredTier`). Every disk arm of `lookupImpl` that restores rows sets it, the plain-KV arm included.
+  A hit is counted when the prefill completes (`recordKeptRestore`, beside `slot.cached_tokens`), so a restore thrown
+  away (a `QsaHistoryGap` retry that re-prefills cold, a cancelled or failed prefill) is no hit: hits never exceed the
+  request-log rows with `cached_tokens > 0`.
+- **Evictions by tier** (`..._evictions_total`, `..._evicted_bytes_total`): entries a tier dropped for room. The RAM
+  tier counts every drop through `evictForSpace`: its budget or entry cap (`evictOneLru`), a prefill being admitted
+  (`evictLruToAdmit`) and an SSD-first idle-allowance drop of an entry with no SSD copy; the SSD tier counts `gcToBudget`.
+  An invalidation (a failed QSA check, a merge failure), an idle spill to disk and `clear` are not evictions.
+- **`sushi:prefix_cache_hot_bytes`**: the RAM tiers of every ready model (`readyHotCacheBytes`), republished with
+  `publishHotCacheResidency`; `resident_hot_cache_bytes` (admission, `/props`) stays the current model's alone.
+- Guards: `cache_stats.zig`, `tier hits:` in `scheduler.zig`, `a capacity eviction is counted`, `the tier that served a restore` in `prefix_cache.zig`,
+  `DiskTier: byte budget evicts LRU entries` in `kv_disk_cache.zig`.
 
 ## SSD-first
 
@@ -462,7 +641,7 @@ Moved to [glm5-prefix-cache](glm5-prefix-cache.md).
 
 ## Guards
 
-`tests/test_prefix_cache_*.sh` (budget revisit, disk, hot, mem, workloads), `tests/test_hybrid_reuse_equivalence.sh`,
-`tests/test_mimo_ring_reuse.sh`, `tests/test_mimo_ring_fork_ssd.sh`, `tests/test_qwen4_mtp_head_persist.sh`,
-`tests/test_glm_prefix_reuse.sh`, `tests/test_prefix_cache_tiers.sh`. Grep the log for `[cache]`, `[hot-cache]`,
+`tests/test_prefix_cache_*.sh` (disabled, mem, restart, ssd default, tiers, workloads), `tests/test_prefix_reuse.sh`,
+`tests/mimo2/test_mimo_ring_reuse.sh`, `tests/mimo2/test_mimo_ring_fork_ssd.sh`, `tests/qwen4/test_qwen4_mtp_head_persist.sh`,
+`tests/glm5/test_glm_prefix_reuse.sh`, `tests/test_prefix_cache_tiers.sh`. Grep the log for `[cache]`, `[hot-cache]`,
 `[disk-cache]`.

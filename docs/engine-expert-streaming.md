@@ -2,7 +2,7 @@
 
 How a checkpoint whose routed experts do not fit in memory is served from SSD: the budget ledger, the per-layer LRU,
 the zero-copy slab I/O and the correctness bars. Read this before touching `src/expert_stream.zig`,
-`src/expert_io.zig` or `src/glm5_stream.zig`.
+`src/expert_io.zig` or `src/glm5/glm5_stream.zig`.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engine-exl3-experts.md),
 [engine-memory-admission](engine-memory-admission.md), [qwen4-arch](qwen4-arch.md),
@@ -15,14 +15,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 | `src/expert_stream.zig` | `ExpertStore` spans, per-layer group-exact LRU + union bridge, zero-copy slabs, `GroupedLayer` (a rate-grouped layer's pools), `BudgetLedger` (`--ssd-budget-gb`), MTP refusal |
 | `src/expert_io.zig` | SSD→Metal I/O: F_NOCACHE positioned-read `FillPool`, `PageSlab` epoch leases, verified zero-copy `importSlab` |
 | `src/expert_bf16_kernels.zig` | bf16 selected-expert kernels over a slab |
-| `src/glm5_stream.zig` | GLM's routed experts over the engine (BF16, FP8 or EXL3 slabs), the native teacher's capture budget |
+| `src/glm5/glm5_stream.zig` | GLM's routed experts over the engine (BF16, FP8 or EXL3 slabs), the native teacher's capture budget |
 | `src/imatrix.zig` | imatrix capture on the streamed forward |
 | `src/hidden_capture.zig` | block-boundary residual capture under `kld capture` |
 
 ## What streams
 
 One engine (`expert_stream.Engine`) streams every served model, keyed by the checkpoint's routed-expert layout, and
-one plan (`scheduler.planExpertStreaming`) sizes it for `serve`/`run`, the registry's cold-load gate and `sushi kld`.
+one plan (`model_load.planExpertStreaming`) sizes it for `serve`/`run`, the registry's cold-load gate and `sushi kld`.
 Each forward runs its own resident expert kernels on slab-local ids, so a streamed forward is bit-identical to the
 resident one; the ledger bills from the stored headers, a slot sized to the widest layer rate. The trunk (and MiMo's
 coarse lm_head) stays resident; with no budget a pack loads resident.
@@ -46,7 +46,7 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
   the FP32 reduction are untouched, and each layer completes before its slabs are reused.
 - The FP8 release's experts stream as stored: e4m3 codes plus f32 block-128 scales. A layer's routed slots
   dequantize to bf16(code x scale) through `fp8_block` and run the BF16 composite; the copies and gathered codes (at
-  most every expert of one layer, about 21.7 GB) are billed beside the trunk (`scheduler.fp8ExpertScratchBytes`).
+  most every expert of one layer, about 21.7 GB) are billed beside the trunk (`model_load.fp8ExpertScratchBytes`).
   Its capture is refused: the release is a block quantization of the BF16 source, which stays the only teacher.
 - The FP8 release is verified by hermetic tests only, with no live boot, KLD or speed number: the checkpoint is no
   longer on the box.
@@ -74,7 +74,7 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
 - **The tower is resident and billed in the ledger** (`vision` term, `resolveStreamedVision`): the expert cache
   shrinks by its weights. A budget that cannot hold it beside two slots per layer is `SsdBudgetBelowVision` (503).
 - **The encode transient is not reserved.** The load proves the largest single image the tower's processor admits
-  (`server.largestImageEncodeBytes`) beside the budget: `budget + planned KV + that encode <= wired limit`, else
+  (`request_media.largestImageEncodeBytes`) beside the budget: `budget + planned KV + that encode <= wired limit`, else
   `SsdBudgetExceedsWiredLimit`. Every request is then billed live like a resident one (`towerFitFault`); its vision
   tokens ride the prompt's admission bill.
 - The forward splices the rows the same way streamed or resident (the embedding step is shared): greedy bytes match.
@@ -99,12 +99,12 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
   every pool to its whole layer, reads all of them at load (`[expert-stream] resident:` line; no 80% warm) and maps
   each expert to its slot (`LayerState.resident_map`), so a DeepSeek STQ route takes its slots on the GPU with no
   host read of the picks (`Engine.residentRoute`). Same bytes out as the streamed path (tested on the tiny STQ pack).
-- Precedence: `--ssd-budget-gb` > setting > `ExpertStreamingRequired` 503 naming both.
+- Precedence: `--ssd-budget-gb` > setting > the RAM default (DeepSeek only: `model_load.ramDefaultBudget`) > `ExpertStreamingRequired` 503 naming all three. The default is 80 GiB on a 96 GB Mac, 96 on 128 GB (108 with `iogpu.wired_limit_mb` at 120000 or more), the planner's resident need on 192 and 256 GB, each stepped down to the largest whole GiB that fits the lower of the residency limit and the user-wire cap beside a 1M request and an image encode.
   An explicit launch flag always beats `model-settings.json` ([server-lifecycle](server-lifecycle.md#settings)).
 - The load's fit check prices serving at the per-request ladder's floor rung (512), since a request picks its own
   rung against free memory; a pinned chunk is priced as given; an explicit
   `--prefill-chunk` only lowers the floor the load proves.
-- **A streamed Flash-Next bills no expert fill peak** (`scheduler.billedFillPeakBytes`); MiMo and GLM keep theirs. The
+- **A streamed Flash-Next bills no expert fill peak** (`model_load.billedFillPeakBytes`); MiMo and GLM keep theirs. The
   fill peak (`fillPeakBytes`: two union workspaces, a cache layer, a batch) rode on top of a budget that already holds
   the union workspace and the bounce. M1 Max, `--ssd-budget-gb 23`, kv8, lean: a cold 8k prompt peaked 1,224 MiB over
   the loaded weights and a 45k 1,683, the resident pack's own peak, against bills of 3,270 and 3,821 that carried it.
@@ -175,6 +175,16 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
   keeps its hits and admitted misses in its pool, only the declined misses are read into the workspace, and
   `Ragged.initSplit` serves each overflowing group as two pools, its cache and its spill. No host copies, the same
   SSD reads, the same bytes out. The decode kernels index one trellis, so a decode-width route keeps the copying union.
+- **A wide route's fill is staged** (`prepareHostStaged` + `fillStaged`, `Staged`): stage 0 reads every miss's scale
+  pieces, stage 1 + g rate group g's trellis. The caller builds the whole MoE graph first and `fillStaged` calls it
+  back after each stage, so it can queue group g's gate and up GEMMs (`rate_groups.EarlyPlanes.start`, `mlx_async_eval`)
+  while group g+1 is read; mid, down and finish run after the last stage. Same kernels and inputs, so the bytes are
+  unchanged, with or without the shared expert riding the routed launches (`moePrefillSharedFusedEarly`).
+  `prepareHostWide` is the same route with a no-op callback; a borrowed layer's route is not staged. A route dropped
+  before its last stage is aborted (`Prepared.deinit`), and the caller synchronizes the stream first. `staged_routes`
+  (in the `[expert-stream] forward=` line) counts the routes.
+  Measured on the STQ 1.75bpw pack (default SSD budget, M5 Max on AC, one boot per arm, a cold llmprobe code prompt):
+  prefill 1383 / 1451 tok/s staged against 1242 / 1372 tok/s with the fill read whole, at 32k / 64k tokens.
 - The breakdown line's `copy_ms` / `unions` time the host copies of a union route: cached hits copied into the
   workspace and admitted misses copied back. A read-ahead (the next router on this layer's rows) was measured and cut:
   it guessed about a quarter of a 1024-row chunk's picks and did not move cold prefill.
@@ -203,12 +213,22 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
   `picks_sync`, `engram`, `state`, `head`) and logs their mean per forward at debug level every 64 forwards.
 - DeepSeek-V4.1 STQ also reads experts ahead (`Engine.prefetch`, `Prefetcher`): a layer's router input times the gate
   matrix of the layer `d` ahead (d = 3, for forwards of 2 or more rows only: at one row the GEMV and the waits cost more than the misses they save; `Model.prefetch_lead_rows`) ranks that layer's experts, the
-  host passes each row's first uncached one of its top 12 to a thread that reads them into the pool before the layer's
+  host passes each row's first uncached one of its top 12, with its predicted pick score, to a thread that reads them into the pool before the layer's
   chain is queued, so the miss becomes a hit. Rules: a job owns its layer's cache and slabs until `prefetchWait(layer)`
   returns (`specGrouped`, `prepareHost*`, `swapGroupedMisses`, `borrowLayer`, `restoreLayer` call it, `warmCache` and
   `deinit` drain the thread); only layers `d >= 2` ahead are targeted, so no queued chain reads a slot the job writes;
-  the prefetch pool has its own fill workers (inside `BOUNCE_BYTES`, so no new bill); it changes what is cached, never
-  the arithmetic. `[expert-stream] prefetch: ...` is the engagement line. Measurements: [dsv41-arch](dsv41-arch.md#stq).
+  the prefetch pool has its own fill workers (inside `BOUNCE_BYTES`, so no new bill; with `--ssd-prefetch 0` or a resident load it is never created and its share stays billed); it changes what is cached, never
+  the arithmetic. The prefetch exists on every streamed load with `--ssd-prefetch` above 0 (default 0, off; `startExpertPrefetch`, decided at load; at 0 no probe, thread, pool or bounce buffer is created, [dsv41-arch](dsv41-arch.md#stq)).
+  Its reads are metered (`prefetch_plan.PrefetchCredit`): `Engine.finishForward` refills a credit from the forward's wall time and its demand fill bytes
+  only (`pct x max read rate x wall - demand`, the leftover carried at most one round's grant), each job spends its share of the grant (a round's grant over the
+  layers a prediction can target) plus what earlier jobs left, and a read is one whole expert or none. A job ranks the distinct experts its rows want
+  (`rankWanted`: rows that want it, then the predicted pick score, then the earlier row) and reads down that order while the credit holds; the ones left over count in
+  `experts_skipped`. `Engine.probeReadRate` measures the maximum before the cache warm and leaves no trace in the caches or the engine's totals. A target that `Engine.canPrefetch` refuses is not predicted at all (that includes a round whose credit and job slice hold less than the smallest expert: a starved prefetch runs no GEMV and queues no job), and a prediction whose candidates the pool already holds queues and wakes nothing (the line's `jobs queued` counts only jobs with something to read). `[expert-stream] prefetch: ...` is the engagement line (jobs queued, read, experts read, skipped for lack of credit). Measurements: [dsv41-arch](dsv41-arch.md#stq).
+  The host's wait is `specGrouped` of the targeted layer (the settle's `prepareHost` finds the job done) and the job's SSD read is
+  the time it waits out: a map read mid-job lists the job's experts as misses, so the settle would rebuild the layer; the wait stays.
+- A rate-grouped route (`prepareGrouped`) must be able to undo its cache moves when it fails before writing a slab: a group whose
+  experts all sit ready logs the ages its resolve will touch (`CacheUndo.touched`, `Engine.age_log`), any group with a miss copies
+  the pool first (`CacheUndo.full`, counted in `Engine.cache_snapshots`). A hit-only route copies nothing.
 - At decode widths each layer's experts are queued from a GPU copy of the cache map (`Engine.specRoute`: expert →
   slot, -1 where not ready) before the host reads the router ids. The host keeps that result only when every routed
   id resolved to the slot the GPU gathered (`specMatches`), else rebuilds it; a union workspace always rebuilds. The
@@ -259,12 +279,31 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
   into the slab by `layout.tileMajor`, in place of the direct read or the bounce copy. It is never coalesced with a
   neighbour, so a job is one projection of one expert (at most ~6 MB) and the bounce the ledger already bills
   (`BOUNCE_BYTES`) is the only scratch. A pool-to-union or union-to-pool copy stays a memcpy: both are tile-major.
+- **A fill's reads split across workers by cost, not bytes** (`partitionByMidpoint`, `READ_COST_BYTES` = 1 MiB per
+  read): a byte split in file-offset order piles a run of small scale reads onto the worker that also holds the last
+  big trellis read. DeepSeek STQ 1.75bpw, budget 60, 1000 greedy tokens (base eba709e8, legacy layout): replay 1.484
+  -> 1.394 ms/fill, fill_s 24.94 -> 24.04, prefetch job 27616 -> 26532 ms, host wait 5543 -> 4778 ms, second-half
+  decode 25.52 -> 26.45 tok/s, output identical.
+- **A pair-major pack** ([pack-format](pack-format.md#tile-order)) is stored in the pools' own tile-major order, so its
+  spans carry no `tile`: they coalesce and, where the file offset, the length and the destination lie on pages, are read
+  straight into the slab. Every rate-group pool of the layer starts on a page too (`LayerGroups.align_bytes`; slots inside a pool keep their packed stride, so a group whose expert is
+  not a page multiple is direct only at the slots that land on pages). The padding is billed with the layer
+  (`LayerGroups.padBytes` in `allBytes`, `floorBytes` and the union workspace). A pair-major pack needs tile-major
+  pools (`Exl3TileOrderNeedsTileMajor` otherwise).
+- **Direct reads on 4 KiB blocks** (495d6713, unmerged): a span lands straight in the slab when its offset, length and
+  destination are on the volume's 4 KiB block instead of the 16 KiB page. On pack revision 2.0 it raised the direct
+  share of a 17.9k new-text prompt's reads from 26% to 34% (`reads_direct`/`reads`) and moved neither the fill rate nor prefill
+  (new text 1,370 against ~1,359 tok/s at 17.9k, 1,403 against ~1,404 at 31.5k, two boots, `--ssd-budget-gb 108`):
+  the reads are bound by the SSD at ~8.5 GB/s, not by the bounce copy.
+- The `[expert-stream] forward=` line ends with `bounced_gb` (bytes read through the bounce buffer since boot) and
+  `reshuffled_gb` (tile bytes the CPU permuted); a pair-major pack on aligned shards shows both falling to the share
+  of reads that cannot be direct, `reshuffled_gb` at 0.
 - `FillPool` workers park on their condition without broadcasting: `submit` signals after every push, and a
   broadcast before the wait makes idle workers wake each other forever.
 - `PageSlab` epoch leases (`free → filling → ready → leased → readers_complete → reclaimable`, CPU writes only in
   `filling`).
 - `importSlab` = `mlx_array_new_data_managed_payload` verified by pointer identity (`ExpertSlabImportCopied`
-  refuses). Bench: `tests/ssd_fill_bench.sh`.
+  refuses). Bench: the `expert io ssd microbench` test (`QWEN4_BF16_STREAM_MODEL=<pack>`), waiting to move into `sushi-ubench`.
 - **MLX releases an IMPORTED host buffer asynchronously**: `mlx_array_free` returns BEFORE the payload deleter runs;
   wait for the deleter (`SlabOperand.destroy`), leak (counted, logged on the breakdown line) rather than unmap what
   MLX still holds.
@@ -319,5 +358,5 @@ tokens x top-k exactly on every layer; the two load-time warmup forwards add a f
 
 A dense qwen4_exp checkpoint with a complete streaming index registers as a streaming stub
 (`streamingStubMarker`); `/v1/models` carries `streaming`, `streaming_required`, `ssd_budget_gb` at top level and
-`input_modalities: ["text"]` when it must stream. Guards: `tests/test_bf16_streaming.sh`,
-`tests/test_model_settings.sh` [5].
+`input_modalities: ["text"]` when it must stream. Guards: `tests/qwen4/test_bf16_streaming.sh`,
+`tests/test_cold_load.sh` [5].

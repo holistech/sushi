@@ -1,4 +1,5 @@
 #!/bin/bash
+# sushi-test: tier=host
 . "$(dirname "$0")/private_cache.sh"
 # Self-update end to end, offline. A local HTTP server stands in for GitHub (SUSHI_UPDATE_API, the test-only hook)
 # and serves releases staged from this tree the way release.yml packages them: the current build, and the same
@@ -156,6 +157,8 @@ echo "[1/7] check, and the refusals that leave the install alone"
 upd --check
 check "--check names $NEXT" "$(has "$WORK/upd.log" "sushi $NEXT is available (this is $CUR)")"
 check "--check recorded the answer" "$(has "$HOME/.sushi/update-check.json" "\"latest\":\"$NEXT\"")"
+if SUSHI_UPDATE_API="http://127.0.0.1:1" upd --check; then offline_rc=0; else offline_rc=1; fi
+check "--check with no release server exits non-zero and says it could not reach it" "$([ "$offline_rc" = 1 ] && grep -q "update: could not reach the release server" "$WORK/upd.log" && echo 1 || echo 0)"
 if boot; then
     upd
     check "a running sushi from the install refuses the update" "$(has "$WORK/upd.log" "(pid $SPID) is running from")"
@@ -193,6 +196,25 @@ if boot --no-update-check; then
     check "--no-update-check turns it off by name" "$(has "$WORK/server.log" "\[update\] daily check off (--no-update-check)")"
 fi
 stop_server
+rm -f "$HOME/.sushi/update-check.json"
+echo '{"server":{"update_check":false}}' > "$HOME/.sushi/model-settings.json"
+API_HITS=$(wc -l < "$WORK/api.log")
+if boot; then
+    check "update_check false in the settings file turns it off by name" "$(has "$WORK/server.log" "\[update\] daily check off (model-settings.json)")"
+    sleep 3
+    check "... and the release API is not asked" "$(is "$(wc -l < "$WORK/api.log")" "$API_HITS")"
+    check "GET /v1/settings reports the key off from the file" "$(curl -s "$BASE/v1/settings" | python3 -c "import json,sys; o=json.load(sys.stdin)['server']['update_check']; print(1 if o['file'] is False and o['source']=='file' and not o['locked'] else 0)")"
+    curl -s -X POST "$BASE/v1/settings" -d '{"server":{"update_check":true}}' > /dev/null
+    # The loop wakes every minute, so a toggle needs no restart and takes at most that long.
+    wait_for available true 90
+    check "turning it on in Settings makes the running server look, without a restart" "$(is "$(prop latest)" "$NEXT")"
+    stop_server
+fi
+rm -f "$HOME/.sushi/model-settings.json"
+if boot --no-update-check; then
+    check "--no-update-check pins both settings keys, reported locked" "$(curl -s "$BASE/v1/settings" | python3 -c "import json,sys; s=json.load(sys.stdin)['server']; print(1 if all(s[k]['locked'] and s[k]['flag']=='--no-update-check' for k in ('update_check','pack_update_check')) else 0)")"
+    stop_server
+fi
 rm -f "$HOME/.sushi/update-check.json"
 API_HITS=$(wc -l < "$WORK/api.log")
 "$BINARY" serve --model-dir "$EMPTY" --port "$PORT" --log-file off > "$WORK/src-serve.log" 2>&1 &

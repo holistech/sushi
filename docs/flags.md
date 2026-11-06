@@ -8,7 +8,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 
 **Reading the columns.** *default → effect* ends with the parse site. *who* is `user` (a tradeoff), `machine` (fits a Mac), `operator` (port, auth, paths, logging), `dev` (A/B, debug, bench), `test` (only a test needs it), `dead` (no effect left). *documented* names `help` (`sushi --help` or the subcommand's), `usage` (`docs/usage.md`), `README`, the topic docs, and how many `tests/` scripts pass it (`scripts/` counted apart); *hidden* means parsed but absent from `--help`. *recommendation* starts with `keep`, `cut`, `merge` (names the target) or `owner call` (the evidence that decides it is under [Owner calls](#owner-calls)).
 
-**Summary.** 114 rows: 58 shared by `run`, `serve` and the bare form, 56 in `run`, `launch`, `update`, `kld`, `bench` and `convert`. By who: user 33, operator 28, machine 17, dev 35, dead 1. By recommendation: keep 106, cut 4, owner call 4. Among the 58 shared rows: keep 52, cut 4, owner call 2.
+**Summary.** 116 rows: 57 shared by `run`, `serve` and the bare form, 59 in `run`, `launch`, `update`, `kld`, `bench` and `convert`. By who: user 32, operator 28, machine 17, dev 38, dead 1. By recommendation: keep 108, cut 4, owner call 4. Among the 57 shared rows: keep 51, cut 4, owner call 2.
 
 ## Serving, network and auth
 
@@ -16,35 +16,37 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 |---|---|---|---|---|
 | `--serve` | off → HTTP server mode; the headless `--serve --model-dir` form is what the app launches (main.zig:620) | operator | help, server-lifecycle; 123 tests | keep: the app depends on it; overlaps the `serve` subcommand only in spelling |
 | `--host` | `127.0.0.1` → bind address, `0.0.0.0` opens the LAN (main.zig:617) | operator | help, server-lifecycle; 52 tests | keep |
-| `--port` | `12345` → bind port (main.zig:614) | operator | help, server-lifecycle; 139 tests | keep |
+| `--port` | `12345`, or `server.port` of `model-settings.json` → bind port (main.zig:614); pins that key, reported locked | operator | help, server-lifecycle; 139 tests | keep |
 | `--api-key` | none → required on every request, loopback exempt (main.zig:728) | operator | help, server-http-apis; 2 tests | keep |
 | `--api-key-strict` | off → also require the key from loopback (main.zig:732) | operator | help; 1 test | keep: embedders on shared machines |
 | `--api-key-env` | none → read the key from a named env var so argv does not carry it (main.zig:734) | operator | help, envvar; 0 tests | keep: the only way to keep the key out of the process table |
-| `--metrics` | off → Prometheus `/metrics` and `/metrics.json` (main.zig:726) | operator | help, server-http-apis; 10 tests, 2 scripts | keep |
+| `--no-metrics` | off → turns off Prometheus `/metrics` and `/metrics.json`, which are ON by default; `POST /metrics/enable` turns them back on at runtime | operator | help, server-http-apis, usage | keep |
+| `--metrics` | accepted and does nothing (metrics are on by default); kept so existing launch lines still start | operator | help | keep as a no-op alias; cut at the next major version |
 | `--max-concurrent` | `1` → only sizes the submit queue (`n + 32`) and floors the prefix-cache capacity; slots batch at any value (main.zig:913) | dead | help; server-lifecycle; 21 tests, 2 scripts | cut: the queue depth is fixed, batching is the model's answer, not this number |
 | `--parent-pid` | none → exit when that pid dies (main.zig:811) | operator | help, server-http-apis; 1 test | keep: for a host that embeds the engine |
 | `--timeout` | `300` → stall timeout in seconds, 0 = none (main.zig:690) | operator | help, server-http-apis; 1 test | keep |
 | `--no-prevent-sleep` | off → allow idle sleep during inference (main.zig:697) | operator | help; 1 test | keep |
 | `--gpu-warm-secs` | `60` → keep the GPU awake this long after a request (main.zig:953) | machine | help, server-lifecycle; 0 tests | keep: a power-against-latency choice |
 | `--no-tool-autocorrect` | off → stop coercing tool-call arguments to the schema's types (main.zig:706) | dev | help, server-tool-calling; 0 tests | cut: kill switch of an adopted default, no test, no measurement |
-| `--no-update-check` | off → never ask GitHub for a newer release (main.zig:818) | operator | help, server-lifecycle; 2 tests | keep |
+| `--no-update-check` | off → never ask GitHub for a newer release or Hugging Face for a pack revision; pins the settings keys `server.update_check` and `server.pack_update_check` off, reported locked (main.zig:818) | operator | help, server-lifecycle; 3 tests | keep |
 
 ## Model, memory and context
 
 | flag | default → effect | who | documented | recommendation |
 |---|---|---|---|---|
 | `--model` | `~/.sushi/models` default → model directory (main.zig:611) | operator | help, usage; 135 tests | keep |
-| `--model-dir` | none → repeatable discovery root, up to 8 (main.zig:916) | operator | help, server-lifecycle; 27 tests | keep |
+| `--model-dir` | none → repeatable discovery root, up to 8 (main.zig:916) | operator | help, server-lifecycle; 27 tests | keep; the settings-file key `server.models_dir` is the default folder when no flag is given (a flag outranks it) |
 | `--max-resident-models` | `3` → cap on loaded models, bad value falls back to 3 (main.zig:933) | machine | help; 5 tests | keep |
 | `--max-resident-mem` | `auto` = 80% of the wired limit → cap on summed resident bytes (main.zig:939) | machine | help, server-lifecycle; 0 tests | keep |
 | `--idle-evict-secs` | off → unload a model idle this long (main.zig:959) | machine | help; 1 test | keep |
-| `--ctx-size` | model max → context length; also `ctx_size` in settings (main.zig:663) | machine | help, usage, README; 40 tests | keep |
+| `--ctx-size` | model max → context length (DeepSeek-V4.1: 1,000,000 when the bill admits it); also `ctx_size` in settings (main.zig:663) | machine | help, usage, README; 40 tests | keep |
 | `--config-overrides` | none → JSON deep-merged into every model's `config.json`, e.g. YaRN extension (main.zig:666) | user | help; 0 tests | keep: the context-extension lever; add a test |
 | `--vision-bf16` | off: a bf16 tower is requantized to affine 8-bit at load; set keeps it as stored, billed as stored (DeepSeek-V4.1 +0.47 GB, Qwen +0.30 GB) → users who want the stored tower's exact image quality; no effect with `--no-vision` or on a tower not stored bf16 (GLM); no settings key | machine | help; 4 tests | keep |
 | `--vision` / `--no-vision` | tower loads on a resident model and on DeepSeek-V4.1, not on any other streamed one → force it on or save its memory; also `vision` in settings (main.zig:693) | machine | help, README, topic docs; 17 tests | keep |
-| `--skip-mem-preflight` | off → bypass the free-RAM check before a load (main.zig:699) | machine | help, engine-memory-admission, qwen4-perf; 0 tests | keep: the refusal text names it; the M2 Max runs need it |
+| `--skip-mem-preflight` | off → bypass the free-RAM check before a load (main.zig:699); settings twin `server.skip_mem_preflight` (Settings › Memory), the flag pins it on, locked | machine | help, engine-memory-admission, server-lifecycle, qwen4-perf; unit tests | keep: the refusal text names it; the M2 Max runs need it |
 | `--wired-margin-gib` | `1` → headroom under `iogpu.wired_limit_mb`, 1..32 (main.zig:898) | machine | help, README, engine-memory-admission; 0 tests | keep |
-| `--ssd-budget-gb` | none → stream experts from SSD within a TOTAL resident target; also `ssd_budget_gb` in settings (main.zig:985) | machine | help, README, engine-expert-streaming; 9 tests | keep |
+| `--ssd-budget-gb` | none → stream experts from SSD within a TOTAL resident target (DeepSeek-V4.1 with no flag or setting: 80 on a 96 GB Mac, 96 on 128 GB (108 with `iogpu.wired_limit_mb` at 120000 or more), fully resident on 192 and 256 GB, stepped down to the Mac's limits; any other RAM size requires it); also `ssd_budget_gb` in settings (main.zig:985) | machine | help, README, engine-expert-streaming; 9 tests | keep |
+| `--ssd-prefetch` | `0` (off) → the percent (0..100) of this Mac's maximum SSD read rate, measured at load, that a streamed DeepSeek-V4.1 load's expert reads (the misses a route waits for and the prefetch's together) may use; `0` = no prefetch (no probe, thread or pool); also `ssd_prefetch` in settings, ignored with a log line on other archs; every other arch refuses the flag at load (`archFlagRefusal`) ([dsv41-arch](dsv41-arch.md#stq)) | machine | help, usage, dsv41-arch, engine-expert-streaming; 6 tests, 1 script | keep: owner call; off by default, 65 is the tuned cap on a fast SSD |
 | `--expert-pick-tolerance` | `0` exact → swap a missed streamed expert for a cached one within n, 0..0.6 (main.zig:904); engages on rate-grouped layers too (DeepSeek STQ, any group's pool); does nothing on streamed GLM | user | help, README, engine-expert-streaming; 2 tests | keep: a measured speed-for-exactness tradeoff |
 | `--drop-expert` | `0` off → never load, bill, cache or pick the n least-used routed experts of every layer, ranked by the pack's `expert_usage.json`; a multiple of 8; DeepSeek-V4.1 only, every other arch refuses it at load (main.zig:886, `archFlagRefusal`); `sushi kld compare` takes it, `capture` refuses it ([dsv41-arch](dsv41-arch.md#drop-expert)) | user | help, dsv41-arch, engine-expert-streaming, pack-format; 18 tests | keep: frees expert bytes for re-routed picks; answers change, so score it with `sushi kld compare` |
 | `--prefill-chunk` | `8192` → ceiling on tokens per prefill chunk, auto-capped per model (main.zig:824) | machine | help, usage, engine-memory-admission; 11 tests, 2 scripts | keep |
@@ -80,18 +82,17 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 |---|---|---|---|---|
 | `--prefix-cache-entries` | `32` → hot-cache capacity, `0` disables all reuse; a bad value silently becomes 1 (main.zig:840) | user | help, usage, engine-prefix-cache; 41 tests, 2 scripts | keep |
 | `--prefix-cache-mem` | off → RAM retention with this byte budget, `0` or `off` keeps it off (main.zig:843) | machine | help, usage, engine-prefix-cache; 19 tests, 2 scripts | keep |
-| `--prefix-cache-disk` | min(sized + 2 GiB, 20 GiB, free - 4 GiB) → SSD tier budget, `0` or `off` disables (main.zig:854) | machine | help, usage, engine-prefix-cache; 16 tests, 2 scripts | keep |
+| `--prefix-cache-disk` | min(sized + 2 GiB, 20 GiB, free - 4 GiB) → SSD tier budget, `0` or `off` disables (main.zig:854) | machine | help, usage, engine-prefix-cache; 16 tests, 2 scripts | keep; also the settings-file key `server.prefix_cache_disk_gb`, edited from the web UI (a flag outranks it) |
 | `--ssm-checkpoint-max` | `16` → checkpoint states held in memory per entry (the SSD restore points are never thinned by it), `0` unlimited (main.zig:895) | dev | help; 2 tests, 2 scripts | cut: the scripts pass the default and the cache byte budget already bounds it |
 
 ## Sampling and reasoning defaults
 
 | flag | default → effect | who | documented | recommendation |
 |---|---|---|---|---|
-| `--max-tokens` | `100` offline; serve: default for requests that omit it (main.zig:649) | operator | help, usage; 9 tests | keep |
+| `--max-tokens` | `100` offline; serve: default for requests that omit it, else the model's `max_tokens` setting, else the rest of the window (DeepSeek-V4.1: 256,000) (main.zig:649) | operator | help, usage; 9 tests | keep |
 | `--temp` | `0` offline; serve: default temperature before `generation_config.json` (main.zig:653) | operator | help, usage; 2 tests | keep |
 | `--top-p` | model config → serve default for requests that omit it (main.zig:657) | operator | help; 1 test | keep |
 | `--top-k` | model config → serve default for requests that omit it (main.zig:660) | operator | help; 1 test | keep |
-| `--reasoning-budget` | unlimited → max thinking tokens per request (main.zig:799) | user | help, server-http-apis; 2 tests | keep |
 | `--preserve-thinking` | template default → keep every turn's thinking, `on` or `off`; also in settings (main.zig:876) | user | help, usage; 0 tests (settings test) | keep |
 | `--think-penalty` | `0` off → lower overthinking-marker logits inside the reasoning span; also in settings (main.zig:868) | user | help, server-http-apis; 2 tests | keep |
 
@@ -107,18 +108,18 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 
 ## Subcommands
 
-`pull <model>` and `list` take no flags and reject any extra argument (`HF_TOKEN` is read from the environment); `pull` accepts only the `beamster` org. `serve` and `run <model>` take every flag above.
+`pull <model>` and `list` take no flags and `repack <pack>` takes only the four below; each rejects any other argument (`HF_TOKEN` is read from the environment); `pull` accepts only the `beamster` org. `serve` and `run <model>` take every flag above.
 
 | flag | default → effect | who | documented | recommendation |
 |---|---|---|---|---|
-| `run`: `--think` | model default → reasoning effort, per model (main.zig:623) | user | help, server-http-apis; 2 tests | keep |
+| `run`: `--think` | model default → reasoning effort, per model; outranks the effort table's default word (main.zig:623) | user | help, server-http-apis; 2 tests | keep |
 | `run`: `--tool` | `off` → REPL tools: web, fetch, read files in the folder (main.zig:631) | user | help, server-http-apis; 1 test | keep |
 | `run`: `--edit` | `off` → add `write_file` and `edit_file` inside that folder (main.zig:637) | user | help, server-http-apis; 2 tests | keep |
 | `run`: `--prompt` / `-p` | none → one prompt and exit (cli.zig:2354) | user | help; 4 tests | keep |
 | `run`: `--stream` | off → stream tokens with `--prompt` (main.zig:644) | user | help; 1 test | keep |
 | `launch`: `--model` | the server's default → model id (launch.zig:867) | operator | help, usage; 0 tests | keep |
 | `launch`: `--url` | `http://127.0.0.1:<port>` → server base URL (launch.zig:871) | operator | help; test_launch_cmd, test_zcode_launch | keep |
-| `launch`: `--port` | `12345` → server port for the default URL (launch.zig:875) | operator | help; 0 tests | keep |
+| `launch`: `--port` | `12345`, or `server.port` of `model-settings.json` → server port for the default URL (launch.zig:875) | operator | help; 0 tests | keep |
 | `launch`: `--print` | off → write configs and print the script instead of running (launch.zig:879) | user | help, usage; test_launch_cmd | keep |
 | `launch`: `--` | none → everything after goes to the agent (launch.zig:864) | user | help, usage; test_launch_cmd | keep |
 | `update`: `--check` | off → report only (update.zig:709) | user | help; 1 test | keep |
@@ -126,6 +127,11 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `update`: `--force` | off → update while a sushi of this install runs (update.zig:713) | user | help; 0 tests | keep |
 | `update`: `--rollback` | off → swap `<install>.previous` back (update.zig:715) | user | help; 1 test | keep |
 | `update`: `--relaunch --` | internal: the updater restarts the server with its argv (update.zig:717) | dev | not in help (internal); 1 test | keep: plumbing, not a user flag |
+| `repack <pack>` | no flag → pair-major rewrite in place, resumable ([pack-format](pack-format.md#repack)) | operator | help, pack-format; tests in dsv41/repack_test.zig | keep: owner-approved subcommand |
+| `repack`: `--pack-revision <id>` | none → stamp the pack with that revision: `config.json` `pack_revision` and `__metadata__["pack_revision"]` in every other shard; a pack-order DeepSeek-V4.1 STQ pack is repacked first ([pack-format](pack-format.md#pack-revision-writer)) | operator | help, pack-format; repack_stamp_test.zig, test_repack_stamp.sh | keep: owner-approved |
+| `repack`: `--shards <name-or-glob>` | all shards → stamp (or `--check`) only the matching ones; repeatable; a pattern matching nothing exits non-zero before a write | operator | help, pack-format; same tests | keep: owner-approved |
+| `repack`: `--unstamped <shard>` | none → leave this shard without a stamp and list it in `config.json`; repeatable; a symlinked shard must be listed | operator | help, pack-format; same tests | keep: owner-approved |
+| `repack`: `--check` | off → read only: every shard not unstamped carries the config's revision (and `--pack-revision`'s id when given) | operator | help, pack-format; same tests | keep: owner-approved |
 | `kld`: `--model` | required → pack to score or capture (kld.zig:99) | dev | help, quality-kld | keep |
 | `kld`: `--prompts` | required for capture → `standard4`, a fixture dir, `*.txt` dir or `.jsonl` (kld.zig:100) | dev | help, quality-kld | keep |
 | `kld`: `--out` | required for capture → fixture output dir (kld.zig:101) | dev | help, quality-kld | keep |
@@ -139,16 +145,19 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `kld`: `--ctx-size` | model max → context override (kld.zig:108) | dev | help | keep |
 | `kld`: `--kv-quant` | dense BF16 → KV scheme; the teacher adds no quantization of its own (kld.zig:109) | dev | help, quality-kld | keep |
 | `kld`: `--qwen-gdn` | `32` → `16` scores a bf16-state student against the f32 teacher; a GLM capture refuses it (kld.zig:107) | dev | help, quality-kld; 2 tests | keep |
-| `bench`: `--url` | `127.0.0.1:8080` → `host:port` of the running server to drive (bench.zig `parseArgs`) | dev | help, process-measurement; 1 test | keep |
-| `bench`: `--model` | first id of `/v1/models` → model id sent in each request | dev | help, process-measurement; 1 test | keep |
-| `bench`: `--out` | required → directory for `bench.json`, the raw samples | dev | help, process-measurement; 1 test | keep |
-| `bench`: `--log` | required → the server's log, read for `[spec-stats] mode=` and the restore line | dev | help, process-measurement; 1 test | keep |
+| `bench`: `--url` | none → `host:port` of the running server to drive; naming it selects the HTTP client mode (bench.zig `parseArgs`) | dev | help, process-measurement; 1 test | keep |
+| `bench`: `--model` | none → a pack to load and bench in this process, with no server; every flag it does not own is a serve flag. With `--url`: the model id sent in each request (default the first id of `/v1/models`) | dev | help, process-measurement; 2 tests | keep |
+| `bench`: `--out` | `~/.sushi/runs/bench-<UTC stamp>/` with `--model`, required with `--url` → directory for `bench.json`; with `--model` also the run's `server.log` and its private prefix cache, which is removed at the end unless `--out` named the run | dev | help, process-measurement; 2 tests | keep |
+| `bench`: `--log` | required with `--url` → the server's log, read for `[spec-stats] mode=` and the restore line; refused with `--model`, where the engine reports both | dev | help, process-measurement; 1 test | keep |
 | `bench`: `--report` | none → write the `docs/bench/v<ver>/<model>.md` report here | dev | help, process-measurement; 1 test | keep |
-| `bench`: `--version` | none → release version in the report title | dev | help, process-measurement; 1 test | keep |
+| `bench`: `--version` | this binary's version (`sushi --version`) → release version in the report title; bare or before another flag it is the default, `--version <ver>` overrides | dev | help, process-measurement; 1 test | keep |
 | `bench`: `--stamp` | none → header lines for the report (`\n` separates), which `tests/bench.sh` fills | dev | help, process-measurement; 1 test | keep |
-| `bench`: `--decode-tokens` | `512` → tokens decoded per sample, at least 2 | dev | help, process-measurement; 1 test | keep |
+| `bench`: `--tokens` | `256` → tokens decoded per sample, at least 2; the prose arm decodes at most 128 | dev | help, process-measurement; 1 test | keep |
+| `bench`: `--rungs` | `4k,8k,16k,32k,64k,128k` → the decode rungs, a comma list with an optional `k` (1024); each 4096 or a multiple of 8192 up to 131072. The ladder grows in 8192-token windows to the largest | dev | help, process-measurement; 2 tests | keep |
+| `bench`: `--code-only`, `--prose-only` | both arms → run one arm; they exclude each other | dev | help, process-measurement; 1 test | keep |
 | `kld`: `--drop-expert` | `0` → compare only, the student drops n experts a layer by the pack's usage list; a capture refuses it (the teacher is exact) (kld.zig:112) | dev | help, dsv41-arch; 1 test | keep |
 | `kld`: `--ssd-budget-gb` | none → expert streaming budget (kld.zig:111) | dev | help, quality-kld | keep |
+| `kld`: `--ssd-prefetch` | none (0, off) → the same percent for the loaded pack; DeepSeek-V4.1 only (kld.zig) | dev | help, dsv41-arch; 1 test | keep |
 | `kld`: `--expert-pick-tolerance` | `0` → compare only, lossy swap of a missed expert (kld.zig:113) | dev | help, quality-kld; 1 test | keep |
 | `kld`: `--wired-margin-gib` | `1` → headroom under the wired limit (kld.zig:114) | dev | help | keep |
 | `kld`: `--mtp` / `--no-mtp` | head not resident → keep the head loaded (kld.zig:145) | dev | help; quality-kld | keep |
@@ -202,6 +211,7 @@ Landed; their rows are gone from the tables above. A removed flag now fails as `
 | `--mtp-cascade` | `--mtp-tokenv3` (the same arm) |
 | `--no-prefix-cache-ram` | `--prefix-cache-mem off` (or `0`); the last `--prefix-cache-mem` on the line wins, where the old flag won in either order |
 | `--fast` | the flags it set: `--mtp`, `--mtp-typical 0.2`, `--mtp-greedy-tail`, `--kv-quant 8`; the `fast` source label and preset are gone |
+| `--reasoning-budget` | the per-word cap of the effort table (Settings › Inference › Thinking effort, `effort:<family>` in `model-settings.json`); a word with no cap has none. A request's own `reasoning_budget_tokens` or Anthropic `budget_tokens` still applies |
 | `--pld`, `--no-pld`, `--pld-draft-len`, `--pld-key-len` | nothing: standalone prompt lookup decoding, its request field `enable_pld` and `/props settings.pld` are gone; MTP's and GLM DFlash2's own lookups stay (`--no-mtp-lookup`) |
 | `--ssm-checkpoint-stride` | a fixed 256 (`server.SSM_CHECKPOINT_STRIDE_DEFAULT`); only tests move it |
 | `--expert-cache-gb` (also `kld`) | `--ssd-budget-gb`; the BF16-source streaming test passes it |

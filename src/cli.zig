@@ -18,6 +18,7 @@
 const std = @import("std");
 const chat = @import("chat.zig");
 const model = @import("model.zig");
+const effort_mod = @import("effort.zig");
 const model_discovery = @import("model_discovery.zig");
 const log = @import("log.zig");
 const dflash = @import("dflash.zig");
@@ -25,6 +26,10 @@ const status = @import("status.zig");
 const repl_tools = @import("repl_tools.zig");
 const repl_input = @import("repl_input.zig");
 const update = @import("update.zig");
+const hf_pull = @import("hf_pull.zig");
+const pack_update = @import("pack_update.zig");
+const download_progress = @import("download_progress.zig");
+const model_settings = @import("model_settings.zig");
 
 // ── Unparsed-argument reporting ─────────────────────────────────────────
 
@@ -113,6 +118,10 @@ pub const Alias = struct {
     /// Installed RAM, in GB, from which `sushi list` recommends the pack (the largest such pack of a
     /// family at or under the machine's RAM); 0 = never recommended.
     recommend_gb: u32 = 0,
+    /// Its experts always stream from the SSD (DeepSeek): `tier_gb` is the memory it streams from, not "in memory".
+    streams_experts: bool = false,
+    /// The flags of the pack's recommended `sushi serve --model <pack>` in docs/usage.md.
+    serve_flags: []const u8 = "",
 };
 
 /// The Hugging Face org every `pull` and `run` download comes from.
@@ -123,14 +132,26 @@ pub const HF_ORG = "beamster";
 /// GLM's default 2.4bpw need 128 GB, GLM's 2bpw 96 GB. Qwen 2bpw also streams on a 32 GB Mac (README, "Streaming on a 32 GB Mac").
 /// A new pack lands here, in docs/usage.md and, once its repo is live, in the README.
 pub const aliases = [_]Alias{
-    .{ .name = "qwen3.8-flash-next", .tag = "2bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-2bpw", .tier_gb = 48, .recommend_gb = 32 },
-    .{ .name = "qwen3.8-flash-next", .tag = "2.75bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", .is_default = true, .tier_gb = 64, .recommend_gb = 64 },
-    .{ .name = "qwen3.8-flash-next", .tag = "4bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-4bpw", .tier_gb = 96, .recommend_gb = 96 },
-    .{ .name = "mimo-v2.6-flash", .tag = "2.3bpw", .repo = "beamster/MiMo-V2.6-Flash-Sushi-2.3bpw", .is_default = true, .tier_gb = 128, .recommend_gb = 128 },
+    .{ .name = "qwen3.8-flash-next", .tag = "2bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-2bpw", .tier_gb = 48, .recommend_gb = 32, .serve_flags = "--mtp --kv-quant 8 --mtp-head-kv-quant --qwen-gdn 16 --ctx-size 131072 --max-tokens 32000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1" },
+    .{ .name = "qwen3.8-flash-next", .tag = "2.75bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", .is_default = true, .tier_gb = 64, .recommend_gb = 64, .serve_flags = "--mtp --kv-quant 8 --mtp-head-kv-quant --qwen-gdn 16 --ctx-size 250000 --max-tokens 32000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1" },
+    .{ .name = "qwen3.8-flash-next", .tag = "4bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-4bpw", .tier_gb = 96, .recommend_gb = 96, .serve_flags = "--mtp --kv-quant 8 --mtp-head-kv-quant --ctx-size 500000 --prefill-chunk 2048 --max-tokens 64000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1" },
+    .{ .name = "mimo-v2.6-flash", .tag = "2.3bpw", .repo = "beamster/MiMo-V2.6-Flash-Sushi-2.3bpw", .is_default = true, .tier_gb = 128, .recommend_gb = 128, .serve_flags = "--ctx-size 1048576" },
     .{ .name = "glm-5.3-flash", .tag = "2bpw", .repo = "beamster/GLM-5.3-Flash-Sushi-2bpw", .tier_gb = 96, .recommend_gb = 96 },
     .{ .name = "glm-5.3-flash", .tag = "2.4bpw", .repo = "beamster/GLM-5.3-Flash-Sushi-2.4bpw", .is_default = true, .tier_gb = 128, .recommend_gb = 128 },
-    .{ .name = "deepseek-v4.1-flash", .tag = "1.75bpw", .repo = "beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw", .is_default = true, .tier_gb = 96, .recommend_gb = 96 },
+    .{ .name = "deepseek-v4.1-flash", .tag = "1.75bpw", .repo = "beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw", .is_default = true, .tier_gb = 96, .recommend_gb = 96, .streams_experts = true },
 };
+
+/// The published packs as the update check sees them.
+pub const known_packs = blk: {
+    var k: [aliases.len]pack_update.Known = undefined;
+    for (aliases, 0..) |a, i| k[i] = .{ .name = a.name, .tag = a.tag, .repo = a.repo, .is_default = a.is_default };
+    break :blk k;
+};
+
+/// Server start: the daily pack-revision look, off under `--no-update-check`; `auto` is the settings file's choice.
+pub fn configurePackUpdates(io: std.Io, on: bool, auto: bool) void {
+    pack_update.configure(io, on, auto, &known_packs);
+}
 
 pub const Resolved = struct {
     repo: []const u8,
@@ -299,52 +320,9 @@ fn homeDir() []const u8 {
 
 // ── HF tree listing ─────────────────────────────────────────────────────
 
-pub const RepoFile = struct {
-    path: []u8,
-    size: u64,
-};
-
-pub fn freeRepoFiles(allocator: std.mem.Allocator, files: []RepoFile) void {
-    for (files) |f| allocator.free(f.path);
-    allocator.free(files);
-}
-
-/// Parse the HF `/api/models/<repo>/tree/main?recursive=true` JSON array.
-/// LFS entries report the real artifact size under `lfs.size`.
-pub fn parseTreeJson(allocator: std.mem.Allocator, json: []const u8) ![]RepoFile {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch return error.InvalidTree;
-    defer parsed.deinit();
-    if (parsed.value != .array) return error.InvalidTree;
-
-    var files = std.ArrayList(RepoFile).empty;
-    errdefer {
-        for (files.items) |f| allocator.free(f.path);
-        files.deinit(allocator);
-    }
-    for (parsed.value.array.items) |item| {
-        if (item != .object) continue;
-        const obj = item.object;
-        const t = obj.get("type") orelse continue;
-        if (t != .string or !std.mem.eql(u8, t.string, "file")) continue;
-        const p = obj.get("path") orelse continue;
-        if (p != .string) continue;
-        var size: u64 = 0;
-        if (obj.get("lfs")) |lfs| {
-            if (lfs == .object) {
-                if (lfs.object.get("size")) |s| {
-                    if (s == .integer and s.integer > 0) size = @intCast(s.integer);
-                }
-            }
-        }
-        if (size == 0) {
-            if (obj.get("size")) |s| {
-                if (s == .integer and s.integer > 0) size = @intCast(s.integer);
-            }
-        }
-        try files.append(allocator, .{ .path = try allocator.dupe(u8, p.string), .size = size });
-    }
-    return files.toOwnedSlice(allocator);
-}
+pub const RepoFile = hf_pull.RepoFile;
+pub const freeRepoFiles = hf_pull.freeRepoFiles;
+pub const parseTreeJson = hf_pull.parseTreeJson;
 
 /// Chat-default file selection (mirrors the app's `FileSelection.chatDefault`):
 /// top-level files + the `mtp/` spec-decode sidecar + GLM's DFlash2 assistant
@@ -392,51 +370,40 @@ pub const Reporter = struct {
     impl: *anyopaque,
     /// One human-readable status line per call (no trailing newline).
     reportFn: *const fn (impl: *anyopaque, line: []const u8) void,
+    /// Progress for a caller that draws it (the web page's Available list); false stops the pull with `PullCancelled`.
+    eventFn: ?*const fn (impl: *anyopaque, ev: PullEvent) bool = null,
+    /// Set by that caller to stop the pull; the hash of the files on disk checks it between files.
+    stop: ?*const std.atomic.Value(bool) = null,
 
     pub fn say(self: Reporter, comptime fmt: []const u8, args: anytype) void {
         var buf: [512]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, fmt, args) catch return;
         self.reportFn(self.impl, line);
     }
-};
 
-/// The process environment a Hugging Face token is resolved from; a test passes its own.
-const HfEnv = struct {
-    token: ?[]const u8 = null,
-    token_path: ?[]const u8 = null,
-    hf_home: ?[]const u8 = null,
-    home: []const u8,
-
-    fn fromProcess() HfEnv {
-        const get = struct {
-            fn f(name: [:0]const u8) ?[]const u8 {
-                return if (std.c.getenv(name.ptr)) |v| std.mem.span(v) else null;
-            }
-        }.f;
-        return .{ .token = get("HF_TOKEN"), .token_path = get("HF_TOKEN_PATH"), .hf_home = get("HF_HOME"), .home = homeDir() };
+    pub fn event(self: Reporter, ev: PullEvent) bool {
+        const f = self.eventFn orelse return true;
+        return f(self.impl, ev);
     }
 };
 
-/// The token `sushi pull` and `sushi list` send: `HF_TOKEN`, else the file `hf auth login` wrote (`HF_TOKEN_PATH`,
-/// else `$HF_HOME/token`, else `~/.cache/huggingface/token`; the first one set is the only one read). Blank is none.
-fn resolveHfToken(allocator: std.mem.Allocator, io: std.Io, env: HfEnv) !?[]u8 {
-    if (env.token) |t| {
-        const v = std.mem.trim(u8, t, " \t\r\n");
-        if (v.len > 0) return try allocator.dupe(u8, v);
+pub const PullEvent = hf_pull.PullEvent;
+
+extern "c" fn waitid(idtype: c_int, id: c_uint, info: *anyopaque, options: c_int) c_int;
+
+/// Blocks until `pid` exits without reaping it, so the pid a caller holds cannot be reused until `wait` reaps it.
+fn waitExitedUnreaped(pid: std.posix.pid_t) void {
+    const P_PID = 1;
+    const WEXITED = 0x04;
+    const WNOWAIT = 0x20;
+    var info: [256]u8 align(8) = undefined;
+    while (waitid(P_PID, @intCast(pid), &info, WEXITED | WNOWAIT) != 0) {
+        if (std.c._errno().* != @intFromEnum(std.c.E.INTR)) return;
     }
-    const path = try hfTokenPath(allocator, env);
-    defer allocator.free(path);
-    const raw = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(4096)) catch return null;
-    defer allocator.free(raw);
-    const v = std.mem.trim(u8, raw, " \t\r\n");
-    return if (v.len == 0) null else try allocator.dupe(u8, v);
 }
 
-fn hfTokenPath(allocator: std.mem.Allocator, env: HfEnv) ![]u8 {
-    if (env.token_path) |p| if (p.len > 0) return allocator.dupe(u8, p);
-    if (env.hf_home) |h| if (h.len > 0) return std.fmt.allocPrint(allocator, "{s}/token", .{h});
-    return std.fmt.allocPrint(allocator, "{s}/.cache/huggingface/token", .{env.home});
-}
+const HfEnv = pack_update.HfEnv;
+const resolveHfToken = pack_update.resolveHfToken;
 
 var hf_header_seq = std.atomic.Value(u32).init(0);
 
@@ -535,7 +502,9 @@ fn curlFetch(allocator: std.mem.Allocator, io: std.Io, url: []const u8) ![]u8 {
 /// Download one file to `<dest_dir>/<file>` via curl (`-C -` resume onto a
 /// .partial, atomic rename on success). `show_progress` inherits stderr so
 /// the terminal gets curl's progress bar; the server-side pull passes false.
-fn curlDownload(allocator: std.mem.Allocator, io: std.Io, url: []const u8, dest_path: []const u8, show_progress: bool) !void {
+/// With `expect`, the partial's content id must match before it is renamed into place, else it is deleted
+/// and the error is `DownloadCorrupt`.
+fn curlDownload(allocator: std.mem.Allocator, io: std.Io, url: []const u8, dest_path: []const u8, show_progress: bool, expect: ?hf_pull.RepoFile, reporter: Reporter) !void {
     const partial = try std.fmt.allocPrint(allocator, "{s}.partial", .{dest_path});
     defer allocator.free(partial);
 
@@ -544,6 +513,7 @@ fn curlDownload(allocator: std.mem.Allocator, io: std.Io, url: []const u8, dest_
     var auth = HfAuth.initProcess(allocator, io) catch return error.DownloadFailed;
     defer auth.deinit(allocator, io);
     try curlBaseArgs(&argv, allocator, auth);
+    if (expect) |e| hf_pull.claimPartial(io, partial, e) catch {};
     try argv.appendSlice(allocator, &.{ "--create-dirs", "-C", "-", "-o", partial });
     if (show_progress) {
         try argv.append(allocator, "--progress-bar");
@@ -558,12 +528,26 @@ fn curlDownload(allocator: std.mem.Allocator, io: std.Io, url: []const u8, dest_
         .stdout = .ignore,
         .stderr = if (show_progress) .inherit else .ignore,
     }) catch return error.DownloadFailed;
+    if (!reporter.event(.{ .child = child.id })) {
+        child.kill(io);
+        _ = reporter.event(.{ .child = null });
+        return error.PullCancelled;
+    }
+    waitExitedUnreaped(child.id.?);
+    _ = reporter.event(.{ .child = null });
     const term = child.wait(io) catch return error.DownloadFailed;
     switch (term) {
         .exited => |code| if (code != 0) return error.DownloadFailed,
         else => return error.DownloadFailed,
     }
+    // A stop asked for now waits for the verify: a complete partial is checked and kept, never left unverified.
+    _ = reporter.event(.verifying);
+    if (expect) |e| if (e.oid.len > 0 and !hf_pull.digestMatches(io, partial, e)) {
+        hf_pull.dropPartial(io, partial);
+        return error.DownloadCorrupt;
+    };
     std.Io.Dir.renameAbsolute(partial, dest_path, io) catch return error.DownloadFailed;
+    hf_pull.dropPartial(io, partial);
 }
 
 fn fileSizeAt(io: std.Io, dir_path: []const u8, rel: []const u8) ?u64 {
@@ -620,7 +604,7 @@ fn modelPresentInDir(io: std.Io, dir: std.Io.Dir) bool {
 /// Present for the whole of a pull and removed only after the last file verifies: a refused request (HTTP 429)
 /// leaves no `.partial`, so the files alone cannot tell an interrupted pull from a finished one. A pack pulled
 /// before the marker existed never has it and keeps the `.partial` rule.
-const pull_marker = ".pull-incomplete";
+pub const pull_marker = ".pull-incomplete";
 
 fn setPullMarker(io: std.Io, dest_dir: []const u8, on: bool) !void {
     var dir = try std.Io.Dir.cwd().createDirPathOpen(io, dest_dir, .{});
@@ -632,11 +616,13 @@ fn setPullMarker(io: std.Io, dest_dir: []const u8, on: bool) !void {
     }
 }
 
-/// Download `resolved.repo` into `dest_dir`. Skips files already complete
-/// on disk (size match), resumes partials, reports per-file progress.
+/// Download `resolved.repo` into `dest_dir`. A file already on disk is kept only when its content id matches the
+/// listing (the manifest of the last pull, or a one-time hash of a folder without one); partials resume, and every
+/// download is verified before it is renamed into place. Reports per-file progress.
 pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, dest_dir: []const u8, reporter: Reporter, show_progress: bool) !void {
     reporter.say("pulling manifest for {s}", .{resolved.repo});
-    const tree_url = try std.fmt.allocPrint(allocator, "https://huggingface.co/api/models/{s}/tree/main?recursive=true", .{resolved.repo});
+    const base = hf_pull.endpoint();
+    const tree_url = try hf_pull.hfUrl(allocator, base, "/api/models/{s}/tree/main?recursive=true", .{resolved.repo});
     defer allocator.free(tree_url);
     const tree_json = curlFetch(allocator, io, tree_url) catch |err| {
         if (err == error.NotFound) {
@@ -653,45 +639,87 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
     };
     defer freeRepoFiles(allocator, files);
 
-    var wanted: usize = 0;
+    var wanted_files = std.ArrayList(hf_pull.RepoFile).empty;
+    defer wanted_files.deinit(allocator);
     var total_bytes: u64 = 0;
     for (files) |f| {
         if (!wantedFile(f.path)) continue;
-        wanted += 1;
+        try wanted_files.append(allocator, f);
         total_bytes += f.size;
     }
+    const wanted = wanted_files.items.len;
     if (wanted == 0) {
         reporter.say("error: {s} has no downloadable model files", .{resolved.repo});
         return error.PullFailed;
     }
     reporter.say("{d} files, {d} MB total", .{ wanted, total_bytes / (1024 * 1024) });
+    if (!reporter.event(.{ .listed = .{ .files = wanted, .bytes = total_bytes, .present = hf_pull.bytesPresent(io, dest_dir, wanted_files.items) } })) return error.PullCancelled;
     setPullMarker(io, dest_dir, true) catch {
         reporter.say("error: cannot write to {s}", .{dest_dir});
         return error.PullFailed;
     };
 
-    var idx: usize = 0;
-    for (files) |f| {
-        if (!wantedFile(f.path)) continue;
-        idx += 1;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const old = hf_pull.readManifest(arena_state.allocator(), io, dest_dir);
+    const actions = try allocator.alloc(hf_pull.Action, wanted);
+    defer allocator.free(actions);
+    var to_hash = std.ArrayList(hf_pull.RepoFile).empty;
+    defer to_hash.deinit(allocator);
+    var hash_slot = std.ArrayList(usize).empty;
+    defer hash_slot.deinit(allocator);
+    for (wanted_files.items, actions, 0..) |f, *act, i| {
+        const prior: ?hf_pull.RepoFile = if (old) |m| m.find(f.path) else null;
+        act.* = hf_pull.decide(f, prior, old != null, fileSizeAt(io, dest_dir, f.path));
+        if (act.* == .hash) {
+            try to_hash.append(allocator, f);
+            try hash_slot.append(allocator, i);
+        }
+    }
+    if (to_hash.items.len > 0) {
+        reporter.say("checking {d} files already on disk…", .{to_hash.items.len});
+        if (!reporter.event(.checking)) return error.PullCancelled;
+        const match = try allocator.alloc(bool, to_hash.items.len);
+        defer allocator.free(match);
+        hf_pull.hashMatches(io, dest_dir, to_hash.items, match, reporter.stop);
+        if (reporter.stop) |st| if (st.load(.monotonic)) return error.PullCancelled;
+        for (match, hash_slot.items) |ok, i| actions[i] = if (ok) .skip else .download;
+    }
+    // Files are replaced from here on: a manifest left behind would vouch for bytes that are about to change.
+    hf_pull.removeManifest(io, dest_dir);
+
+    for (wanted_files.items, actions, 1..) |f, act, idx| {
+        if (!reporter.event(.{ .file = .{ .index = idx, .path = f.path, .size = f.size, .skip = act == .skip } })) return error.PullCancelled;
+        if (act == .skip) {
+            reporter.say("[{d}/{d}] {s} — already complete", .{ idx, wanted, f.path });
+            continue;
+        }
         const dest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dest_dir, f.path });
         defer allocator.free(dest_path);
-        if (f.size > 0) {
-            if (fileSizeAt(io, dest_dir, f.path)) |have| {
-                if (have == f.size) {
-                    reporter.say("[{d}/{d}] {s} — already complete", .{ idx, wanted, f.path });
-                    continue;
-                }
-            }
-        }
         reporter.say("[{d}/{d}] pulling {s} ({d} MB)", .{ idx, wanted, f.path, f.size / (1024 * 1024) });
-        const url = try std.fmt.allocPrint(allocator, "https://huggingface.co/{s}/resolve/main/{s}", .{ resolved.repo, f.path });
+        const url = try hf_pull.hfUrl(allocator, base, "/{s}/resolve/main/{s}", .{ resolved.repo, f.path });
         defer allocator.free(url);
-        curlDownload(allocator, io, url, dest_path, show_progress) catch {
-            reporter.say("error: download failed for {s} (partial kept — rerun to resume)", .{f.path});
+        curlDownload(allocator, io, url, dest_path, show_progress, f, reporter) catch |err| {
+            if (err == error.PullCancelled) return err;
+            if (err == error.DownloadCorrupt) {
+                reporter.say("error: {s} does not match its Hugging Face checksum (partial deleted — rerun to download it again)", .{f.path});
+            } else {
+                reporter.say("error: download failed for {s} (partial kept — rerun to resume)", .{f.path});
+            }
             return error.PullFailed;
         };
     }
+
+    if (old) |m| {
+        const gone = hf_pull.removeDropped(io, dest_dir, m, files);
+        if (gone > 0) reporter.say("removed {d} files the repo no longer has", .{gone});
+    }
+    const commit = repoCommit(allocator, io, base, resolved.repo);
+    defer if (commit) |c| allocator.free(c);
+    hf_pull.writeManifest(allocator, io, dest_dir, .{ .repo = resolved.repo, .commit = commit orelse "", .files = wanted_files.items }) catch {
+        reporter.say("error: cannot write {s}/{s}", .{ dest_dir, hf_pull.manifest_name });
+        return error.PullFailed;
+    };
     setPullMarker(io, dest_dir, false) catch {
         reporter.say("error: cannot finish {s}: remove {s}/{s} by hand", .{ resolved.repo, dest_dir, pull_marker });
         return error.PullFailed;
@@ -699,8 +727,23 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
     reporter.say("success: {s} ready", .{resolved.repo});
 }
 
+/// The commit the repo's main branch is at, or null when the API does not say.
+fn repoCommit(allocator: std.mem.Allocator, io: std.Io, base: []const u8, repo: []const u8) ?[]u8 {
+    const url = hf_pull.hfUrl(allocator, base, "/api/models/{s}", .{repo}) catch return null;
+    defer allocator.free(url);
+    const got = curlFetch(allocator, io, url) catch return null;
+    defer allocator.free(got);
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, got, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const sha = parsed.value.object.get("sha") orelse return null;
+    if (sha != .string) return null;
+    return allocator.dupe(u8, sha.string) catch null;
+}
+
+/// A listed path is written under the pack folder, so one that could leave it is never taken.
 fn wantedFile(path: []const u8) bool {
-    return shouldDownload(path);
+    return hf_pull.safeRelative(path) and shouldDownload(path);
 }
 
 // ── Commands ────────────────────────────────────────────────────────────
@@ -808,7 +851,7 @@ pub fn parseRepoSize(allocator: std.mem.Allocator, json: []const u8) !u64 {
 /// that is not published yet), or nothing at all (no network, a timeout).
 pub const FetchOutcome = union(enum) { size: u64, not_found, offline };
 
-pub const CatalogRow = struct { alias: Alias, size: ?u64, downloaded: bool, published: bool = true };
+pub const CatalogRow = struct { alias: Alias, size: ?u64, downloaded: bool, published: bool = true, update: ?pack_update.Available = null };
 
 pub const SizeFetch = *const fn (ctx: *anyopaque, repo: []const u8) FetchOutcome;
 
@@ -841,6 +884,10 @@ pub fn writeCatalog(w: *std.Io.Writer, ram_gb: u64, rows: []const CatalogRow) !v
             if (recommended) "  <- recommended" else "",
             if (row.published) "" else "  (not yet published)",
         });
+        if (row.update) |u| {
+            try w.writeAll("  ");
+            try pack_update.listLine(w, u);
+        }
     }
 }
 
@@ -848,7 +895,7 @@ pub const offline_note = "note: could not reach huggingface.co; showing the loca
 
 fn fetchSizeViaCurl(ctx: *anyopaque, repo: []const u8) FetchOutcome {
     const env: *const ListEnv = @ptrCast(@alignCast(ctx));
-    const url = std.fmt.allocPrint(env.allocator, "https://huggingface.co/api/models/{s}?blobs=true", .{repo}) catch return .offline;
+    const url = hf_pull.hfUrl(env.allocator, hf_pull.endpoint(), "/api/models/{s}?blobs=true", .{repo}) catch return .offline;
     defer env.allocator.free(url);
     const got = curlGet(env.allocator, env.io, url, true) catch return .offline;
     defer env.allocator.free(got.body);
@@ -859,7 +906,35 @@ fn fetchSizeViaCurl(ctx: *anyopaque, repo: []const u8) FetchOutcome {
     };
 }
 
+/// `sushi list` asks about pack updates unless the settings file's `pack_update_check` is off.
+fn packChecksFor(file: *const model_settings.Settings) bool {
+    return model_settings.server(file).pack_update_check orelse true;
+}
+
+fn packChecksOn(allocator: std.mem.Allocator, io: std.Io) bool {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var file = model_settings.load(allocator, io, model_settings.defaultPath(&buf));
+    defer file.deinit();
+    return packChecksFor(&file);
+}
+
 const ListEnv = struct { allocator: std.mem.Allocator, io: std.Io };
+
+/// `sushi list`'s size look for one repo, for the server's Downloads catalog.
+pub fn fetchRepoSize(allocator: std.mem.Allocator, io: std.Io, repo: []const u8) FetchOutcome {
+    var env = ListEnv{ .allocator = allocator, .io = io };
+    return fetchSizeViaCurl(&env, repo);
+}
+
+/// The org's public Sushi repos, or null when Hugging Face gave no usable answer.
+pub fn fetchOrgPacks(allocator: std.mem.Allocator, io: std.Io) ?[][]u8 {
+    const url = hf_pull.hfUrl(allocator, hf_pull.endpoint(), "/api/models?author={s}&limit=500", .{HF_ORG}) catch return null;
+    defer allocator.free(url);
+    const got = curlGet(allocator, io, url, true) catch return null;
+    defer allocator.free(got.body);
+    if (statusKind(got.status) != .ok) return null;
+    return download_progress.parseOrgPacks(allocator, got.body, HF_ORG) catch null;
+}
 
 /// A catalog row from what the API said about the repo: a pack it does not return is listed as not yet
 /// published, without a size.
@@ -870,16 +945,32 @@ pub fn catalogRow(a: Alias, outcome: FetchOutcome, downloaded: bool) CatalogRow 
     };
 }
 
-fn catalogDownloaded(io: std.Io, allocator: std.mem.Allocator, root: []const u8, repo: []const u8) bool {
-    const org_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, repo }) catch return false;
-    defer allocator.free(org_path);
-    if (modelPresent(io, org_path)) return true;
+/// Where a catalog pack sits on disk, or null when it is not downloaded. Caller frees.
+pub fn catalogPackPath(io: std.Io, allocator: std.mem.Allocator, root: []const u8, repo: []const u8) ?[]u8 {
+    const org_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, repo }) catch return null;
+    if (modelPresent(io, org_path)) return org_path;
+    allocator.free(org_path);
     // `hf download --local-dir ~/.sushi/models/<pack>` (docs/usage.md) lands without the org folder.
-    const slash = std.mem.indexOfScalar(u8, repo, '/') orelse return false;
-    const flat_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, repo[slash + 1 ..] }) catch return false;
-    defer allocator.free(flat_path);
-    return modelPresent(io, flat_path);
+    const slash = std.mem.indexOfScalar(u8, repo, '/') orelse return null;
+    const flat_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, repo[slash + 1 ..] }) catch return null;
+    if (modelPresent(io, flat_path)) return flat_path;
+    allocator.free(flat_path);
+    return null;
 }
+
+const UpdateJob = struct {
+    io: std.Io,
+    path: []const u8,
+    arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
+    found: ?pack_update.Available = null,
+
+    fn run(self: *UpdateJob) void {
+        switch (pack_update.checkPack(self.arena.allocator(), self.io, &known_packs, self.path)) {
+            .available => |a| self.found = a,
+            else => {},
+        }
+    }
+};
 
 /// Whether a local model row (`name` as `list` prints it) is one of the catalog packs.
 fn isCatalogName(name: []const u8) bool {
@@ -897,16 +988,39 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
     defer allocator.free(root);
 
     var out_buf: [4096]u8 = undefined;
-    var stdout_w = std.Io.File.stdout().writer(io, &out_buf);
+    var stdout_w = std.Io.File.stdout().writerStreaming(io, &out_buf);
     const w = &stdout_w.interface;
     defer w.flush() catch {};
 
     var env = ListEnv{ .allocator = allocator, .io = io };
     var outcomes: [aliases.len]FetchOutcome = undefined;
     const online = fetchCatalogSizes(&env, &fetchSizeViaCurl, &outcomes);
+    const check_packs = online and packChecksOn(allocator, io);
     if (online) {
         var rows: [aliases.len]CatalogRow = undefined;
-        for (aliases, 0..) |a, i| rows[i] = catalogRow(a, outcomes[i], catalogDownloaded(io, allocator, root, a.repo));
+        var jobs: [aliases.len]?UpdateJob = @splat(null);
+        var paths: [aliases.len]?[]u8 = @splat(null);
+        var threads: [aliases.len]?std.Thread = @splat(null);
+        defer for (&jobs, &paths) |*j, p| {
+            if (j.*) |*job| job.arena.deinit();
+            if (p) |pp| allocator.free(pp);
+        };
+        for (aliases, 0..) |a, i| {
+            paths[i] = catalogPackPath(io, allocator, root, a.repo);
+            rows[i] = catalogRow(a, outcomes[i], paths[i] != null);
+        }
+        // Each downloaded pack asks Hugging Face for its revision at the same time, so a slow answer costs one wait.
+        for (&jobs, &threads, paths) |*j, *t, p| {
+            if (!check_packs) break;
+            const path = p orelse continue;
+            j.* = .{ .io = io, .path = path };
+            t.* = std.Thread.spawn(.{}, UpdateJob.run, .{&j.*.?}) catch null;
+            if (t.* == null) j.*.?.run();
+        }
+        for (threads) |t| if (t) |th| th.join();
+        for (&rows, jobs) |*row, j| if (j) |job| {
+            row.update = job.found;
+        };
         try writeCatalog(w, installedGb(status.getTotalMemBytes()), &rows);
         try w.writeAll("\n");
     } else {
@@ -929,7 +1043,7 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
         if (isModelDir(io, &sub)) {
             if (online and isCatalogName(entry.name)) continue;
             try printLocalHeader(w, count);
-            try printModelRow(io, allocator, w, &sub, entry.name, root);
+            try printModelRow(io, allocator, w, &sub, entry.name, root, check_packs);
             count += 1;
             continue;
         }
@@ -944,7 +1058,7 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
             const full = std.fmt.bufPrint(&name_buf, "{s}/{s}", .{ entry.name, sub_entry.name }) catch continue;
             if (online and isCatalogName(full)) continue;
             try printLocalHeader(w, count);
-            try printModelRow(io, allocator, w, &leaf, full, root);
+            try printModelRow(io, allocator, w, &leaf, full, root, check_packs);
             count += 1;
         }
     }
@@ -964,24 +1078,15 @@ fn treeEntryDescends(kind: std.Io.File.Kind) bool {
 }
 
 fn isModelDir(io: std.Io, dir: *std.Io.Dir) bool {
-    if (dir.statFile(io, "config.json", .{})) |st| {
-        if (st.kind == .file) return true;
-    } else |_| {}
-    var it = dir.iterate();
-    while (it.next(io) catch null) |entry| {
-        if (entry.kind != .file and entry.kind != .sym_link) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".gguf")) continue;
-        const st = dir.statFile(io, entry.name, .{}) catch continue;
-        if (st.kind == .file) return true;
-    }
-    return false;
+    const st = dir.statFile(io, "config.json", .{}) catch return false;
+    return st.kind == .file;
 }
 
-fn printModelRow(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, dir: *std.Io.Dir, name: []const u8, root: []const u8) !void {
+fn printModelRow(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, dir: *std.Io.Dir, name: []const u8, root: []const u8, check_updates: bool) !void {
     const bytes = dirBytesOneLevel(io, dir);
-    // TYPE from the same classification serving uses (gguf → chat via the
-    // embedded engines, media modalities, embed, drafter, unsupported) so
-    // the list is honest about which rows `run` can actually chat with.
+    // TYPE from the same classification serving uses (chat, embed, drafter,
+    // unsupported) so the list is honest about which rows `run` can actually
+    // chat with.
     const abs = std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, name }) catch null;
     defer if (abs) |a| allocator.free(a);
     const kind_label: []const u8 = blk: {
@@ -991,6 +1096,16 @@ fn printModelRow(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, di
     };
     var size_buf: [32]u8 = undefined;
     try w.print("{s: <56} {s: <12} {s: >10}\n", .{ name, kind_label, formatSize(&size_buf, bytes) });
+    if (!check_updates) return;
+    var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    switch (pack_update.checkPack(arena_state.allocator(), io, &known_packs, abs orelse return)) {
+        .available => |u| {
+            try w.writeAll("  ");
+            try pack_update.listLine(w, u);
+        },
+        else => {},
+    }
 }
 
 /// Sum file bytes in a model dir INCLUDING one level of subdirectories —
@@ -1077,7 +1192,7 @@ pub const Turn = struct {
 };
 
 /// The REPL's thinking request. `model_default` sends no thinking field.
-pub const Think = union(enum) { model_default, on, effort: model.Effort };
+pub const Think = union(enum) { model_default, on, effort: effort_mod.Effort };
 
 pub const ReplOptions = struct {
     think: Think = .model_default,
@@ -1155,7 +1270,7 @@ pub const ThinkFlag = struct { think: Think, consumed: bool };
 
 /// `--think <effort>` requires an explicit effort word.
 pub fn parseThinkFlag(next: ?[]const u8) error{Usage}!ThinkFlag {
-    if (next) |w| if (model.parseEffort(w)) |e| return .{ .think = .{ .effort = e }, .consumed = true };
+    if (next) |w| if (effort_mod.parseEffort(w)) |e| return .{ .think = .{ .effort = e }, .consumed = true };
     return error.Usage;
 }
 
@@ -1163,40 +1278,40 @@ pub const ThinkCommand = union(enum) { show, set: Think, refuse: []const u8 };
 
 /// `/think [effort]`; null when the line is not that command. An empty
 /// `accepted` (the server listed none) leaves the whole vocabulary to the server.
-pub fn parseThinkCommand(line: []const u8, accepted: []const model.Effort) ?ThinkCommand {
+pub fn parseThinkCommand(line: []const u8, accepted: []const effort_mod.Effort) ?ThinkCommand {
     if (!std.mem.startsWith(u8, line, "/think")) return null;
     const rest = line["/think".len..];
     if (rest.len > 0 and rest[0] != ' ') return null;
     const word = std.mem.trim(u8, rest, " \t");
     if (word.len == 0) return .show;
-    const e = model.parseEffort(word) orelse return .{ .refuse = word };
+    const e = effort_mod.parseEffort(word) orelse return .{ .refuse = word };
     return .{ .set = .{ .effort = acceptedEffort(e, accepted) orelse return .{ .refuse = word } } };
 }
 
-/// The effort `e` selects among the server's listed words (`model.selectEffort`); null = refused.
-pub fn acceptedEffort(e: model.Effort, accepted: []const model.Effort) ?model.Effort {
+/// The effort `e` selects among the server's listed words (`effort_mod.selectEffort`); null = refused.
+pub fn acceptedEffort(e: effort_mod.Effort, accepted: []const effort_mod.Effort) ?effort_mod.Effort {
     if (accepted.len == 0) return e;
-    return model.selectEffort(accepted, e);
+    return effort_mod.selectEffort(accepted, e);
 }
 
-fn writeEffortOptions(w: *std.Io.Writer, accepted: []const model.Effort) !void {
-    const all = std.enums.values(model.Effort);
+fn writeEffortOptions(w: *std.Io.Writer, accepted: []const effort_mod.Effort) !void {
+    const all = std.enums.values(effort_mod.Effort);
     const list = if (accepted.len > 0) accepted else all;
     for (list, 0..) |e, i| try w.print("{s}{s}", .{ if (i > 0) ", " else "", @tagName(e) });
 }
 
-/// Same text as the server's 400 (`server.effortRefusal`).
-pub fn writeEffortRefusal(w: *std.Io.Writer, word: []const u8, model_id: []const u8, accepted: []const model.Effort) !void {
+/// Same text as the server's 400 (`request_policy.effortRefusal`).
+pub fn writeEffortRefusal(w: *std.Io.Writer, word: []const u8, model_id: []const u8, accepted: []const effort_mod.Effort) !void {
     try w.print("reasoning effort '{s}' is not supported by {s}; use one of: ", .{ word, model_id });
     try writeEffortOptions(w, accepted);
 }
 
 /// The server's `[effort]` line, when `/think` re-routed `asked`. False when the word was accepted as itself.
-pub fn writeEffortReroute(w: *std.Io.Writer, model_id: []const u8, asked: model.Effort, accepted: []const model.Effort) !bool {
+pub fn writeEffortReroute(w: *std.Io.Writer, model_id: []const u8, asked: effort_mod.Effort, accepted: []const effort_mod.Effort) !bool {
     if (accepted.len == 0) return false;
-    const pick = model.selectEffortPick(accepted, asked) orelse return false;
+    const pick = effort_mod.selectEffortPick(accepted, asked) orelse return false;
     const from = pick.rerouted_from orelse return false;
-    try w.print("[effort] " ++ model.effort_reroute_notice ++ "\n", .{ model_id, @tagName(from), @tagName(pick.effort) });
+    try w.print("[effort] " ++ effort_mod.effort_reroute_notice ++ "\n", .{ model_id, @tagName(from), @tagName(pick.effort) });
     return true;
 }
 
@@ -1211,7 +1326,7 @@ fn writeResponseEffortNotice(w: *std.Io.Writer, head: anytype) !void {
     }
 }
 
-pub fn writeThinkSetting(w: *std.Io.Writer, think: Think, accepted: []const model.Effort) !void {
+pub fn writeThinkSetting(w: *std.Io.Writer, think: Think, accepted: []const effort_mod.Effort) !void {
     try w.writeAll("thinking: ");
     try w.writeAll(switch (think) {
         .model_default => "model default",
@@ -1226,7 +1341,7 @@ pub fn writeThinkSetting(w: *std.Io.Writer, think: Think, accepted: []const mode
 pub const ModelEfforts = struct {
     id: []u8,
     /// Empty when the row lists none.
-    efforts: []model.Effort,
+    efforts: []effort_mod.Effort,
     /// The row lists the `vision` capability.
     vision: bool = false,
 
@@ -1244,11 +1359,11 @@ pub fn parseModelEfforts(allocator: std.mem.Allocator, body: []const u8) !ModelE
     if (data == null or data.? != .array or data.?.array.items.len == 0 or data.?.array.items[0] != .object) return error.ReplNoModel;
     const row = data.?.array.items[0].object;
     const id = if (row.get("id")) |v| (if (v == .string) v.string else "") else "";
-    var efforts = std.ArrayList(model.Effort).empty;
+    var efforts = std.ArrayList(effort_mod.Effort).empty;
     errdefer efforts.deinit(allocator);
     if (row.get("reasoning_efforts")) |list| if (list == .array) for (list.array.items) |v| {
         if (v != .string) continue;
-        if (model.parseEffort(v.string)) |e| try efforts.append(allocator, e);
+        if (effort_mod.parseEffort(v.string)) |e| try efforts.append(allocator, e);
     };
     var vision = false;
     if (row.get("capabilities")) |caps| if (caps == .array) for (caps.array.items) |v| {
@@ -1616,7 +1731,7 @@ pub fn runRepl(allocator: std.mem.Allocator, io: std.Io, port: u16, launch: Repl
     defer allocator.free(chat_url);
 
     var out_buf: [4096]u8 = undefined;
-    var stdout_w = std.Io.File.stdout().writer(io, &out_buf);
+    var stdout_w = std.Io.File.stdout().writerStreaming(io, &out_buf);
     const w = &stdout_w.interface;
 
     const models_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/v1/models", .{port});
@@ -1628,7 +1743,7 @@ pub fn runRepl(allocator: std.mem.Allocator, io: std.Io, port: u16, launch: Repl
     else |_|
         null;
     defer if (models_info) |m| m.deinit(allocator);
-    const accepted: []const model.Effort = if (models_info) |m| m.efforts else &.{};
+    const accepted: []const effort_mod.Effort = if (models_info) |m| m.efforts else &.{};
     var think = opts.think;
     if (think == .effort) {
         const asked = think.effort;
@@ -1640,8 +1755,8 @@ pub fn runRepl(allocator: std.mem.Allocator, io: std.Io, port: u16, launch: Repl
         } };
         _ = try writeEffortReroute(w, if (models_info) |m| m.id else "this model", asked, accepted);
     }
-    // The initial load finishes BEFORE the listener binds, so an answering
-    // /health is the post-load moment. `run` quieted the log to warn on a TTY,
+    // /health answers 200 only once the launch model is loaded and its boot is
+    // done, so an ok /health is the post-load moment. `run` quieted the log to warn on a TTY,
     // so this one line is printed here rather than logged.
     var mem_buf: [160]u8 = undefined;
     if (formatMemorySummary(
@@ -1698,7 +1813,7 @@ pub fn runRepl(allocator: std.mem.Allocator, io: std.Io, port: u16, launch: Repl
                     think = t;
                     try writeThinkSetting(w, think, accepted);
                     const word = std.mem.trim(u8, trimmed["/think".len..], " \t");
-                    if (model.parseEffort(word)) |asked| _ = try writeEffortReroute(w, if (models_info) |m| m.id else "this model", asked, accepted);
+                    if (effort_mod.parseEffort(word)) |asked| _ = try writeEffortReroute(w, if (models_info) |m| m.id else "this model", asked, accepted);
                 },
                 .refuse => |word| try writeEffortRefusal(w, word, if (models_info) |m| m.id else "this model", accepted),
             }
@@ -1766,7 +1881,7 @@ pub fn writeReadyBanner(w: *std.Io.Writer, vision: bool, port: u16, state: []con
     try w.writeAll("\n>>> chat is live — /bye to exit, /tool on for web search and file tools, /edit on to let the model write files there");
     try w.writeAll(if (vision) ", /image <path> to show an image\n" else "\n");
     try w.print(">>> {s} (shown before each prompt); /cd <folder> moves the folder the file tools{s} read\n", .{ state, if (vision) " and relative /image paths" else "" });
-    try w.print(">>> chat in your browser: http://127.0.0.1:{d}/\n", .{port});
+    try w.print(">>> chat in your browser: http://127.0.0.1:{d}/chat\n", .{port});
 }
 
 /// The REPL's line for a newer release found by the daily check; nothing without one.
@@ -2054,7 +2169,12 @@ test "cli: resolveShortName aliases, tags, org/repo, hf.co, unknown" {
     // Unknown alias-shaped name → null; upstream families are not served.
     try testing.expect(resolveShortName("doesnotexist") == null);
     try testing.expect(resolveShortName("qwen3.8-flash-next:nosuchtag") == null);
-    try testing.expect(resolveShortName("gemma4") == null);
+    try testing.expect(resolveShortName("unlisted-pack") == null);
+}
+
+test "pull: a listed path that leaves the pack folder is never downloaded" {
+    for ([_][]const u8{ "mtp/../x", "mtp/../../../x", "../x", "/etc/x", "mtp//x" }) |p| try testing.expect(!wantedFile(p));
+    for ([_][]const u8{ "config.json", "mtp/weights.safetensors", "model-00001.safetensors" }) |p| try testing.expect(wantedFile(p));
 }
 
 test "pull: only the beamster org, an alias or beamster/<repo>, before anything downloads" {
@@ -2066,7 +2186,7 @@ test "pull: only the beamster org, an alias or beamster/<repo>, before anything 
     try testing.expectError(error.NotBeamster, checkPullable("https://huggingface.co/Qwen/Qwen3.8-Flash-Next"));
     try testing.expectError(error.NotBeamster, checkPullable("beamster-fake/pack"));
     try testing.expectError(error.NotBeamster, checkPullable("beamster/a/b"));
-    try testing.expectError(error.UnknownModel, checkPullable("gemma4"));
+    try testing.expectError(error.UnknownModel, checkPullable("unlisted-pack"));
     try testing.expect(!isBeamsterRepo("beamster/"));
     try testing.expect(!isBeamsterRepo("beamster"));
 }
@@ -2423,7 +2543,7 @@ test "cli: --think requires an effort word" {
 }
 
 test "cli: /think shows, sets an accepted word, and refuses the rest" {
-    const qwen = [_]model.Effort{ .off, .low, .medium, .xhigh };
+    const qwen = [_]effort_mod.Effort{ .off, .low, .medium, .xhigh };
     try testing.expectEqual(@as(?ThinkCommand, null), parseThinkCommand("/thinking about it", &qwen));
     var notice: [160]u8 = undefined;
     var nw: std.Io.Writer = .fixed(&notice);
@@ -2432,7 +2552,7 @@ test "cli: /think shows, sets an accepted word, and refuses the rest" {
     nw = .fixed(&notice);
     try testing.expect(!try writeEffortReroute(&nw, "Qwen3.8-Flash-Next", .low, &qwen));
     try testing.expect(!try writeEffortReroute(&nw, "MiMo", .high, &.{ .off, .on }));
-    const glm = [_]model.Effort{ .low, .high, .max };
+    const glm = [_]effort_mod.Effort{ .low, .high, .max };
     try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .high } }), parseThinkCommand("/think medium", &glm));
     try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .max } }), parseThinkCommand("/think xhigh", &glm));
     nw = .fixed(&notice);
@@ -2491,7 +2611,7 @@ test "cli: the REPL reads the model's efforts from /v1/models and streams reason
     );
     defer info.deinit(allocator);
     try testing.expectEqualStrings("MiMo", info.id);
-    try testing.expectEqualSlices(model.Effort, &.{ .off, .low, .max }, info.efforts);
+    try testing.expectEqualSlices(effort_mod.Effort, &.{ .off, .low, .max }, info.efforts);
     try testing.expect(info.vision);
     const bare = try parseModelEfforts(allocator, "{\"data\":[{\"id\":\"old\",\"capabilities\":[\"chat\"]}]}");
     defer bare.deinit(allocator);
@@ -2556,7 +2676,7 @@ test "cli: the ready banner shows the folder, the tools state, /cd and the brows
         var w: std.Io.Writer = .fixed(&buf);
         try writeReadyBanner(&w, vision, 18800, "~/project · tools off");
         const text = w.buffered();
-        try testing.expect(std.mem.indexOf(u8, text, "chat in your browser: http://127.0.0.1:18800/\n") != null);
+        try testing.expect(std.mem.indexOf(u8, text, "chat in your browser: http://127.0.0.1:18800/chat\n") != null);
         try testing.expect(std.mem.indexOf(u8, text, "/tool on") != null);
         try testing.expect(std.mem.indexOf(u8, text, "~/project · tools off") != null);
         try testing.expect(std.mem.indexOf(u8, text, "/cd <folder>") != null);
@@ -2946,20 +3066,6 @@ test "cli: list tree walk descends into symlinked model dirs" {
     try testing.expect(treeEntryDescends(.directory));
     try testing.expect(treeEntryDescends(.sym_link));
     try testing.expect(!treeEntryDescends(.file));
-
-    // Source scan: the org-level and leaf-level loops in listModels must both
-    // consult the predicate — a reintroduced raw `!= .directory` check is the
-    // regression this pins. Needle split so the scan cannot match itself.
-    const src = @embedFile("cli.zig");
-    const needle = "treeEntry" ++ "Descends(";
-    var found: usize = 0;
-    var idx: usize = 0;
-    while (std.mem.indexOfPos(u8, src, idx, needle)) |p| {
-        found += 1;
-        idx = p + needle.len;
-    }
-    // 1 definition + 3 in this test + at least 2 call sites in the walk.
-    try testing.expect(found >= 6);
 }
 
 pub fn isPromptFlag(arg: []const u8) bool {
@@ -3040,7 +3146,7 @@ pub fn runPrompt(allocator: std.mem.Allocator, io: std.Io, port: u16, body: []co
     }
 
     var out_buf: [16 * 1024]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(io, &out_buf);
+    var stdout = std.Io.File.stdout().writerStreaming(io, &out_buf);
     try writeResponseEffortNotice(&stdout.interface, response.head);
     var buffered: std.Io.Writer.Allocating = .init(allocator);
     defer buffered.deinit();
@@ -3121,18 +3227,30 @@ test "cli: one-shot and REPL omission keep the model default" {
 test "thinking policy CLI: MiMo takes every thinking level as on, Qwen and GLM only their own words" {
     try testing.expectEqual(ThinkFlag{ .think = .{ .effort = .on }, .consumed = true }, try parseThinkFlag("on"));
     try testing.expectEqual(ThinkFlag{ .think = .{ .effort = .minimal }, .consumed = true }, try parseThinkFlag("minimal"));
-    const mimo = [_]model.Effort{ .off, .on };
+    const mimo = [_]effort_mod.Effort{ .off, .on };
     for ([_][]const u8{ "/think on", "/think minimal", "/think low", "/think medium", "/think high", "/think xhigh", "/think max" }) |line| {
         try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .on } }), parseThinkCommand(line, &mimo));
     }
     try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .off } }), parseThinkCommand("/think none", &mimo));
-    try testing.expectEqual(@as(?model.Effort, .on), acceptedEffort(.high, &mimo));
+    try testing.expectEqual(@as(?effort_mod.Effort, .on), acceptedEffort(.high, &mimo));
     try testing.expect(parseThinkCommand("/think off", &.{ .low, .high, .max }).? == .refuse);
     try testing.expect(parseThinkCommand("/think minimal", &.{ .low, .high, .max }).? == .refuse);
     try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .xhigh } }), parseThinkCommand("/think high", &.{ .off, .low, .medium, .xhigh }));
     try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .xhigh } }), parseThinkCommand("/think max", &.{ .off, .low, .medium, .xhigh }));
     try testing.expect(parseThinkCommand("/think minimal", &.{ .off, .low, .medium, .xhigh }).? == .refuse);
-    try testing.expectEqual(@as(?model.Effort, null), acceptedEffort(.on, &.{ .off, .low, .medium, .xhigh }));
+    try testing.expectEqual(@as(?effort_mod.Effort, null), acceptedEffort(.on, &.{ .off, .low, .medium, .xhigh }));
+}
+
+test "list: a downloaded pack with a newer published revision gets an update line under its row" {
+    var rows: [aliases.len]CatalogRow = undefined;
+    for (aliases, 0..) |a, i| rows[i] = .{ .alias = a, .size = 1 << 30, .downloaded = true };
+    rows[aliases.len - 1].update = .{ .local = "1.0", .latest = "2.0", .command = "sushi pull example-pack" };
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try writeCatalog(&w, 96, &rows);
+    const out = w.buffered();
+    try testing.expect(std.mem.endsWith(u8, out, "  update available: 2.0 (you have 1.0) — sushi pull example-pack\n"));
+    try testing.expectEqual(std.mem.indexOf(u8, out, "update available"), std.mem.lastIndexOf(u8, out, "update available"));
 }
 
 test "hf token: env var, then HF_TOKEN_PATH, then HF_HOME/token, then the default file, then none" {
@@ -3234,7 +3352,7 @@ test "resolveRelativeDir: a relative directory becomes its absolute real path, a
     try tmp.dir.createDir(io, "pack", .default_dir);
     var pack = try tmp.dir.openDir(io, "pack", .{});
     defer pack.close(io);
-    try @import("glm_stream_fixture.zig").writeStorage(a, pack, .none, 128, 128, .fp8);
+    try @import("glm5/glm_stream_fixture.zig").writeStorage(a, pack, .none, 128, 128, .fp8);
 
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
     const cwd_len = try std.Io.Dir.cwd().realPath(io, &cwd_buf);
@@ -3258,4 +3376,16 @@ test "resolveRelativeDir: a relative directory becomes its absolute real path, a
     try std.testing.expect(resolveRelativeDir(a, io, want) == null);
     try std.testing.expect(resolveRelativeDir(a, io, "qwen3.8-flash-next") == null);
     try std.testing.expect(resolveRelativeDir(a, io, "") == null);
+}
+
+test "list: pack update lookups run unless the settings file turns pack_update_check off" {
+    var on = try model_settings.parse(std.testing.allocator, "{}");
+    defer on.deinit();
+    try std.testing.expect(packChecksFor(&on));
+    var off = try model_settings.parse(std.testing.allocator, "{\"server\":{\"pack_update_check\":false}}");
+    defer off.deinit();
+    try std.testing.expect(!packChecksFor(&off));
+    var other = try model_settings.parse(std.testing.allocator, "{\"server\":{\"update_check\":false}}");
+    defer other.deinit();
+    try std.testing.expect(packChecksFor(&other));
 }

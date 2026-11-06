@@ -1,3 +1,4 @@
+// sushi-test: tier=tool
 // Generate a real-browser renderer regression page. Open the output HTML and expect all PASS.
 // No model, network image, npm dependency or private conversation data is needed.
 const fs = require('node:fs');
@@ -61,6 +62,34 @@ const checks = async function () {
     assert(imageRequests === 1, 'duplicate image fetch');
     const bad = inlineNodes('![Bad](javascript:alert%281%29)');
     assert(!bad.querySelector('img'), 'unsafe image URL accepted');
+  });
+  await test('Markdown fences: info strings, longer and tilde marks, fences in list items', () => {
+    const host = el('div');
+    host.appendChild(renderMarkdown('``` python\nprint(1)\n```\n\n```js title="a.js"\nx\n```\n\n````md\n```js\ny\n```\n````\n\n~~~\nt\n~~~\n\n1. step\n   ```sh\n   ls\n   ```\n2. next\n\nAfter'));
+    document.getElementById('examples').appendChild(host);
+    const blocks = [...host.querySelectorAll('.code-block')].map((b) => `${b.querySelector('.cb-head span').textContent}:${b.querySelector('pre').textContent}`);
+    assert(JSON.stringify(blocks) === JSON.stringify(['python:print(1)', 'js:x', 'md:```js\ny\n```', 'code:t', 'sh:ls']), `blocks were ${JSON.stringify(blocks)}`);
+    assert(host.querySelectorAll(':scope > ol > li').length === 2, 'the list lost an item');
+    assert(host.lastElementChild.textContent === 'After', 'text after the fences was swallowed');
+  });
+  await test('Markdown inline: a paren in a link, a pipe in a code span, an escaped star', () => {
+    const host = el('div');
+    host.appendChild(renderMarkdown('[Foo](https://en.wikipedia.org/wiki/Foo_(bar)) \\* x\n\n| a | b |\n|---|---|\n| `x|y` | 2 |'));
+    document.getElementById('examples').appendChild(host);
+    assert(host.querySelector('a').href.endsWith('Foo_(bar)'), 'link cut at the parenthesis');
+    assert(host.querySelector('p').textContent.endsWith(' * x') && !host.querySelector('em'), 'escaped star');
+    assert([...host.querySelectorAll('td')].map((c) => c.textContent).join('/') === 'x|y/2', 'code span split the cell');
+  });
+  await test('Markdown lists nest by indentation, keep a nested start, and *** is emphasis around strong', () => {
+    const host = el('div');
+    host.appendChild(renderMarkdown('- a\n  - b\n    - c\n      - d\n- e\n\n1. one\n   5. five\n   6. six\n\n***both*** and **bold** and *it*'));
+    document.getElementById('examples').appendChild(host);
+    assert(host.querySelectorAll('ul ul ul ul').length === 1, 'the fourth level was flattened');
+    assert(host.querySelectorAll(':scope > ul > li').length === 2, 'the outer list lost an item');
+    assert(host.querySelector('ol ol').start === 5, 'the nested numbered list lost its start');
+    const last = host.lastElementChild;
+    assert(last.querySelectorAll('em > strong').length === 1 && last.querySelectorAll('strong').length === 2 && last.querySelectorAll('em').length === 2, 'triple stars');
+    assert(last.textContent === 'both and bold and it', `stray stars: ${last.textContent}`);
   });
   document.title = failures ? `${failures} FAILED` : 'All renderer checks passed';
   results.prepend(el('h2', null, document.title));

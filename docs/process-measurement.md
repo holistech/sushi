@@ -31,10 +31,11 @@ echo "$(git rev-parse --short HEAD) $(stat -f %Sm zig-out/bin/sushi)" > <run>.bi
 ## 3. Take the lock for exactly one run
 
 ```sh
-scripts/gpu-lock.sh acquire <owner>
 # one boot+probe, one KLD, one microbench, one pilot or one trace
-scripts/gpu-lock.sh release <owner>
+scripts/gpu-lock.sh run <owner> [--max-min N] -- <cmd...>
 ```
+
+`sushi-ubench` takes and releases the lock itself ([process-ubench](process-ubench.md)).
 
 - Lock = a full model load (server boot, `kld capture|compare`, live test) or a quiet-box bench or timing whose
   absolute number is recorded. Conversions, pilots, builds and tests run in parallel without it when memory fits:
@@ -48,18 +49,32 @@ scripts/gpu-lock.sh release <owner>
   whose text is `<pid> <owner>`) and only the lowest live ticket may take the lock, so a later arrival that polls
   faster cannot jump the queue. A ticket whose waiter process is gone is skipped and pruned. `scripts/gpu-lock.sh
   status` prints the holder (or `free`), then the queue in order.
-- In a script: `trap "scripts/gpu-lock.sh release <owner>" EXIT` right after the acquire.
-- A dead holder (its run is gone but `status` still names it) blocks every waiter: `acquire` exits once it holds the
-  lock, so no live PID is recorded and no script can tell a dead holder from a slow one. A worker that suspects one
-  reports it to the coordinator and keeps waiting. The coordinator checks that the holder's run is gone (its PID, END
-  marker, log), then runs `scripts/gpu-lock.sh break <holder>`, which frees the lock only if it names the current
-  holder, so it cannot break a newer one. The next ticket then takes the lock. Only the coordinator breaks a lock.
+- `run` takes the lock, runs the command, releases on any exit (a signal included) and exits with the command's
+  status. It records the command's PID as the holder. Prefer it to `acquire` + `release`.
+- Plain `acquire <owner> [--max-min N]` records no holder PID (its caller often exits before the job runs), so it is
+  never auto-freed: only `release` or the coordinator's `break` frees it. `--pid P` (the job's PID) opts into
+  auto-free. In a script: `trap "scripts/gpu-lock.sh release <owner>" EXIT` right after the acquire.
+- `--max-min N` (default 15) is the run's declared length: declare it for anything longer. `status` prints the
+  holder, then its PID, age and declared max, with `OVERDUE` once the age passes it, then the queue.
+- A dead holder (its recorded PID, from `run` or `--pid`, is gone) is freed by the next `acquire` or `status`, which logs one stderr line
+  naming the owner; the queue then proceeds. Nothing kills a live holder. An OVERDUE or idle one is the coordinator's
+  to check (PID, END marker, log) and stop, then `scripts/gpu-lock.sh break <holder>`, which frees the lock only if it
+  names the current holder, so it cannot break a newer one. Only the coordinator breaks a lock. A lock with no PID
+  (a plain `acquire`, or the old script's) is never auto-freed; `break` is its only way out.
+- Once the lock is taken, `run` and `acquire` wait until available memory (free + inactive + speculative + purgeable
+  pages) stops rising, at most 60 s (`GPU_LOCK_SETTLE_MAX_S`): a previous holder's memory comes back seconds after it
+  exits, and a boot in that gap failed its preflight at 103 of 108.8 GB. `status` ends with a `QUIET set N min ago`
+  line while the marker exists, so a stale one (it blocks every build) is visible.
 
 ## 4. Restore QoS for agent-launched jobs
 
 Processes spawned from an agent harness inherit background QoS (priority 4 vs 31) and run up to ~3x slower. Launch
 timed jobs with `taskpolicy -a <cmd>` (or restore the running PID), and state the QoS used beside the number. A number
 2-4x worse than a terminal run points at QoS before anything else.
+
+Agent shells also run reniced (nice 5, detached jobs nice 10), and only root can lower that again. A `sushibar` an agent
+left running passed nice 10 to every server it started: the GPU stayed under 1 GHz and a DeepSeek decode ran ~30%
+slow. The owner starts their own `sushibar` and servers.
 
 The same holds for builds and tests: on the M5 Max an agent-launched process with inherited QoS stays on the 12
 Performance cores and never reaches the 6 Super cores (CPUs 12-17); under `taskpolicy -a` it does. Run every CPU-heavy
@@ -71,15 +86,15 @@ agent command (`zig build`, `zig build test`, test scripts, conversions) under `
 ## 4b. Cool the box before a bench
 
 The M5 Max throttles hard: a 1M ladder read 1358 tok/s prefill at 2k right after hours of GPU work, and 1678 after a cooled
-start (fans at max, 4 min idle). Even with fans at max the die reached 97 °C inside one minute of 4k load. So before any
-bench:
-- heavy GPU workload AND a die sensor over 90 °C: fans to max, then 3 min with nothing running, then start;
-- otherwise: fans to max, wait 10 s, start.
+start (fans at max, 4 min idle). Even with fans at max the die reached 97 °C inside one minute of 4k load. So before each
+server and between arms: fans to max, then idle until the hottest die sensor (`fanctl status`) reads under 50 °C, at most
+3 min. Never slot a GPU job into that idle: the next server starts throttled.
 
 Under this protocol one A arm then one B arm is enough. Run A B B A only when the expected difference is within a few
 percent, where a thermal or drift step between two single arms would read as the effect.
 
-Set the fans back to auto when the bench ends. The fan control and temperature readout are the box's own tooling (on this
+Set the fans back to auto when the bench ends, but only when `gpu-lock.sh status` shows the lock free with an empty
+queue: an exit trap that sets auto under another job's lock lets the next boot start at 105 °C. The fan control and temperature readout are the box's own tooling (on this
 box, the fan-control MCP: `max_fans`, `set_fan_auto`, `get_thermal_status`). A bench script waits on a marker file that
 the driver touches once the fans are at max. Nothing else may compute during the idle and the bench (quiet box).
 
@@ -92,6 +107,21 @@ under 50 °C for at most 3 min, `taskpolicy -a`, a private `SUSHI_PREFIX_CACHE_D
 refusal while any `sushi`, `sushi-repack` or `sushi-grid` runs), boots the server by PID, runs `sushi bench` against it
 and stops it. The raw `bench.json` (every request), the server log and `bench.log` stay in the run directory; the report
 `docs/bench/v<ver>/<pack>.md` carries the commit, binary SHA-256 and mtime, flags and hardware.
+While a chain of release benches runs from the main checkout, edit only in a worktree: one uncommitted change there
+refuses every model still queued.
+
+`sushi bench --model <pack> [--rungs 4k,16k] [--tokens 256] [--code-only | --prose-only] [<serve flags>]` is the same
+bench with no server to boot: the pack loads in this process, through the serve path, and each request goes straight
+to the scheduler (`completions.completeIds`, the resolution `/v1/completions` does for a token-id body: default sampling,
+speculative mode, context clamp). It reads prefill, decode, TTFT, the restore time and the speculative mode that
+engaged off the finished slot instead of the HTTP reply and the log, so a request is the one `--url` mode would send.
+Every serve flag applies as it does to `sushi serve --model` (`--ssd-budget-gb`, `--kv-quant`, `--no-mtp`, `--ctx-size`);
+`--host`, `--port` and `--prompt` are refused. The ladder grows in 8192-token windows to the largest rung and decodes
+only at the listed ones; the run ends with a compact arm-by-rung table and any warnings, and `bench.json` lands in
+`--out` (default `~/.sushi/runs/bench-<UTC stamp>/`, with the run's `server.log`). The prefix cache is a private
+`<out>/cache`, removed at the end unless `--out` named the run. It takes none of the box rules (lock, quiet window, fans
+at the boot, AC check): for a number you record, take them as `tests/bench.sh` does, which keeps the `--url` mode.
+`bench.sh` passes `--rungs` and `--tokens` through.
 
 The protocol, fixed for every model and release:
 - **Two corpora, two arms.** The code arm is a seeded synthetic TypeScript codebase (`bench.Corpus`, seed fixed). The prose
@@ -117,16 +147,16 @@ The protocol, fixed for every model and release:
 - **The report** puts code and prose decode side by side per rung (with the prose/code ratio), one window table per
   arm, and a summary row set: the code rows keep the old shape and stay comparable across releases, and the prose rows
   are added beneath them as `<pack> (prose)`.
-- **The GPU clock is read, and a throttled run stops.** `sushi bench` runs `sudo -n powermetrics --samplers gpu_power,thermal`
-  (500 ms) beside the run and keeps, for each request, the median active MHz of the samples with at least 50% GPU
-  residency and the worst thermal pressure level; both are columns beside the tok/s and the header gives the run's
+- **The GPU clock is read, and a throttled run stops.** `sushi bench` reads the GPU clock (IOReport P-state residency
+  weighted by the `pmgr` frequency table) and the thermal pressure notification, with no sudo, every 500 ms beside the run and keeps, for each request, the median active MHz of the samples with at least 50% GPU
+  utilization (the AGX "Device Utilization %") and the worst thermal pressure level; both are columns beside the tok/s and the header gives the run's
   minimum and median. A request whose busy clock is at 1100 MHz or under aborts the bench with an error naming it
   (the top clock is 1620 MHz; a throttled run sat at 1025 to 1120). The pressure level is recorded only: a DeepSeek run
   reached `Heavy` 25 minutes in with the GPU still at 1539 MHz. The partial report is `bench-aborted.md` in the run
-  directory, never `docs/bench`. `bench.sh` logs the pressure level after the cooldown. Without a passwordless `sudo -n powermetrics` both say the clock is not monitored and
-  go on; a decode number from a run that was not monitored needs a `powermetrics` look beside it before it is recorded.
+  directory, never `docs/bench`. `bench.sh` logs the pressure level after the cooldown. Where the clock cannot be read the bench says it is not monitored and goes on;
+  a decode number from a run that was not monitored needs a clock look beside it before it is recorded.
 - **The prose arm starts cool.** Between the arms `sushi bench` sets the fans to max and idles until the hottest
-  `fanctl status` die is under 50 C, at most 180 s (a fixed 180 s without `fanctl`); the wait is logged and named in the report's protocol line.
+  `fanctl status` die is under 50 C, at most 180 s (no idle when `fanctl` gives no reading); the wait is logged and named in the report's protocol line.
 - **A request that did not restore** within 64 tokens of the point it should, one without a restore log line, or a
   short decode is listed under Warnings and makes the run exit non-zero: it is not a measurement. A decode the
   server's loop stop ended (`finish_details.type` = `repetition_loop`) is valid: it counts and is listed under Notes.
@@ -139,6 +169,9 @@ Cross-engine comparison is not this bench: start the other engine, run llmprobe 
 Never wait on `pgrep -f "<string>"`: every agent shell's own `zsh -c "<command>"` contains the string and matches
 forever. Wait on an END marker the job writes after it exits (`echo "END <job> rc=$?" >> <phases file>`), on a PID
 captured at launch (`kill -0 $pid`), or on `pgrep -x <binary>` / `ps -axo pid,comm` filtered on the executable name.
+
+Run scripts run under zsh, which does not word-split an unquoted expansion: `for x in ${ARMS:-a b}` loops once over
+"a b". Write `${=ARMS}`, or loop over an array.
 
 ## 6. Check what actually ran
 
@@ -161,3 +194,10 @@ local path.
   that builds and passes the full suite.
 - A git worktree has neither `.zig-toolchain/` nor the built `lib/mlx/`: symlink both from the main checkout.
 - `lib/mlx-src` and `lib/mlxc-src` are the only submodules; they are needed only to rebuild MLX.
+- Pins: `lib/mlx-src` v0.32.3 and `lib/mlxc-src` 56b2d39 (mlx-serve's). Bumping: check out the tag, `git add` the
+  submodule, rerun `scripts/build-mlx.sh`, re-diff `src/mlx.zig` externs against `lib/mlxc-src/mlx/c/*.h`.
+- After a `lib/jinja_cpp/*.cpp` change: compile the 7 `.cpp` (`clang++ -std=c++17 -O2 -DNDEBUG -I .`) into `obj/`,
+  then `ar rcs libjinja.a obj/*.o`.
+- Image input links `stb_image` and libwebp; the only non-system dylibs are `libmlxc` and `libwebp`
+  (`tests/test_serving_deps.sh`); NAX needs macOS 26.2 (`tests/test_mlx_staged_nax.sh`).
+- `scripts/fetch-zig.sh` replaces a stale `.zig-toolchain` link with its own copy.

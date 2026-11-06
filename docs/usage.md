@@ -12,6 +12,16 @@ brew install beamivalice/tap/sushi
 curl -L https://github.com/beamivalice/sushi/releases/latest/download/sushi-bin-macos-arm64.tar.gz | tar xz
 ```
 
+The release tarball also holds `sushibar`, a menu bar item for the server: run `sushibar [--port N]` and it detaches from
+the terminal. The title is the live generation speed in tok/s while a request generates (the icon alone when idle), beside a menu bar icon
+that is filled while a server answers. Its menu opens on a status
+card (model, memory, generation speed, prompt speed and GPU numbers, a five-minute generation-speed graph) and then starts or stops the server
+on the watched port (asking first for one it did not start; Start loads again the model the server last had, and with none known the card links to the Models page; a Stop that has not taken after 15 s offers Force Stop), switches the port (the default port first, then the ports you added by typing one; hover an added port and click its x to forget it; a server on a port you never added is not listed; the choice is remembered; `--port` wins, then the default port,
+`server.port` in Settings, 12345 unless changed), opens the dashboard, chat, Models and Settings pages (⌘1-⌘4), and ends with a row of
+three buttons: Log (a window that follows the watched server's log live, with Find and a "New lines" button when you scrolled up), Update (Check, which shows Checking… and then
+Up to date, Retry or an orange Update while the menu stays open; with a model loaded it asks before restarting the server; Homebrew installs get an Upgrade button that copies `brew upgrade sushi`; a running sushibar never
+blocks `sushi update` and restarts itself on the new version) and Quit (⌘Q; servers it started keep running, hold ⌥ for Quit & Stop). The card says why a server is stopped, hung, locked or unable to start, an orange dot on the icon marks a server that does not answer, wants a key, lost its port or exited on its own, and a note in the menu opens the log. A server started with `--api-key` or `--api-key-env` is read with its own key. sushibar polls every second while a request runs or the menu is open, and every 5 s (10 s with no server) otherwise.
+
 A browser download is quarantined: clear it with `xattr -dr com.apple.quarantine sushi-macos-arm64`. GPU memory and the
 largest context per Mac: [README, Memory](../README.md#memory).
 
@@ -20,8 +30,16 @@ largest context per Mac: [README, Memory](../README.md#memory).
 `sushi pull <model>` downloads a pack into `~/.sushi/models/beamster/<repo>`, where `sushi serve` and `sushi run` find it
 by name. `<model>` is a short name (`qwen3.8-flash-next[:tag]`, `mimo-v2.6-flash`, `glm-5.3-flash[:tag]`,
 `deepseek-v4.1-flash`) or `beamster/<repo>`; packs from any other org are refused. A rerun downloads only what is missing
-or short, so it finishes an interrupted pull; until then the folder holds `.pull-incomplete`. A private repo pulls after
+or changed, so it finishes an interrupted pull; until then the folder holds `.pull-incomplete`. A private repo pulls after
 `hf auth login` or with `HF_TOKEN`.
+
+A file is kept by content, never by size: a finished pull leaves `.sushi-pull.json` (repo, Hugging Face commit, and each
+file's size and checksum: sha256 for a large file, the git blob id for a small one) and the next pull skips a file only
+when the repo lists the same checksum. A folder without the manifest (an older sushi, a copy by hand) is hashed once
+(`checking N files already on disk…`) and only the files that differ download. Each download is checked against its
+checksum before it is put in place; a mismatch deletes the partial and fails naming the file. A `.partial` resumes only under its `.partial.oid` key (the checksum and size it was started for); a partial with another key, or none, is deleted and the file starts from zero. A file the last manifest
+listed that the repo no longer has is removed; nothing else in the folder is touched. `sushi run` still uses a present
+local copy without contacting Hugging Face.
 
 `sushi list` shows each pack's size, whether it is downloaded and whether this Mac meets its tier, and marks the one it
 recommends. A Mac's tier is its installed RAM in whole GB. Below a pack's tier it reads `may stream (--ssd-budget-gb)`:
@@ -39,6 +57,30 @@ it may still run streamed ([README, Streaming](../README.md#streaming)), with no
 
 Sizes are the whole download; a Qwen pack's n-gram table and DeepSeek's 189 GiB of Engram tables stay on the SSD and are
 never loaded. Offline, `sushi list` shows only the models on disk.
+
+A pack carries a revision in `config.json` (`pack_revision.id`; a pack without it is revision 1.0). When Hugging Face
+publishes a higher revision of a pack you have downloaded, `sushi list` prints, under its row,
+`update available: 2.0 (you have 1.0) — sushi pull deepseek-v4.1-flash`. Nothing is printed when the pack is current,
+when its repo is not known (a folder that is neither a catalog pack nor pulled by `sushi pull`) or when Hugging Face
+cannot be reached or answers 404 (a private repo needs `HF_TOKEN`). The server asks the same once after a model loads and
+then once a day (each answer is kept in `~/.sushi/pack-update-check.json`, so a restart inside a day asks nothing),
+unless `--no-update-check` or the Settings page's pack check is off.
+
+### Downloading from the web page
+
+The web page's **Models** tab (Cmd+3) does the same in the browser: its **Available** list (`/downloads`) shows every
+Sushi pack published on Hugging Face (the ones this build knows, and any newer public `-Sushi-` repo of `beamster`) with
+its size, marks the pack `sushi list` recommends for this Mac's memory, says "Needs N GB" for one above it (still
+downloadable, after a confirm), and shows which are downloaded, partly downloaded or have an update. Download saves into
+the models folder of the Settings tab (`--model-dir` when given, else `server.models_dir`, else `~/.sushi/models`) under
+`beamster/<repo>`, after checking the free space: a pack that would leave less than a twentieth of the disk (at least 4
+GiB) is refused, one that leaves under a tenth free warns. Update replaces a downloaded pack in its own folder, after
+you unload it. A running download shows a progress bar, the file in flight, speed and time left. Stop keeps what is
+downloaded: Resume continues from it, also after the server restarts. A finished pack appears in the Installed list at
+once (Open takes you there), ready to load. A small dot on the Models tab marks a pack (or an update) this browser has
+not listed before; under `--no-update-check` the page asks Hugging Face only while the list is open. From another
+machine a download needs the server's `--api-key`. Downloads use `sushi pull`'s checks; a pack is never deleted from the
+page.
 
 ## Recommended launch
 
@@ -81,7 +123,8 @@ sushi serve --model ~/.sushi/models/beamster/Qwen3.8-Flash-Next-Sushi-4bpw \
 between `--drafter-min-depth` (2) and `--drafter-max-depth` (8) rows, and greedy output equals MTP's byte for byte.
 Speed per pack and context: [qwen4-perf](qwen4-perf.md#dflash2).
 
-**128 GB Mac, MiMo-V2.6-Flash-Sushi-2.3bpw** (limit 120000)
+**128 GB Mac, MiMo-V2.6-Flash-Sushi-2.3bpw** (limit 120000). Unsupported: it still loads, but from 1.5.1 releases do
+not test, benchmark or tune it; 1.5.0 is the last release that supports it.
 
 ```bash
 sushi pull mimo-v2.6-flash
@@ -108,12 +151,20 @@ derivatives); the smaller copy sushi builds from it in `dflash2/` on first load 
 
 ```bash
 sushi pull deepseek-v4.1-flash
-sushi serve --model ~/.sushi/models/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw \
-  --ssd-budget-gb 108 --ctx-size 1000000 --max-tokens 128000
-# 128 GB Mac: 108 (or 96 to leave memory to other apps); 96 GB Mac: 80
+sushi serve --model ~/.sushi/models/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw
+# pass --ssd-budget-gb to change the budget: 96 on a 128 GB Mac leaves memory to other apps
 ```
 
-- **`--ssd-budget-gb` is required.** It is everything the load keeps resident (trunk, DSpark, vision tower, workspace)
+On a 128 GB Mac the 108 default needs the GPU wired limit raised (`iogpu.wired_limit_mb=125000`, the limit the
+heading names); without it the default is 96, and it steps down further, saying so, when the Mac's limits cannot hold it.
+
+DeepSeek serves a 1,000,000-token context and a 256,000-token budget for a request that omits `max_tokens`, as its
+authors recommend; `--ctx-size` and `--max-tokens` still override them.
+
+- **`--ssd-budget-gb` defaults to 80 on 96 GB Macs; 128 GB Macs default to 96, or 108 with `iogpu.wired_limit_mb` at 120000 or more (the recommended 125000); pass `--ssd-budget-gb` to change it.** 192 and
+  256 GB Macs load the pack fully resident by default. Any other RAM size must pass it. The default steps down to the
+  largest budget the Mac's limits hold beside a 1M request and an image encode, and the load log says which limit bound
+  it; a flag outranks `ssd_budget_gb` in `model-settings.json`, which outranks the default. The budget is everything the load keeps resident (trunk, DSpark, vision tower, workspace)
   plus the expert cache, which gets the rest; more budget means more expert slots and fewer SSD reads. Budget, the
   request's state (3.7 GB billed at 1M) and an image encode (1.6 GB) must fit under the GPU limit.
 
@@ -140,8 +191,19 @@ sushi serve --model ~/.sushi/models/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-
   widths and identical between stream and non-stream.
 - **Thinking** is `high` by default; `reasoning_effort` `low`, `high` or `max`, or `off` / `enable_thinking: false`.
 - **Images** are on by default; `--no-vision` frees the 0.50 GB tower for the expert cache; `--vision-bf16` keeps the stored bf16 tower.
+- **Pair-major layout:** `sushi repack <pack>` rewrites a pack-order pack in place into the layout the streaming engine
+  reads fastest ([pack-format](pack-format.md#repack)). Stop any server using the pack first; it needs free disk of one
+  shard plus 1 GiB, and repeating it after an interruption finishes the job.
+  `--pack-revision <id>` also stamps the pack with a revision, `--shards <name-or-glob>` narrows the stamping to some
+  shards, `--unstamped <shard>` leaves one (a symlink) out and `--check` only verifies
+  ([pack-format](pack-format.md#pack-revision-writer)).
 - **`--drop-expert n`** (multiple of 8) skips the `n` least-used experts a layer, freeing 2.1–2.5 GB at 8 and 4.3–5.0 GB
   at 16. It is lossy: check it with `sushi kld compare` ([dsv41-arch](dsv41-arch.md#drop-expert)).
+- **`--ssd-prefetch <n>` (0..100, default 0 = off) turns on the expert prefetch of a streamed DeepSeek load and caps its SSD reads.**
+  At load sushi measures how fast this Mac's SSD reads experts, and the reads a route waits for plus the ones the prefetch makes
+  ahead of it together stay under `n` percent of that rate; the prefetch uses only what the waiting reads leave. 65 is the tuned
+  cap; it pays on a fast SSD at a mid budget and nothing elsewhere. `ssd_prefetch` in `model-settings.json` sets it per model,
+  and a flag outranks it. Other models refuse the flag.
 - **Refused flags:** `--kv-quant`, `--qwen-gdn`, `--mtp-head-kv-quant`, `--mtp-typical`, `--mtp-tokenv3` and
   `--mtp-greedy-tail` stop the load, since the model has none of those parts ([dsv41-parity](dsv41-parity.md)).
 
@@ -152,17 +214,20 @@ sushi serve --model ~/.sushi/models/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-
 - A restore point sits every 8192 tokens and at each prompt's end, so a 1M-token conversation takes about 0.9 GB of
   SSD (DeepSeek), 7-14 GB of points plus 16 GB of rows (Qwen) or 24 GB (GLM): raise `--prefix-cache-disk` for long
   contexts. A conversation past the budget drops its oldest points first.
+- `--no-metrics` turns off `/metrics`, `/metrics.json` and the dashboard's charts (on by default; `--metrics` is still accepted and does nothing).
+  The page at `/` has Chat, Dashboard, Models and Settings views: the SSD prefix cache's size, per-model disk use and
+  clear buttons, the models folder and each model's `model-settings.json` keys are edited in Settings and Models.
 - `--preserve-thinking off` keeps only the latest turn's thinking in the prompt.
 - `--prefill-chunk 2048` caps the prompt step per forward; a request that does not fit steps down.
 
 ## Coding agents
 
-With the server running, `sushi launch <agent>` starts claude, pi, omp, opencode, codex, grok, hermes or aider against it:
+With the server running, `sushi launch <agent>` starts claude, pi, omp, opencode, dsh (DeepSeek Harness), codex, grok, hermes or aider against it:
 
 ```bash
 sushi launch omp
 ```
 
-pi, omp, codex, grok and hermes run from their own home under `~/.sushi/<agent>/`, so your usual config is untouched;
+pi, omp, codex, grok and hermes run from their own home under `~/.sushi/<agent>/`, so your usual config is untouched; dsh keeps your `~/.dsh` profile as it is and gets sushi's provider as an extra `--patch` layer (`~/.sushi/dsh/patch.yml`);
 claude, opencode and aider reach the server through environment variables. `--print` writes the config and prints the
 launch script instead of running it.

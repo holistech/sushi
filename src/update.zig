@@ -187,7 +187,7 @@ pub fn installRefusal(io: std.Io, dir: []const u8, buf: []u8) ?[]const u8 {
 }
 
 /// The release tarball's entries; `.DS_Store` is Finder's.
-const release_entries = [_][]const u8{ "sushi", "lib", "LICENSE", "LICENSE-APACHE-2.0", "NOTICE", "guest.json", ".DS_Store" };
+const release_entries = [_][]const u8{ "sushi", "sushibar", "lib", "LICENSE", "LICENSE-APACHE-2.0", "NOTICE", "guest.json", ".DS_Store" };
 
 /// An entry of `dir` that neither the release layout nor `incoming` has: the swap would carry it away, so a folder
 /// holding anything else (a shared bin/) is never swapped.
@@ -306,11 +306,19 @@ pub fn readCache(arena: Allocator, io: std.Io, path: []const u8) Cache {
     return std.json.parseFromSliceLeaky(Cache, arena, text, .{ .ignore_unknown_fields = true }) catch .{};
 }
 
-/// Written beside and renamed over, so a reader never sees half a file.
 pub fn writeCache(arena: Allocator, io: std.Io, path: []const u8, c: Cache) !void {
+    return writeJsonAtomic(arena, io, path, c);
+}
+
+var tmp_seq = std.atomic.Value(u32).init(0);
+
+/// Written beside under a name no other writer (thread or process) uses, then renamed over, so a reader never sees
+/// half a file and the last rename wins whole.
+pub fn writeJsonAtomic(arena: Allocator, io: std.Io, path: []const u8, value: anytype) !void {
     if (std.fs.path.dirname(path)) |d| try std.Io.Dir.cwd().createDirPath(io, d);
-    const text = try std.json.Stringify.valueAlloc(arena, c, .{});
-    const tmp = try std.fmt.allocPrint(arena, "{s}.tmp", .{path});
+    const text = try std.json.Stringify.valueAlloc(arena, value, .{});
+    const tmp = try std.fmt.allocPrint(arena, "{s}.{d}-{d}.tmp", .{ path, std.c.getpid(), tmp_seq.fetchAdd(1, .monotonic) });
+    errdefer std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = text });
     try std.Io.Dir.renameAbsolute(tmp, path, io);
 }
@@ -373,21 +381,40 @@ pub fn availableVersion(buf: []u8) ?[]const u8 {
 
 pub const CheckChoice = struct { on: bool, source: []const u8 };
 
-pub fn checkChoice(flag_off: bool, source_build: bool) CheckChoice {
+/// `--no-update-check` > a source build (never checks) > the settings file's `update_check` > on.
+pub fn checkChoice(flag_off: bool, source_build: bool, file: ?bool) CheckChoice {
     if (flag_off) return .{ .on = false, .source = "--no-update-check" };
     if (source_build) return .{ .on = false, .source = "source build" };
+    if (file) |f| return .{ .on = f, .source = "model-settings.json" };
     return .{ .on = true, .source = "default" };
 }
 
-/// Logs the resolved choice once and, when on, checks on a detached thread: never the inference thread, never
-/// in the way of the boot, silent on failure.
-pub fn startDailyCheck(io: std.Io, flag_off: bool) void {
+/// The settings page flips this; the check loop reads it before each look.
+var auto_on = std.atomic.Value(bool).init(true);
+
+pub fn setAutoCheck(on: bool) void {
+    auto_on.store(on, .release);
+}
+
+pub fn autoCheckOn() bool {
+    return auto_on.load(.acquire);
+}
+
+/// Whether a loop wakes into a look; a `next_at` more than a day ahead is a clock set back.
+fn looksNow(on: bool, now: i64, next_at: i64) bool {
+    return on and (now >= next_at or next_at - now > day_s);
+}
+
+/// Logs the resolved choice once and checks on a detached thread: never the inference thread, never in the way of
+/// the boot, silent on failure. `file_on` is the settings file's `update_check`; the thread idles while it is off.
+pub fn startDailyCheck(io: std.Io, flag_off: bool, file_on: ?bool) void {
     var ebuf: [std.fs.max_path_bytes]u8 = undefined;
     const exe_dir = selfDir(io, &ebuf) orelse "";
     homebrew.store(isHomebrewKeg(exe_dir), .release);
-    const choice = checkChoice(flag_off, isSourceBuild(io, exe_dir));
+    const choice = checkChoice(flag_off, isSourceBuild(io, exe_dir), file_on);
     if (choice.on or !std.mem.eql(u8, choice.source, "source build")) log.info("[update] daily check {s} ({s})\n", .{ if (choice.on) "on" else "off", choice.source });
-    if (!choice.on) return;
+    setAutoCheck(choice.on);
+    if (flag_off or std.mem.eql(u8, choice.source, "source build")) return;
     const t = std.Thread.spawn(.{}, checkLoop, .{io}) catch |err| {
         log.debug("[update] check thread: {t}\n", .{err});
         return;
@@ -395,10 +422,13 @@ pub fn startDailyCheck(io: std.Io, flag_off: bool) void {
     t.detach();
 }
 
+/// Wakes every minute so a toggle from the settings page takes hold within it.
 fn checkLoop(io: std.Io) void {
+    var next_at: i64 = 0;
     while (true) {
-        const wait = checkOnce(io);
-        const ts = std.c.timespec{ .sec = @intCast(@max(wait, 60)), .nsec = 0 };
+        const now = std.Io.Timestamp.now(io, .real).toSeconds();
+        if (looksNow(autoCheckOn(), now, next_at)) next_at = now + @max(checkOnce(io), 60);
+        const ts = std.c.timespec{ .sec = 60, .nsec = 0 };
         _ = std.c.nanosleep(&ts, null);
     }
 }
@@ -429,7 +459,7 @@ fn checkOnce(io: std.Io) i64 {
 
 /// A fresh check for `sushi update --check` and the REPL's `/update`, recorded in the cache like the daily one.
 pub fn checkNow(arena: Allocator, io: std.Io, pre: bool) !?Release {
-    const f = try fetchReleases(arena, io, "");
+    const f = fetchReleases(arena, io, "") catch |err| return fail("could not reach the release server ({s})", .{@errorName(err)});
     if (f.status != 200) return fail("GitHub answered HTTP {d} for the release list", .{f.status});
     const r = try pickRelease(arena, f.body, pre);
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
@@ -623,6 +653,13 @@ fn execInPlace(arena: Allocator, argv: []const []const u8) void {
     _ = spawn(arena, argv, true, null) catch {};
 }
 
+/// Whether a process running `exe` stops the swap of `dir`: anything from the install but `sushibar`, which
+/// restarts itself on the new version and never holds `sushi` open.
+fn blocksUpdate(dir: []const u8, exe: []const u8) bool {
+    if (exe.len <= dir.len or !std.mem.startsWith(u8, exe, dir) or exe[dir.len] != '/') return false;
+    return !eql(u8, std.fs.path.basename(exe), "sushibar");
+}
+
 /// Another process running a binary from `dir`, or null.
 fn otherProcessIn(dir: []const u8) ?c_int {
     var pids: [8192]c_int = undefined;
@@ -634,8 +671,7 @@ fn otherProcessIn(dir: []const u8) ?c_int {
         if (pid == self or pid <= 0) continue;
         const len = proc_pidpath(pid, &buf, buf.len);
         if (len <= 0) continue;
-        const p = buf[0..@intCast(len)];
-        if (p.len > dir.len and std.mem.startsWith(u8, p, dir) and p[dir.len] == '/') return pid;
+        if (blocksUpdate(dir, buf[0..@intCast(len)])) return pid;
     }
     return null;
 }
@@ -719,7 +755,7 @@ pub fn cmdUpdate(allocator: Allocator, io: std.Io, args: []const []const u8) !vo
             opts.relaunch = args[i + 2 ..];
             break;
         } else if (eql(u8, a, "--help") or eql(u8, a, "-h")) {
-            var out = std.Io.File.stdout().writer(io, &.{});
+            var out = std.Io.File.stdout().writerStreaming(io, &.{});
             out.interface.writeAll(usage) catch {};
             return;
         } else {
@@ -949,6 +985,14 @@ fn relaunch(arena: Allocator, io: std.Io, argv: []const []const u8, result: anye
 // ── Tests ───────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "update: a process from the install blocks the swap, except the menu bar app" {
+    try testing.expect(blocksUpdate("/opt/s/sushi-macos-arm64", "/opt/s/sushi-macos-arm64/sushi"));
+    try testing.expect(blocksUpdate("/opt/s/sushi-macos-arm64", "/opt/s/sushi-macos-arm64/sushi-ubench"));
+    try testing.expect(!blocksUpdate("/opt/s/sushi-macos-arm64", "/opt/s/sushi-macos-arm64/sushibar"));
+    try testing.expect(!blocksUpdate("/opt/s/sushi-macos-arm64", "/opt/s/other/sushi"));
+    try testing.expect(!blocksUpdate("/opt/s/sushi-macos-arm64", "/opt/s/sushi-macos-arm64"));
+}
 
 test "update: the relaunch log line never carries the api key" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -1219,12 +1263,35 @@ test "update: /props carries null fields until a check answers, then the newer r
 }
 
 test "update: the daily check's resolved state names its source" {
-    try testing.expectEqualStrings("--no-update-check", checkChoice(true, true).source);
-    try testing.expectEqualStrings("source build", checkChoice(false, true).source);
-    const on = checkChoice(false, false);
+    try testing.expectEqualStrings("--no-update-check", checkChoice(true, true, null).source);
+    try testing.expectEqualStrings("source build", checkChoice(false, true, null).source);
+    const on = checkChoice(false, false, null);
     try testing.expect(on.on);
     try testing.expectEqualStrings("default", on.source);
-    try testing.expect(!checkChoice(true, false).on);
+    try testing.expect(!checkChoice(true, false, null).on);
+}
+
+test "update: the settings file turns the check off or on, and the flag and a source build outrank it" {
+    const off = checkChoice(false, false, false);
+    try testing.expect(!off.on);
+    try testing.expectEqualStrings("model-settings.json", off.source);
+    try testing.expect(checkChoice(false, false, true).on);
+    try testing.expect(!checkChoice(true, false, true).on);
+    try testing.expectEqualStrings("--no-update-check", checkChoice(true, false, true).source);
+    try testing.expectEqualStrings("source build", checkChoice(false, true, true).source);
+}
+
+test "update: the published toggle gates every automatic look and nothing else" {
+    defer setAutoCheck(true);
+    try testing.expect(autoCheckOn());
+    try testing.expect(looksNow(autoCheckOn(), 100, 100));
+    try testing.expect(!looksNow(autoCheckOn(), 99, 100));
+    setAutoCheck(false);
+    try testing.expect(!looksNow(autoCheckOn(), 1_000_000, 0));
+    setAutoCheck(true);
+    try testing.expect(looksNow(autoCheckOn(), 1_000_000, 0));
+    // A clock set back must not strand the next look a day or more away.
+    try testing.expect(looksNow(true, 100, 100 + 2 * day_s));
 }
 
 test "update: /v1/update is refused on a public bind, a remote peer, a bad key or Origin, a host, a busy server" {
@@ -1313,4 +1380,55 @@ test "update: tools run through posix_spawn with their output captured" {
     defer std.posix.sigaction(std.posix.SIG.HUP, &prev, null);
     try testing.expectEqual(@as(u8, 0), try runTool(arena, &.{ "/bin/sh", "-c", "kill -HUP $$; echo survived" }, .{ .path = out }));
     try expectMarker(tmp.dir, "out.txt", "survived\n");
+}
+
+test "update: concurrent writers of one JSON file never expose half a file nor fail each other" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpPath(&tmp, ".");
+    defer testing.allocator.free(root);
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/cache.json", .{root});
+    defer testing.allocator.free(path);
+    const Doc = struct { text: []const u8 };
+    const Run = struct {
+        path: []const u8,
+        done: std.atomic.Value(u32) = .init(0),
+        failed: std.atomic.Value(u32) = .init(0),
+        torn: std.atomic.Value(u32) = .init(0),
+
+        fn write(self: *@This(), fill: u8) void {
+            defer _ = self.done.fetchAdd(1, .release);
+            var big: [64 * 1024]u8 = undefined;
+            @memset(&big, fill);
+            for (0..150) |_| {
+                var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+                defer arena.deinit();
+                writeJsonAtomic(arena.allocator(), testing.io, self.path, Doc{ .text = &big }) catch {
+                    _ = self.failed.fetchAdd(1, .monotonic);
+                };
+            }
+        }
+
+        fn read(self: *@This()) void {
+            while (self.done.load(.acquire) < 2) {
+                var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+                defer arena.deinit();
+                const text = std.Io.Dir.cwd().readFileAlloc(testing.io, self.path, arena.allocator(), .limited(1 << 20)) catch continue;
+                const doc = std.json.parseFromSliceLeaky(Doc, arena.allocator(), text, .{}) catch {
+                    _ = self.torn.fetchAdd(1, .monotonic);
+                    continue;
+                };
+                if (doc.text.len != 64 * 1024) _ = self.torn.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    var run: Run = .{ .path = path };
+    const threads = [_]std.Thread{
+        try std.Thread.spawn(.{}, Run.write, .{ &run, 'a' }),
+        try std.Thread.spawn(.{}, Run.write, .{ &run, 'b' }),
+        try std.Thread.spawn(.{}, Run.read, .{&run}),
+    };
+    for (threads) |t| t.join();
+    try testing.expectEqual(@as(u32, 0), run.failed.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), run.torn.load(.monotonic));
 }

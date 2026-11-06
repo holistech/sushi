@@ -2,26 +2,30 @@
 
 # SUSHI
 
-A local AI server for low-bit, very high quality Sushi quants, using custom EXL3-Affine hybrid converter. It is a detached fork of [ddalcu's mlx-serve](https://github.com/ddalcu/mlx-serve). Sushi runs stand-alone and also as a guest engine inside mlx-serve, Apple Silicon M1+ and macOS 26.2 or later are required.
+A local AI server for low-bit, very high quality Sushi quants, using custom Sushi Trellis Quant (STQ) or EXL3-Affine hybrid converter. It is a detached fork of [ddalcu's mlx-serve](https://github.com/ddalcu/mlx-serve). Sushi runs stand-alone and also as a guest engine inside mlx-serve, Apple Silicon M1+ and macOS 26.2 or later are required.
 
 ## Model support list
 
 Usage see [recommended launch commands and coding agent usage](docs/usage.md).
 
-* [DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw](https://huggingface.co/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw) (requires 96 GB+ and sushi 1.4.0 or later, experts [streamed](#streaming), text and image input)
+* [DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw](https://huggingface.co/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw) (pack revision 2.0, requires 96 GB+ and sushi 1.5.0 or later, experts [streamed](#streaming), text and image input)
 * [Qwen3.8-Flash-Next-Sushi-2bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-2bpw) (requires 48 GB+, or 32 GB [streamed](#streaming))
-* [Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw) (requires 64 GB+ and sushi 1.3.0 or later)
+* [Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw) (pack revision 2.0, requires 64 GB+ and sushi 1.5.1 or later)
 * [Qwen3.8-Flash-Next-Sushi-4bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-4bpw) (requires 96 GB+)
-* [MiMo-V2.6-Flash-Sushi-2.3bpw](https://huggingface.co/beamster/MiMo-V2.6-Flash-Sushi-2.3bpw) (requires 128 GB, text and image input)
 * [GLM-5.3-Flash-Sushi-2bpw](https://huggingface.co/beamster/GLM-5.3-Flash-Sushi-2bpw) (requires 96 GB+, text, image and video input)
 * [GLM-5.3-Flash-Sushi-2.4bpw](https://huggingface.co/beamster/GLM-5.3-Flash-Sushi-2.4bpw) (requires 128 GB, text, image and video input)
 
+**Unsupported:** [MiMo-V2.6-Flash-Sushi-2.3bpw](https://huggingface.co/beamster/MiMo-V2.6-Flash-Sushi-2.3bpw) still
+loads, but from 1.5.1 releases do not test, benchmark or tune it. 1.5.0 is the last release that supports it.
+
 ## Quality
 
-<p align="center"><img src="docs/assets/dsv41-1.75bpw-kld.png" alt="DeepSeek-V4.1-Flash KLD by category" width="100%"></p>
+<p align="center"><img src="docs/assets/dsv41-1.75bpw-kld-v1-to-v2.svg" alt="DeepSeek-V4.1-Flash KLD by category, pack revision 1.0 to 2.0, against oQ2.5e" width="100%"></p>
 
 <p align="center"><img src="docs/assets/kld-chart.png" alt="KLD vs size" width="100%"></p>
 
+* DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw, pack revision 2.0, scores KLD 0.1576 (top-1 agreement 89.13%) on the
+  eight-category reading, down from 0.1843 in revision 1.0 and below oQ2.5e's 0.1717 at 2.96 bits per weight
 * MiMo-V2.6-Flash-Sushi-2.3bpw scores KLD 0.0860 (top-1 agreement 91.95%)
 * GLM-5.3-Flash-Sushi-2.4bpw scores KLD 0.0742 (top-1 agreement 90.33%)
 * GLM-5.3-Flash-Sushi-2bpw scores KLD 0.1037 (top-1 agreement 88.18%)
@@ -34,7 +38,9 @@ brew install beamivalice/tap/sushi
 
 Update with `brew upgrade sushi`.
 
-* The server listens on `127.0.0.1:12345`.
+`sushibar` puts the server in the menu bar: the generation speed in tok/s as its title, and a menu with a live status card, Start/Stop and Load/Unload buttons (Start brings the server up empty; Load brings back the last model), a port switcher, its pages, and Log, Update and Quit buttons (Log follows the server log live; hold ⌥ for Quit & Stop).
+
+* The server listens on `127.0.0.1:12345` (Settings has a Default port).
 * Support speculative decoding: MTP for Qwen and MiMo, DFlash2 for GLM.
 * 8-bit KV cache are on by default.
 
@@ -47,7 +53,7 @@ The Qwen rows are at the default f32 GatedDeltaNet state; `--qwen-gdn 16` (bf16)
 | pack | weights only | 128k | 256k | 512k | 1M |
 |---|---:|---:|---:|---:|---:|
 | Qwen3.8-Flash-Next-Sushi-2bpw | 35.2 | 40.3 | 43.2 | 48.2 | 58.4 |
-| Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw | 46.4 | 51.4 | 54.3 | 59.4 | 69.5 |
+| Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw | 44.9 | 50.0 | 52.8 | 57.9 | 68.1 |
 | Qwen3.8-Flash-Next-Sushi-4bpw | 63.9 | 69.0 | 71.9 | 76.9 | 87.1 |
 | GLM-5.3-Flash-Sushi-2bpw | 78.3 | 82.6 | 83.8 | 86.0 | 90.5 |
 | GLM-5.3-Flash-Sushi-2.4bpw | 89.8 | 94.1 | 95.2 | 97.5 | 102.0 |
@@ -61,7 +67,7 @@ the largest multiple of 8192 tokens that fits, at 8-bit / 4-bit KV, with 256 MiB
 | pack | 48 GB † (43,000 MB) | 64 GB † (59,000 MB) | 96 GB (90,000 MB) | 128 GB (120,000 MB) |
 |---|---|---|---|---|
 | Qwen3.8-Flash-Next-Sushi-2bpw | 200k / 304k | 976k / 1M | 1M / 1M | 1M / 1M |
-| Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw | — | 416k / 664k | 1M / 1M | 1M / 1M |
+| Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw | — | 488k / 824k | 1M / 1M | 1M / 1M |
 | Qwen3.8-Flash-Next-Sushi-4bpw | — | — | 1M / 1M | 1M / 1M |
 | GLM-5.3-Flash-Sushi-2bpw | — | — | 696k / — | 1M / — |
 | GLM-5.3-Flash-Sushi-2.4bpw | — | — | — | 1M / — |
@@ -69,9 +75,9 @@ the largest multiple of 8192 tokens that fits, at 8-bit / 4-bit KV, with 256 MiB
 | DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw ‡ | — | — | 1M / — | 1M / — |
 
 † At `--qwen-gdn 16` (bf16 GatedDeltaNet state), which the 32, 48 and 64 GB launch lines use. The f32 default gives
-less: 192k / 288k at 48 GB, and 968k / 1M (Sushi-2bpw) and 408k / 648k (Sushi-STQ-2.75bpw) at 64 GB.
+less: 192k / 288k at 48 GB, and 968k / 1M (Sushi-2bpw) and 480k / 800k (Sushi-STQ-2.75bpw) at 64 GB.
 
-‡ DeepSeek-V4.1-Flash streams its routed experts from the SSD on every under 128GB Mac. It runs 1M at `--ssd-budget-gb 108` on a 128 GB Mac with `iogpu.wired_limit_mb=125000` and at `80` on a 96 GB Mac with `iogpu.wired_limit_mb=93000` ([usage](docs/usage.md#deepseek-launch)). A budget above 108 (for example 111) also needs `sudo sysctl vm.global_user_wire_limit=125000000000 vm.user_wire_limit=125000000000`: without it, prefill slows down with no error.
+‡ DeepSeek-V4.1-Flash streams its routed experts from the SSD on every under 128GB Mac. It runs 1M at `--ssd-budget-gb 108` on a 128 GB Mac with `iogpu.wired_limit_mb=125000` and at `80` on a 96 GB Mac with `iogpu.wired_limit_mb=93000` ([usage](docs/usage.md#deepseek-launch)). A budget above 96 needs `sudo sysctl vm.global_user_wire_limit=125000000000 vm.user_wire_limit=125000000000`: without it, your system will slow down and become unresponsive.
 
 ## Streaming
 
@@ -85,6 +91,16 @@ N plus the context must fit under the GPU limit.
 | 32 GB | Qwen3.8-Flash-Next-Sushi-2bpw | 18 | 27,000 | 66k | ~20 tok/s |
 | 96 GB | DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | 80 | 93,000 | 1M | 45 code / 45 prose |
 | 128 GB | DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | 108 (or 96) | 125,000 | 1M | 77 code / 49 prose |
+
+## Serve on your network
+
+```bash
+export SUSHI_KEY=<pick a secret>
+sushi serve --model <pack> --host 0.0.0.0 --api-key-env SUSHI_KEY
+```
+
+Other computers then reach `http://<your-mac-ip>:12345/v1` (`ipconfig getifaddr en0` prints the IP) and send the key
+as `Authorization: Bearer <key>`. If `SUSHI_KEY` is unset or empty, the server runs with no key.
 
 ## Benchmarks
 
@@ -105,8 +121,8 @@ N plus the context must fit under the GPU limit.
 
 | Pack                 | Thinking | Score  | Points  | Rating | Max weights in RAM |
 | -------------------- | -------- | ------ | ------- | ------ | ------------------ |
+| Qwen STQ 2.75bpw     | medium   | **94** | 182/194 | 5★     | 48 GB              |
 | DeepSeek STQ 1.75bpw | high     | **92** | 178/194 | 5★     | 129 GB (108 stream)|
-| Qwen STQ 2.75bpw     | medium   | **91** | 176/194 | 5★     | 50 GB              |
 | Qwen 4bpw            | medium   | **90** | 174/194 | 5★     | 68 GB              |
 | GLM 2.4bpw           | high     | **90** | 175/194 | 5★     | 98 GB              |
 | MiMo 2.3bpw          | on       | **89** | 172/194 | 4★     | 103 GB             |

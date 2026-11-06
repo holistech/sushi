@@ -201,7 +201,7 @@ max with 10 s idle from 64 °C and restored to auto after. CONTENDED box: a syst
 throughout, other workers' builds and tests beside the first meter and live boots.
 
 Decode meter, the chain and the step alternated off / on / on / off per width in one process
-(`SUSHI_DECODE_FWD_UBENCH=40 _S=1,3,5,7,9 _GDN_ARMS=1`, `--prefix-cache-entries 0`), three boots per length, ms per
+(`SUSHI_DECODE_FWD_UBENCH=40 _S=1,3,5,7,9`, `--prefix-cache-entries 0`), three boots per length, ms per
 forward, mean over boots:
 
 | rows | 4096 keys | 32768 keys |
@@ -234,7 +234,7 @@ M5 Max 128 GB, 2026-09-27, Sushi-3bpw, kv8, `--mtp`, `SUSHI_ROUND_COST_PERSIST=0
 followed a KLD run at 90.6 °C) and restored to auto after; load 1.9-3.5 with other workers' builds beside.
 
 Decode meter on B, the composed chain and the kernel alternated A B B A per width in one process
-(`SUSHI_DECODE_FWD_UBENCH=48 _S=1,3,5,1,3,5 _QSA_POOL_ARMS=1`, ctx 131072), one boot per length, two rounds per
+(`SUSHI_DECODE_FWD_UBENCH=48 _S=1,3,5,1,3,5`, ctx 131072), one boot per length, two rounds per
 width; the context grows ~7.3k keys over a boot. ms per forward:
 
 | keys prefilled | rows | chain | kernel | delta | per round | graph ops |
@@ -305,7 +305,7 @@ load check refuses with apps open), `taskpolicy -a`, the lock held per run, NOT 
 - Metal System Trace over a 2.5k prefill on f42cd8e (`--instrument 'Metal GPU Counters'`): the scalar sorted EXL3
   GEMM took 90.7% of sampled GPU time (gate/up 59.5%, down 31.2%), MLX's bf16 GEMM 5.1%, everything else 4%.
 - The simdgroup-matrix body against the scalar body, one process (f22a383 + the body), A B B A, paired per-block ratio,
-  window table built outside the timed calls (`SUSHI_EXL3_LAYER_UBENCH=1`, MCG w15, 512 experts, top-10):
+  window table built outside the timed calls (a since-removed `SUSHI_EXL3_LAYER_UBENCH=1` meter, MCG w15, 512 experts, top-10):
 
 | prompt chunk | n48 2560->640 | n48 640->2560 | n64 2560->640 | n64 640->2560 |
 |---|---|---|---|---|
@@ -432,6 +432,12 @@ per arm, NOT a quiet box (no §4b fan protocol available). `SUSHI_FORCE_GPU_FAMI
   `WARM=0` skips the pread, it does not evict. A genuinely cold 3bpw end-to-end cell is still unmeasured, and this box
   cannot produce one (49 GB of weights + 30 GB of table fits inside 128 GB, so nothing is evicted) — a 64 GB box
   would.
+- **A pool chosen on a cold table yields to the serial walk once the warm has read the whole table** (`poolPreferred`).
+  The calibration runs before the warm, so a boot whose table was out of page cache used to keep the pool for the
+  server's life. Here that cost 277 ms of PLE per 4096-row chunk against 47 ms serial, about 12% of the chunk.
+  Measured with `QWEN4_PROFILE_FWD=all` on 3eff69ed, `sushi bench --code-only --rungs 131072`, `taskpolicy -a`, GPU
+  lock, fans max. The STQ 2.75bpw (affine-8 trunk) boot read the table cold (serial 36.3 ms, pool 2.0 ms, POOLED). The
+  v2.0 boot read it warm (SERIAL). A table past the residency cap is never warmed and keeps the measured arm.
 
 <a id="qsa"></a>
 ## QSA wide verify (b89991a)
@@ -450,7 +456,7 @@ and 4-8% of a depth-3 verify; a matmul2d QSA prototype (branch `qsa-mpp-proto`) 
 `e79b345002454001b49cf3b1bde86fcc407fb7b3cd7087385de4eaad86926638`), M5 Max 128 GB,
 Sushi-3bpw, `--ctx-size 65536 --kv-quant 8 --prefix-cache-entries 0 --no-mtp`.
 The forward meter prefills 32768 tokens, captures verify state, and runs 40 forwards
-per arm with `SUSHI_DECODE_FWD_UBENCH_GDN_FOLD_ARMS=1`, widths `1,2,3,5,7,9` and
+per arm, widths `1,2,3,5,7,9` and
 `SUSHI_ROUND_COST_PERSIST=0`. A B B A in one process: A is the existing fused
 recurrence plus norm-gate and convolution concat; B folds both epilogues into it.
 There was no recorded fold-only comparison on this base, so both arms were measured.
@@ -540,6 +546,42 @@ Each chunk saves ~0.1 s at both widths (106 ms at 4096 rows, 109 ms at 8192). Th
 chunk, which points at the per-layer host round trip of the host-built table rather than the copy. A 32k prompt would
 save ~0.4 s of ~18.8 s (~2%), below the spread of the two-sample 32k run (one arm's samples ranged 17.9 to 20.1 s). The served path also drops the un-sort buffer
 (`[rows x 10, 2560]` f16: 210 MB at 4096 rows, 420 MB at 8192).
+
+<a id="stq-prefill-profile"></a>
+## Flash-Next STQ prefill: where a chunk's time goes, K6 trunk against affine 8
+
+`QWEN4_PROFILE_FWD=all SUSHI_PROFILE_ATTN=1` (a sync per block, so about 10% over an unprofiled chunk), in-process
+`sushi bench --code-only --rungs 131072` on 3eff69ed ReleaseFast, `taskpolicy -a`, GPU lock per run, fans max, die
+under 50 C at boot, 2026-11-05. STQ-2.75bpw-v2.0 (K6 n96 trellis trunk) and STQ-2.75bpw (affine-8 trunk), same
+binary. Each 8k window runs as chunks of 31, 4096 and 4065 rows plus the 31-row tail before the snapshot. ms per
+4096-row chunk:
+
+| pack, kv | total | PLE | HC read | GDN | attention | HC write | MoE | indexer | q/k/v + rope | QSA | o |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| v2.0 K6, 20k | 1852 | 47 | 191 | 518 | 343 | 83 | 670 | 26 | 105 | 170 | 42 |
+| affine 8, 20k | 1931 | 277 | 193 | 413 | 310 | 82 | 655 | 24 | 81 | 170 | 34 |
+| v2.0 K6, 127k | 2041 | 40 | 201 | 536 | 496 | 85 | 683 | 117 | 109 | 228 | 43 |
+| affine 8, 127k | 2116 | 294 | 195 | 421 | 459 | 83 | 664 | 110 | 83 | 231 | 35 |
+
+- The K6 trunk costs about 150 ms per 4096-row chunk against affine 8 (GDN +105, attention projections +33, the
+  shared expert in the MoE +15) at any context. The affine-8 run's PLE is the pooled gather a cold calibration chose
+  ([the n-gram arm](#the-n-gram-gather-arm-is-measured-per-load-feb9ed7d)), not the trunk.
+- Long context grows attention alone, the same on both packs: indexer +90 ms and QSA +58 ms per chunk from 20k to
+  127k. The release bench's K6 shortfall past 64k (1,816 vs 1,883 at 98k, 1,690 vs 1,821 at 128k) follows the GPU
+  clock. Per MHz the K6 code windows read 1.27 / 1.25 / 1.20 tok/s at 8k / 98k / 128k, and 1.5.0 read 1.28 / 1.24 /
+  1.19.
+- A 4065-row chunk costs 60-90 ms more than a 4096-row one despite fewer rows: GDN +25-40, MoE +20-30.
+- The 31-row forwards cost about 140 ms each, unprofiled (`[prefill-trace] last_token`). An 8k window pays two of
+  them, about 7% of the window.
+- **The first prefill after a load paid about 3.5 s of first use**, and the cross-process Metal cache does not cover it:
+  the first 4065-row chunk took 4.3 s against 1.84 s, and the 31-row tail 1.09 s against 0.13 s, on a second run of the
+  same binary. That made the release bench's cold 4k window 695 tok/s. A 64-row forward at load (`SUSHI_PREFILL_UBENCH=1
+  _ROWS=64`: cold 439 ms, warm 111 ms) took the first 4k window to 1754 tok/s, TTFT 5.90 to 2.41 s; 4096 rows (cold 5.8 s)
+  did no better (1738). The 8-row warm-up forwards stay on the decode chain (16 rows) and the multi-row trunk kernel (8).
+  The spec warm-up's first slot now prefills 64 rows (`SPEC_WARM_PREFILL_ROWS`), output unchanged: the first 4k window
+  reads 1467 tok/s, TTFT 3.05 s (first chunk 2.41 s, tail 0.33 s), against 695 and 5.97 s. Runs: meter on 3eff69ed +
+  the trunk changes; warm-up on the landing tree; ReleaseFast, `sushi bench --code-only`, GPU lock, fans max, die
+  under 50 C.
 
 <a id="mtp-depth-policy"></a>
 ## MTP depth policy: one chunk from acceptance EMAs below 8k KV (reverted)
@@ -693,7 +735,7 @@ multiply and add tail is the reduce's (`gate[row]`); at one row the router kerne
   `moeWithGatedShared` / `moeRagged`), real 2560/640/top-10 geometry, 1 to 8 rows, MCG at n64, n32 and n44/n44/n64, spec1
   grouped at n32/44/64 (down n48), shared g128 and g64, large and small gains, router logit and rider logit, either
   part's threadgroups first, three launches a layer; one decline test.
-- **Chain per layer** (`SUSHI_QWEN_FOLD_UBENCH=1`, main test binary, ReleaseFast, GPU lock `qwen-fold`, `taskpolicy -a`,
+- **Chain per layer** (`sushi-ubench run shared.shared_expert_fold --rungs model=qwen4`; this table, ReleaseFast, GPU lock `qwen-fold`, `taskpolicy -a`,
   fans auto, M5 Max, median of 21 interleaved rounds of 8 dependent layers over distinct banks, 64 experts, random
   routes; separate = production shared chain incl. its N=1 logit; uncommitted tree on `a9853b3e`, us):
 
@@ -714,6 +756,56 @@ multiply and add tail is the reduce's (`gate[row]`); at one row the router kerne
   on STQ-2.75bpw and Sushi-4bpw, MTP and `--no-mtp`. MTP round 28.24 -> 28.14 ms (STQ) and 24.29 -> 24.10 ms (4bpw);
   `--no-mtp` decode 63.2 / 63.4 and 62.3 / 62.0 tok/s: a tie that drops 192 launches a serial token. The
   `[qwen] shared expert rides the routed launches engaged` log line shows the fold is on.
+
+<a id="shared-fold-trellis"></a>
+## Flash-Next: a trellis shared expert rides the routed launches too
+
+`exl3/shared_trellis.zig` (the parts), reached through `qwen_riders` (`Shared.trellis`) from the same two folds as above.
+A trunk-STQ pack stores the shared gate/up as one stacked bank and the down as a bank, both on `project_rows`' NAX
+multi-row kernel. Each rides as that kernel itself, with its own k split, so every partial sum is the bytes of the
+linear's own launch; what its two finish dispatches did moves into the neighbour that reads the partials:
+
+- **Pair launch**: extra threadgroups run the gate/up kernel and write its f32 partials `[rows * nsplit, 1280]` (the
+  gate logit of rows 2 to 8 is one more threadgroup per row, as for the affine riders).
+- **Fused-mid down launch**: the shared down kernel prepares its input per 128-wide k block by summing that block's
+  gate/up partials in finish order, applying the output H128 and `svh`, rounding to bf16 and running the SwiGLU of
+  `fusedSwiGLU`, instead of reading a mid vector (`mid_row` in the kernel header).
+- **Finish reduce**: one idle simdgroup sums the down partials, applies H128 and `svh`, rounds to bf16 into
+  threadgroup memory, and the sigmoid-gated add reads that block.
+- The three launches a layer are the affine fold's: the shared gate/up, finish, SwiGLU, down and finish dispatches and
+  the logit are gone. Declines (separate chain): no NAX on the box, a split that folds (`nsplit` 1), `kph` other than 1,
+  a gate/up not stacked in two, a trunk decode without its table.
+- **A dense shared-expert gate** (the packs store it bf16 `[1, hidden]`, so no affine bank) used to decline the fold at 2
+  to 8 rows, where only the router kernel supplies the logit at one row. The layer now computes the logit as the separate
+  chain does and passes it in, so verify widths fold too.
+- **Proof** (`qwen4_shared.zig`): bytes equal to the production separate chain (`sharedProject`, `fusedSwiGLU`,
+  `trunk_stq.matmul`, then `moeWithGatedShared` / `moeRagged`) at 1 to 8 rows, 6-bit and 4-bit shared banks, SPEC1 trunk,
+  one-bank (MCG) and rate-grouped routed layers, logit riding the launch or passed in, three launches a layer; a decline
+  test.
+- **Chain per layer** (`sushi-ubench run shared.shared_expert_fold --rungs model=qwen4 --rungs shared=trellis`, K6 shared
+  banks, 8 dependent layers over distinct banks, 11 rounds interleaved, median us; commit `3a6c6bb7` ReleaseFast, GPU
+  lock, QUIET, `taskpolicy -a`, AC, fans max, die 50 C at start; the separate arm pays the logit qmv at every width):
+
+  | rows | grouped separate | fused | routed only | one-bank separate | fused | routed only |
+  |---|---|---|---|---|---|---|
+  | 1 | 137.5 | 113.6 | 98.9 | 168.2 | 141.8 | 121.6 |
+  | 2 | 154.2 | 128.1 | 112.7 | 163.5 | 137.8 | 121.5 |
+  | 4 | 229.9 | 198.8 | 181.2 | 236.5 | 211.9 | 190.7 |
+  | 8 | 359.0 | 332.7 | 306.8 | 363.6 | 351.6 | 313.3 |
+
+  Raw: `~/.sushi/runs/ubench/shared.shared_expert_fold-3a6c6bb-20261105T031328.json`.
+- **Decode forward meter** on `Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw-trunkK6` (`SUSHI_DECODE_FWD_UBENCH=40`, `_S=1,2,4,8`,
+  `_KV=1024`, kv8 default, M5 Max on AC, `taskpolicy -a`, GPU lock, QUIET, fans max, one boot per cell, one A then one B,
+  A = 71fd8217 and B = this change on top of it; the A boot began at 55 C, the B boot at 50 C), ms per forward and ops:
+
+  | rows | 1 | 2 | 4 | 8 |
+  |---|---|---|---|---|
+  | A | 17.899 / 5160 | 20.485 / 4829 | 25.259 / 5218 | 35.464 / 5319 |
+  | B | 16.802 / 4296 | 19.637 / 3821 | 24.304 / 4210 | 35.791 / 4311 |
+
+  A serial token drops 1.1 ms (6%) over 48 layers, 0.85 to 0.95 ms at 2 and 4 rows; 8 rows is a tie inside the boot-to-boot
+  band of about 1.5 ms. The first B boot, before the dense-gate change, read 16.788 / 20.048 / 24.822 / 35.024 (ops at 2 to 8
+  rows unchanged from A: the fold declined there).
 
 <a id="verify-rows8"></a>
 ## Flash-Next: verify at 2 to 8 rows costs the same per row (4d7f575c to 8044906b)
@@ -777,6 +869,44 @@ Bench on the final tree (`d2a866b4`, binary built 2026-10-22 06:49:59, SHA-256 `
 
 DFlash2 at 16k and 64k did not move although its verify got cheaper: some requests there are still stopped by the runtime gate
 (`runtime_disabled=true` in their `[spec-stats]`), which prices the round against the serial token.
+
+<a id="verify-rows9"></a>
+## Flash-Next K6 trunk: a 9-row verify on the NAX rows arm
+
+An 8-draft prompt lookup verifies 9 rows. The trellis trunk's rows kernel stopped at 8, so a 9-row verify ran every trunk
+projection through the prefill GEMM, unstacked; it now stays on the NAX rows arm
+([engine-exl3-experts](engine-exl3-experts.md#verify-rows16)). Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw-v2.0 (K6 trunk) against
+the 1.5.0 STQ-2.75bpw pack (affine-8 trunk), M5 Max on AC, ReleaseFast, `taskpolicy -a`, GPU lock and QUIET per boot, fans
+max, die 48-49 C at each boot, 2026-11-05.
+
+- Decode meter (`SUSHI_DECODE_FWD_UBENCH=40`, `_KV=1024`, kv8, one boot per row), ms per forward:
+
+  | binary, pack | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
+  |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+  | 3eff69ed, v2.0 (K6) | 16.36 | 19.02 | 21.07 | 23.94 | 26.72 | 29.48 | 31.77 | 34.30 | 56.99 |
+  | 3eff69ed, 1.5.0 (affine 8) | 16.54 | 19.35 | 21.55 | 24.38 | (34.7) | 30.59 | 34.35 | 37.10 | 43.14 |
+  | this change on 3eff69ed, v2.0 (K6) | 16.28 | | | | | | | 33.17 | 38.19 |
+
+  The K6 trunk is 1-8% ahead of affine 8 at 1 to 8 rows; at 9 rows it was 14 ms behind (7217 ops against 4328 at 8 rows),
+  and is 5 ms ahead now (6553 ops). (34.7) is one noisy cell. The 9-row step over 8 rows is still 4.8 ms against a 2.5 ms
+  slope: GDN, the prepared HC graph and the shared-expert fold stop at 8 rows.
+- **The single-stream verify features reach 9 rows** (`trf.SINGLE_VERIFY_ROWS_MAX`: the prepared HC graph, and
+  `gdn_decode.MAX_SEQ` 9 for the fused GDN step), bytes unchanged. Meter as above, widths 8, 9, 8, 9 per boot, boots
+  A B B A, A = 850d8d8b (main) and B = this change on it, die 44-47 C at each boot; second 9-row pass, ms per forward and
+  ops: A 38.17 / 38.20 (6553), B 36.31 / 36.58 (5353), -1.7 ms (-4.6%). 8 rows: A 33.51 / 33.63, B 33.50 / 33.50.
+  The shared-expert fold (`qwen_riders.max_rows` 8) and the 9-row step to the next 2.5 ms remain.
+- Code 4k rung (`sushi bench --model <pack> --rungs 4k --tokens 512 --code-only`, in process, one load per arm, MTP default),
+  decode tok/s of the two repeats (the cold first request pays JIT):
+
+  | binary, pack | repeat 1 | repeat 2 | 8-draft lookup round | 7-draft lookup round |
+  |---|--:|--:|--:|--:|
+  | 3eff69ed, v2.0 | 142.7 | 148.9 | 58.4-59.8 ms | 37.1-38.7 ms |
+  | 3eff69ed, 1.5.0 | 159.8 | 159.9 | 44.8-48.8 ms | 42.5-44.1 ms |
+  | this change on 3eff69ed, v2.0 | 170.4 | 169.3 | 40.9-41.8 ms | 39.9-41.2 ms |
+
+  A 4k code request runs about 24 eight-draft lookups among about 43 lookup rounds, which was the code 4k loss of the
+  release bench on a00c9951 (146 against 167). Acceptance on the same binary is close between the packs: 74-83 rounds per
+  512 tokens, v2.0 at the high end, inside the request-to-request spread.
 
 <a id="dflash2"></a>
 ## Flash-Next DFlash2 (`--drafter`) against MTP
